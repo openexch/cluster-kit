@@ -18,6 +18,13 @@ jobs:
           java-version: '21'
           distribution: temurin
           cache: maven
+          # Generates the settings.xml that gives `deploy` its credentials.
+          # Without it the deploy step runs, uploads nothing, and still reports
+          # BUILD SUCCESS - which is how the first publish silently produced no
+          # artifact and only the consumers' builds noticed.
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
 
       - run: mvn -B clean verify
 
@@ -28,4 +35,17 @@ jobs:
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: mvn -B deploy -DskipTests
         env:
+          GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # A publish that uploads nothing must not pass. The deploy plugin reports
+      # success whether or not credentials existed, so the only honest check is
+      # asking the registry whether the artifact is actually there.
+      - name: Verify the artifact is resolvable
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          VERSION=$(mvn -B -q help:evaluate -Dexpression=project.version -DforceStdout)
+          URL="https://maven.pkg.github.com/openexch/cluster-kit/com/openexchange/cluster-kit/$VERSION/cluster-kit-$VERSION.jar"
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "$URL")
+          echo "$URL -> $CODE"
+          test "$CODE" = "200"

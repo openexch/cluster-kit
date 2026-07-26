@@ -31,23 +31,33 @@ jobs:
       # Publish only from main. Both engines consume this artifact, so a
       # version published from a branch would put one engine on code the other
       # has never seen — the exact divergence this repo exists to remove.
+      # Published versions are IMMUTABLE - Packages answers 409 to a re-upload,
+      # which is the right behaviour for a substrate two engines pin. So the
+      # publish is conditional on the version not already existing, and pushing
+      # to main without a version bump is simply a no-op rather than a failure.
       - name: Publish to GitHub Packages
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: mvn -B deploy -DskipTests
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # A publish that uploads nothing must not pass. The deploy plugin reports
-      # success whether or not credentials existed, so the only honest check is
-      # asking the registry whether the artifact is actually there.
-      - name: Verify the artifact is resolvable
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: |
           VERSION=$(mvn -B -q help:evaluate -Dexpression=project.version -DforceStdout)
           URL="https://maven.pkg.github.com/openexch/cluster-kit/com/openexchange/cluster-kit/$VERSION/cluster-kit-$VERSION.jar"
-          # -L: Packages answers 302 and redirects to storage, so a bare status
-          # check reads a successful publish as a failure.
-          CODE=$(curl -sL -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "$URL")
-          echo "$URL -> $CODE"
-          test "$CODE" = "200"
+          # -L: Packages redirects to storage, so a bare status check reads a
+          # successful publish as a failure.
+          BEFORE=$(curl -sL -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GITHUB_TOKEN" "$URL")
+
+          if [ "$BEFORE" = "200" ]; then
+            echo "cluster-kit $VERSION is already published; nothing to do."
+            exit 0
+          fi
+
+          mvn -B deploy -DskipTests
+
+          # A publish step that cannot tell "uploaded" from "did nothing" is a
+          # step that says yes. The first run of this workflow reported BUILD
+          # SUCCESS having uploaded nothing at all, and only the consumers'
+          # builds noticed.
+          AFTER=$(curl -sL -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GITHUB_TOKEN" "$URL")
+          echo "$URL -> $AFTER"
+          test "$AFTER" = "200"

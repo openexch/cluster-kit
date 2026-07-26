@@ -49,10 +49,16 @@ import java.util.jar.Manifest;
  * </pre>
  *
  * <p><b>Ordering obligation.</b> Run this BEFORE archive housekeeping purges the
- * log below the snapshot, or the range this bundle needs is already gone. Today
- * the admin gateway snapshots and reclaims in one operation, so capture belongs
- * between those two steps. Step 02 makes that structural by holding the purge
- * watermark at the last position durable in S3.
+ * log below the snapshot, or the range this bundle needs is already gone. The
+ * admin gateway snapshots and reclaims in one operation, and capture sits between
+ * those two steps; the ordering is held structurally by the purge watermark,
+ * which never passes the last position durable in S3.
+ *
+ * <p><b>Staging is reclaimed here, not by the caller.</b> A capture leaves two
+ * kinds of residue in the staging archive, with two different lifetimes, and only
+ * this class knows which is which: the snapshot recordings are scratch and go
+ * immediately, the log is the chain anchor and only its prefix is reclaimable,
+ * bounded by {@code --watermark=N}. See {@code reclaimStaging}.
  */
 public final class BundleCapture {
 
@@ -118,11 +124,16 @@ public final class BundleCapture {
      * @param bundleRoot        where bundle directories are written
      * @param cluster           cluster name for the manifest
      * @param nodeId            node id for the manifest
+     * @param durablePosition   the caller's watermark: the position it has verified
+     *                          durable in S3, below which staged log segments are
+     *                          reclaimable. -1 means "no external constraint known",
+     *                          which reclaims nothing rather than everything.
      */
     public static Result capture(final File clusterDir, final String srcControlChannel,
                                  final File stagingRoot, final File bundleRoot,
                                  final String cluster, final int nodeId,
-                                 final EngineSchema schema) throws IOException {
+                                 final EngineSchema schema,
+                                 final long durablePosition) throws IOException {
 
         final SnapshotSelection selection = readLatestSnapshot(clusterDir);
         if (selection == null) {
@@ -204,6 +215,8 @@ public final class BundleCapture {
             snapshotBytes = snapshot;
 
             state.dstLogRecordingId = dstLogRecordingId;
+
+            reclaimStaging(staging, dstLogRecordingId, durablePosition, selection.logPosition);
         }
 
         Files.copy(clusterDir.toPath().resolve("recording.log"),
@@ -219,6 +232,76 @@ public final class BundleCapture {
 
         return new Result(true, "captured", bundleDir, selection.logPosition,
                 previousPosition, logBytes);
+    }
+
+    /**
+     * Give back the staging space this capture and its predecessors no longer need.
+     *
+     * <p>Two different lifetimes, so two different rules.
+     *
+     * <p>The snapshot recordings are SCRATCH. They exist only to be copied into the
+     * bundle directory a few lines above, and nothing ever reads the staged
+     * original again. They are therefore deleted outright, with no reference to the
+     * durable watermark: the copy that matters is already on disk, and if this
+     * bundle never reaches S3 the next capture simply replicates them again. Left
+     * alone they were the larger leak of the two, because each capture adds a fresh
+     * set and {@link StagingArchive#purgeBelow} cannot remove a catalog entry.
+     *
+     * <p>It sweeps everything that is not the log rather than deleting the ids this
+     * run happens to hold, which is what makes it self-healing. A capture killed
+     * between replicating a snapshot and copying it out leaves recordings no later
+     * run has a reference to; so does any version of this code that shipped without
+     * reclamation. Both are the same garbage, and a sweep collects them on the next
+     * successful capture instead of requiring somebody to go in by hand.
+     *
+     * <p>The log recording is the CHAIN ANCHOR and must survive, so only its prefix
+     * is reclaimable, bounded by what the caller has verified durable in S3. The
+     * clamp to {@code capturedPosition} is defensive rather than expected: a
+     * watermark above the range we just copied out would mean the caller believes
+     * something is durable that this node has not even staged yet, and the cheap
+     * response to a watermark that cannot be true is to not act on it.
+     *
+     * <p>Never throws. A capture that produced a good bundle and then failed to
+     * tidy up has still done the job that protects the ledger; turning that into a
+     * failed capture would stop bundles entirely, which is the outcome this whole
+     * mechanism exists to prevent. Failures are printed instead, and the space is
+     * reclaimed on the next round.
+     */
+    private static void reclaimStaging(final StagingArchive staging,
+                                       final long logRecordingId,
+                                       final long durablePosition,
+                                       final long capturedPosition) {
+        try {
+            final List<Long> deleted = staging.purgeAllExcept(logRecordingId);
+            System.out.println("[BUNDLE] staged snapshot recordings deleted: "
+                    + deleted.size() + " " + deleted);
+        } catch (final Exception e) {
+            System.out.println("[BUNDLE] could not sweep staged snapshot recordings, "
+                    + "they will occupy staging until the next successful capture: " + e);
+        }
+
+        if (durablePosition < 0) {
+            System.out.println("[BUNDLE] staged log kept whole: caller reported no durable "
+                    + "position, so nothing below it is known to be safe to drop");
+            return;
+        }
+
+        final long bound = Math.min(durablePosition, capturedPosition);
+        if (bound < durablePosition) {
+            System.out.println("[BUNDLE] durable position " + durablePosition
+                    + " is ABOVE the position just captured (" + capturedPosition
+                    + "); reclaiming only to the captured position. A watermark this "
+                    + "node cannot account for is a caller bug, not a licence to delete.");
+        }
+
+        try {
+            final long purged = staging.purgeBelow(logRecordingId, bound);
+            System.out.println("[BUNDLE] staged log reclaimed below " + bound
+                    + ": " + purged + " segment(s)");
+        } catch (final Exception e) {
+            System.out.println("[BUNDLE] could not reclaim staged log below "
+                    + bound + ": " + e);
+        }
     }
 
     // ---- recording.log ----
@@ -524,6 +607,44 @@ public final class BundleCapture {
 
     // ---- CLI ----
 
+    /** Named for the same reason as housekeeping's: a stray positional cannot become a position. */
+    private static final String WATERMARK_FLAG = "--watermark=";
+
+    /**
+     * Extract {@code --watermark=N}, or -1 when absent or unusable.
+     *
+     * <p>The default is the OPPOSITE of {@link ArchiveHousekeeping#watermarkFrom},
+     * deliberately. Housekeeping defaults to {@link Long#MAX_VALUE} because it has
+     * a second bound underneath it, the latest valid snapshot, so an absent
+     * watermark still cannot delete anything recovery needs. The staged log has no
+     * such floor: it is a private copy whose only protection is this number. An
+     * absent watermark there has to mean "reclaim nothing" or the first caller that
+     * forgets the flag truncates the chain anchor.
+     *
+     * <p>Scans past the six positional arguments only, so a future positional can
+     * never be read as a watermark.
+     */
+    static long watermarkFrom(final String[] args) {
+        for (int i = 6; i < args.length; i++) {
+            if (!args[i].startsWith(WATERMARK_FLAG)) {
+                continue;
+            }
+            final String value = args[i].substring(WATERMARK_FLAG.length());
+            try {
+                final long parsed = Long.parseLong(value);
+                if (parsed < 0) {
+                    return -1;
+                }
+                return parsed;
+            } catch (final NumberFormatException e) {
+                System.err.println("[BUNDLE] FAILED: unparseable "
+                        + WATERMARK_FLAG + "value: " + value);
+                System.exit(2);
+            }
+        }
+        return -1;
+    }
+
     /**
      * Invoked per node by the admin gateway, between the snapshot and the reclaim.
      *
@@ -534,18 +655,19 @@ public final class BundleCapture {
      *
      * <p>Usage from that entry point: {@code run(args, schema)} with argv
      * {@code <clusterDir> <srcControlChannel> <stagingRoot> <bundleRoot>
-     * <cluster> <nodeId>}
+     * <cluster> <nodeId> [--watermark=N]}
      */
     public static void run(final String[] args, final EngineSchema schema) {
         if (args.length < 6) {
             System.err.println("Usage: <clusterDir> <srcControlChannel> "
-                    + "<stagingRoot> <bundleRoot> <cluster> <nodeId>");
+                    + "<stagingRoot> <bundleRoot> <cluster> <nodeId> [--watermark=N]");
             System.exit(2);
         }
 
         try {
             final Result result = capture(new File(args[0]), args[1], new File(args[2]),
-                    new File(args[3]), args[4], Integer.parseInt(args[5]), schema);
+                    new File(args[3]), args[4], Integer.parseInt(args[5]), schema,
+                    watermarkFrom(args));
             System.out.println("[BUNDLE] " + result);
             if (!result.captured) {
                 System.exit(0);

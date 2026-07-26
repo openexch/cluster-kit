@@ -12,6 +12,8 @@ import org.agrona.CloseHelper;
 import org.agrona.concurrent.YieldingIdleStrategy;
 
 import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -33,10 +35,15 @@ import java.util.concurrent.TimeUnit;
  * recording that persists between runs and gets extended. A fresh staging
  * archive each time could only ever re-copy the whole log.
  *
- * <p>That makes staging retention a real obligation rather than an afterthought:
- * once a range is durable in S3, the segments below it are reclaimable here with
- * the same {@code purgeSegments} call the live archives use. Without that this
- * directory grows for as long as the cluster runs. See {@link #purgeBelow}.
+ * <p>That makes staging retention a real obligation rather than an afterthought,
+ * and it has two halves. Once a range is durable in S3 the log segments below it
+ * are reclaimable with the same {@code purgeSegments} call the live archives use
+ * ({@link #purgeBelow}). Separately, every capture replicates a fresh copy of the
+ * snapshot recordings, which are pure scratch and must be deleted outright
+ * ({@link #purgeRecording}) - purging segments below a position cannot remove a
+ * catalog entry, so left to the first mechanism alone they accumulate one set per
+ * capture for the life of the cluster. Without both halves this directory grows
+ * for as long as the cluster runs.
  *
  * <p>It lives on disk on purpose. The whole point of the exercise is to stop the
  * ledger's durability from depending on tmpfs, so staging it back into tmpfs
@@ -48,6 +55,9 @@ public final class StagingArchive implements AutoCloseable {
     private static final int SEGMENT_FILE_LENGTH = 64 * 1024 * 1024;
 
     private static final long REPLICATION_TIMEOUT_NS = TimeUnit.MINUTES.toNanos(10);
+
+    /** Recordings fetched per listRecordings call while sweeping. */
+    private static final int LIST_BATCH = 100;
 
     private final ArchivingMediaDriver mediaDriver;
     private final AeronArchive archive;
@@ -228,6 +238,78 @@ public final class StagingArchive implements AutoCloseable {
             return 0;
         }
         return archive.purgeSegments(recordingId, newStart);
+    }
+
+    /**
+     * Delete a staged recording outright, segments and catalog entry.
+     *
+     * <p>For the snapshot recordings, not the log. A snapshot replicates whole
+     * into staging only so its files can be copied into the bundle; once that
+     * copy is made nothing reads the staged original again. The log is the
+     * opposite: it is the chain anchor, it gets EXTENDED by the next capture, and
+     * deleting it would restart the chain from the source's own start. So this
+     * takes a recording id rather than deriving one, and the caller is expected
+     * to pass a snapshot's.
+     *
+     * <p>Distinct from {@link #purgeBelow}, which reclaims a prefix of a
+     * recording that stays. Purging segments below a position can never remove
+     * the catalog entry, so a per-capture snapshot copy left to that method would
+     * accumulate one entry per capture forever.
+     *
+     * @return count of segment files deleted
+     */
+    public long purgeRecording(final long recordingId) {
+        return archive.purgeRecording(recordingId);
+    }
+
+    /**
+     * Delete every staged recording except the one to keep, and report which.
+     *
+     * <p>A sweep rather than a list of what this run created, because the two are
+     * not the same set and the difference is exactly the interesting case. A
+     * capture that dies between replicating a snapshot and copying it out - a
+     * crash, a kill, a timeout - leaves recordings nobody holds a reference to
+     * any more. Deleting only what the current run made would leave those
+     * orphans, and they are indistinguishable from a leak because that is what
+     * they are.
+     *
+     * <p>Safe because of what a staging archive contains: one log recording,
+     * which is the chain anchor and is passed in as {@code keepRecordingId}, plus
+     * snapshot copies that exist only to be copied into a bundle and are never
+     * read again. There is no third kind. A chain that has to start over - a
+     * re-formed or reseeded source - is refused by {@code BundleCapture} rather
+     * than continued, so a second live chain never shares this directory.
+     *
+     * @param keepRecordingId the log chain anchor; pass {@link Aeron#NULL_VALUE}
+     *                        only when there is no chain yet
+     * @return ids actually deleted, for the caller to report
+     */
+    public List<Long> purgeAllExcept(final long keepRecordingId) {
+        final List<Long> found = new ArrayList<>();
+        long from = 0;
+        while (true) {
+            final int before = found.size();
+            final long start = from;
+            final int count = archive.listRecordings(start, LIST_BATCH,
+                    (controlSessionId, correlationId, id, startTimestamp, stopTimestamp,
+                     startPosition, stopPosition, initialTermId, segmentFileLength,
+                     termBufferLength, mtuLength, sessionId, streamId, strippedChannel,
+                     originalChannel, sourceIdentity) -> found.add(id));
+            if (count == 0 || found.size() == before) {
+                break;
+            }
+            from = found.get(found.size() - 1) + 1;
+        }
+
+        final List<Long> deleted = new ArrayList<>();
+        for (final long id : found) {
+            if (id == keepRecordingId) {
+                continue;
+            }
+            archive.purgeRecording(id);
+            deleted.add(id);
+        }
+        return deleted;
     }
 
     /** Stop position of a local recording, or -1 if it does not exist. */

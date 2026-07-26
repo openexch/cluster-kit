@@ -25,8 +25,15 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
-        <!-- Pinned identical to BOTH engines. This artifact is the substrate they
-             share, so a version skew here would be a skew between the engines. -->
+        <!-- Compiled against the LOWEST version any consumer runs, so the
+             bytecode is valid on all of them.
+             The engines are NOT on the same version today - match runs Aeron
+             1.52.2 / agrona 2.5.0, assets runs 1.51.0 / 2.4.1, despite a stale
+             comment in the assets pom claiming they are pinned together. This
+             artifact does not paper over that: it is `provided` scope, each
+             engine supplies and shades its own, and building here against the
+             floor is what keeps a 1.51 consumer working. Raise this only when
+             the slowest engine has moved. -->
         <aeron.version>1.51.0</aeron.version>
         <agrona.version>2.4.1</agrona.version>
         <junit.version>4.13.2</junit.version>

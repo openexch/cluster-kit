@@ -178,6 +178,27 @@ public class BundleCaptureTest {
 
     // ---- provenance ----
 
+    // AeronVersion.VERSION is a compile-time constant, so reading it here would
+    // bake THIS library's Aeron into every bundle from every engine. The
+    // matching engine runs 1.52.2 and its first bundle claimed 1.51.0 — the
+    // version this module compiles against — which is how the defect surfaced.
+    //
+    // Provenance that is confidently wrong is worse than provenance that is
+    // missing: a replay would boot the wrong Aeron and debug a different system.
+    @Test
+    public void aeronVersionIsReadAtRuntimeNotInlined() {
+        final io.aeron.version.Version runtime = new io.aeron.AeronVersion();
+        final String expected = runtime.majorVersion() + "." + runtime.minorVersion()
+                + "." + runtime.patchVersion();
+
+        assertEquals("the version must come from the Aeron on the classpath",
+                expected, BundleCapture.aeronVersion());
+
+        // Whatever the engine shades, the string is built from live values.
+        assertTrue("version looks empty: " + BundleCapture.aeronVersion(),
+                BundleCapture.aeronVersion().matches("\\d+\\.\\d+\\.\\d+"));
+    }
+
     // A bundle that cannot name the build that produced it is one a replay must
     // refuse. Saying "unknown" is the point; inventing a value would let a restore
     // run against a tree that never produced this state.

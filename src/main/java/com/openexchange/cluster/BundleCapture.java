@@ -5,6 +5,7 @@ import io.aeron.Aeron;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.cluster.RecordingLog;
 import io.aeron.AeronVersion;
+import io.aeron.version.Version;
 
 import java.io.File;
 import java.io.IOException;
@@ -429,7 +430,7 @@ public final class BundleCapture {
                 + "  \"buildSha\": \"" + buildSha() + "\",\n"
                 + "  \"schemaId\": " + schema.id() + ",\n"
                 + "  \"schemaVersion\": " + schema.version() + ",\n"
-                + "  \"aeronVersion\": \"" + AeronVersion.VERSION + "\",\n"
+                + "  \"aeronVersion\": \"" + aeronVersion() + "\",\n"
                 + "  \"logBytes\": " + logBytes + ",\n"
                 + "  \"snapshotBytes\": " + snapshotBytes + ",\n"
                 + "  \"compression\": \"gzip\",\n"
@@ -441,6 +442,29 @@ public final class BundleCapture {
 
         Files.writeString(bundleDir.toPath().resolve("manifest.json"), json,
                 StandardCharsets.UTF_8);
+    }
+
+    /**
+     * The Aeron the engine is ACTUALLY running, read at runtime.
+     *
+     * <p>Not {@code AeronVersion.VERSION}. That field is a compile-time constant,
+     * so javac inlines it into this class at build time and every bundle from
+     * every engine would report whatever version THIS library was compiled
+     * against. It is a defect the shared module created: while the machinery was
+     * duplicated, each copy compiled against its own engine's Aeron and happened
+     * to be right.
+     *
+     * <p>Caught by reading a real manifest: the matching engine runs 1.52.2 and
+     * its first bundle claimed 1.51.0. Provenance that is confidently wrong is
+     * worse than provenance that is missing — a replay would boot the wrong
+     * Aeron and debug a different system.
+     *
+     * <p>The instance methods are virtual calls, resolved against whatever Aeron
+     * is on the classpath at run time, which is the whole point.
+     */
+    static String aeronVersion() {
+        final Version version = new AeronVersion();
+        return version.majorVersion() + "." + version.minorVersion() + "." + version.patchVersion();
     }
 
     /**

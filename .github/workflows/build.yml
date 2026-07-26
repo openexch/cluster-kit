@@ -46,6 +46,8 @@ jobs:
         run: |
           VERSION=$(mvn -B -q help:evaluate -Dexpression=project.version -DforceStdout)
           URL="https://maven.pkg.github.com/openexch/cluster-kit/com/openexchange/cluster-kit/$VERSION/cluster-kit-$VERSION.jar"
-          CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "$URL")
+          # -L: Packages answers 302 and redirects to storage, so a bare status
+          # check reads a successful publish as a failure.
+          CODE=$(curl -sL -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "$URL")
           echo "$URL -> $CODE"
           test "$CODE" = "200"

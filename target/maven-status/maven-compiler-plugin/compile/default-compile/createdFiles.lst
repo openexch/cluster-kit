@@ -1,9 +1,0 @@
-com/openexchange/cluster/BundleCapture.class
-com/openexchange/cluster/StagingArchive$ReplicationOutcome.class
-com/openexchange/cluster/BundleCapture$StagingState.class
-com/openexchange/cluster/BundleCapture$Result.class
-com/openexchange/cluster/StagingArchive.class
-com/openexchange/cluster/ArchiveHousekeeping$Result.class
-com/openexchange/cluster/BundleCapture$EngineSchema.class
-com/openexchange/cluster/ArchiveHousekeeping.class
-com/openexchange/cluster/BundleCapture$SnapshotSelection.class

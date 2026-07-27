@@ -312,6 +312,32 @@ public final class StagingArchive implements AutoCloseable {
         return deleted;
     }
 
+    /**
+     * The fields of a recording descriptor that describe the DATA, as opposed to the session that
+     * happened to record it. This is what a bundle has to carry: segment files state none of it, and
+     * the catalog entry that does is deleted by {@link #purgeAllExcept} moments after the files are
+     * copied out. Timestamps, control session and correlation ids are deliberately absent — they
+     * describe this capture's own recording session and mean nothing on the other side.
+     */
+    public record Descriptor(long recordingId, long startPosition, long stopPosition,
+                             int initialTermId, int segmentFileLength, int termBufferLength,
+                             int mtuLength, int sessionId, int streamId,
+                             String strippedChannel, String originalChannel, String sourceIdentity) {
+    }
+
+    /** Descriptor of a local recording, or null if the catalog has no valid entry for it. */
+    public Descriptor describe(final long recordingId) {
+        final Descriptor[] found = {null};
+        archive.listRecording(recordingId,
+                (controlSessionId, correlationId, id, startTimestamp, stopTimestamp,
+                 startPosition, stopPosition, initialTermId, segmentFileLength, termBufferLength,
+                 mtuLength, sessionId, streamId, strippedChannel, originalChannel, sourceIdentity) ->
+                        found[0] = new Descriptor(id, startPosition, stopPosition, initialTermId,
+                                segmentFileLength, termBufferLength, mtuLength, sessionId, streamId,
+                                strippedChannel, originalChannel, sourceIdentity));
+        return found[0];
+    }
+
     /** Stop position of a local recording, or -1 if it does not exist. */
     public long stopPosition(final long recordingId) {
         final long[] stop = {-1};

@@ -42,11 +42,18 @@ import java.util.jar.Manifest;
  *
  * <pre>
  * &lt;bundleRoot&gt;/2026-07-26T00-05-00Z-pos-1057814752/
- *     manifest.json
+ *     manifest.json        positions, build, schema, checksums, AND "recordings"
  *     snapshot/            consensus module + service recordings
  *     log/                 segments (previousPosition .. snapshotPosition)
  *     recording-log.txt    RecordingLog entries at capture time
  * </pre>
+ *
+ * <p><b>Why the manifest carries recording descriptors.</b> A {@code .rec} file does not state where
+ * it starts, where it stops, or how its frames are shaped; Aeron keeps that in the archive catalog,
+ * which stays on the box. Worse, the catalog entries for the recordings a bundle carries are
+ * DELETED by this class's own staging sweep a few lines after their files are copied out. The
+ * descriptors are therefore written into the manifest at the one moment both exist. Without them a
+ * bundle passes its checksum, uploads cleanly, and cannot be opened by anything.</p>
  *
  * <p><b>Ordering obligation.</b> Run this BEFORE archive housekeeping purges the
  * log below the snapshot, or the range this bundle needs is already gone. The
@@ -73,6 +80,93 @@ public final class BundleCapture {
      * else here is engine-agnostic and lives in exactly one place.
      */
     public record EngineSchema(int id, int version) {
+    }
+
+    /**
+     * One recording in the bundle, described well enough to be served again.
+     *
+     * <p>Aeron keeps this in the archive catalog, which stays on the box; the {@code .rec} files
+     * carry none of it. Without these fields a restore cannot say where a recording starts, where it
+     * stops, which file holds a given position, or how the frames are shaped — so the bundle is a
+     * pile of bytes rather than something an archive can replay.</p>
+     *
+     * <p>{@code serviceId} is -1 for the log. Everything else is verbatim from the staging catalog,
+     * except the log's {@code stopPosition}, which is clamped to the position this bundle was cut at.</p>
+     */
+    record BundledRecording(String role, int serviceId, StagingArchive.Descriptor descriptor) {
+
+        static BundledRecording log(final StagingArchive.Descriptor d, final long bundlePosition) {
+            require(d, "log");
+            final StagingArchive.Descriptor clamped = new StagingArchive.Descriptor(
+                    d.recordingId(), d.startPosition(), Math.min(d.stopPosition(), bundlePosition),
+                    d.initialTermId(), d.segmentFileLength(), d.termBufferLength(), d.mtuLength(),
+                    d.sessionId(), d.streamId(), d.strippedChannel(), d.originalChannel(),
+                    d.sourceIdentity());
+            return new BundledRecording("log", -1, clamped);
+        }
+
+        static BundledRecording snapshot(final StagingArchive.Descriptor d, final int serviceId) {
+            require(d, "snapshot");
+            return new BundledRecording("snapshot", serviceId, d);
+        }
+
+        /**
+         * A bundle whose recordings cannot be described is not a bundle. Failing here loses one
+         * capture; shipping the files without them produces something that looks complete, passes
+         * its checksum, and cannot be opened.
+         */
+        private static void require(final StagingArchive.Descriptor d, final String role) {
+            if (d == null) {
+                throw new IllegalStateException("[BUNDLE] no catalog entry for the staged " + role
+                        + " recording - refusing to write a bundle that cannot be replayed");
+            }
+        }
+
+        String toJson() {
+            final StagingArchive.Descriptor d = descriptor;
+            return "    {\n"
+                    + "      \"role\": \"" + role + "\",\n"
+                    + (serviceId >= 0 ? "      \"serviceId\": " + serviceId + ",\n" : "")
+                    + "      \"recordingId\": " + d.recordingId() + ",\n"
+                    + "      \"startPosition\": " + d.startPosition() + ",\n"
+                    + "      \"stopPosition\": " + d.stopPosition() + ",\n"
+                    + "      \"initialTermId\": " + d.initialTermId() + ",\n"
+                    + "      \"segmentFileLength\": " + d.segmentFileLength() + ",\n"
+                    + "      \"termBufferLength\": " + d.termBufferLength() + ",\n"
+                    + "      \"mtuLength\": " + d.mtuLength() + ",\n"
+                    + "      \"sessionId\": " + d.sessionId() + ",\n"
+                    + "      \"streamId\": " + d.streamId() + ",\n"
+                    + "      \"strippedChannel\": \"" + escape(d.strippedChannel()) + "\",\n"
+                    + "      \"originalChannel\": \"" + escape(d.originalChannel()) + "\",\n"
+                    + "      \"sourceIdentity\": \"" + escape(d.sourceIdentity()) + "\"\n"
+                    + "    }";
+        }
+
+        /** Aeron channel URIs are not JSON-safe by construction; escape what matters. */
+        private static String escape(final String value) {
+            if (value == null) {
+                return "";
+            }
+            final StringBuilder sb = new StringBuilder(value.length() + 8);
+            for (int i = 0; i < value.length(); i++) {
+                final char c = value.charAt(i);
+                switch (c) {
+                    case '"'  -> sb.append("\\\"");
+                    case '\\' -> sb.append("\\\\");
+                    case '\n' -> sb.append("\\n");
+                    case '\r' -> sb.append("\\r");
+                    case '\t' -> sb.append("\\t");
+                    default   -> {
+                        if (c < 0x20) {
+                            sb.append(String.format("\\u%04x", (int) c));
+                        } else {
+                            sb.append(c);
+                        }
+                    }
+                }
+            }
+            return sb.toString();
+        }
     }
 
     private static final DateTimeFormatter BUNDLE_STAMP =
@@ -177,6 +271,7 @@ public final class BundleCapture {
         final long logBytes;
         final long snapshotBytes;
         final List<Long> stagedSnapshotRecordings = new ArrayList<>();
+        final List<BundledRecording> recordings = new ArrayList<>();
 
         try (StagingArchive staging = StagingArchive.launch(stagingRoot)) {
             // Snapshot recordings are COMPLETE, so they replicate whole. There is one
@@ -216,6 +311,22 @@ public final class BundleCapture {
 
             state.dstLogRecordingId = dstLogRecordingId;
 
+            // Describe the recordings BEFORE the sweep below deletes their catalog entries. This is
+            // the only moment both exist: the files are in the bundle and their descriptors are still
+            // valid. One line later purgeRecording marks them DELETED, and nothing outside this
+            // archive can ever reconstruct what shape those bytes are in.
+            //
+            // The log is clamped to the position this bundle was cut at. Staging keeps recording into
+            // it, so its live stopPosition runs ahead of what the bundle actually carries, and a
+            // restore told otherwise would ask for bytes that are not there.
+            recordings.add(BundledRecording.log(
+                    staging.describe(dstLogRecordingId), selection.logPosition));
+            for (int i = 0; i < selection.snapshotEntries.size(); i++) {
+                final RecordingLog.Entry entry = selection.snapshotEntries.get(i);
+                recordings.add(BundledRecording.snapshot(
+                        staging.describe(stagedSnapshotRecordings.get(i)), entry.serviceId));
+            }
+
             reclaimStaging(staging, dstLogRecordingId, durablePosition, selection.logPosition);
         }
 
@@ -224,7 +335,7 @@ public final class BundleCapture {
                 StandardCopyOption.REPLACE_EXISTING);
 
         writeManifest(bundleDir, cluster, nodeId, selection, state.lastBundledPosition,
-                capturedAt, logBytes, snapshotBytes, snapshotDir, logDir, schema);
+                capturedAt, logBytes, snapshotBytes, snapshotDir, logDir, schema, recordings);
 
         final long previousPosition = state.lastBundledPosition;
         state.lastBundledPosition = selection.logPosition;
@@ -503,7 +614,15 @@ public final class BundleCapture {
                                       final Instant capturedAt, final long logBytes,
                                       final long snapshotBytes,
                                       final File snapshotDir, final File logDir,
-                                      final EngineSchema schema) throws IOException {
+                                      final EngineSchema schema,
+                                      final List<BundledRecording> recordings) throws IOException {
+        final StringBuilder recordingsJson = new StringBuilder("[\n");
+        for (int i = 0; i < recordings.size(); i++) {
+            recordingsJson.append(recordings.get(i).toJson());
+            recordingsJson.append(i < recordings.size() - 1 ? ",\n" : "\n");
+        }
+        recordingsJson.append("  ]");
+
         final String json = "{\n"
                 + "  \"cluster\": \"" + cluster + "\",\n"
                 + "  \"nodeId\": " + nodeId + ",\n"
@@ -517,6 +636,7 @@ public final class BundleCapture {
                 + "  \"logBytes\": " + logBytes + ",\n"
                 + "  \"snapshotBytes\": " + snapshotBytes + ",\n"
                 + "  \"compression\": \"gzip\",\n"
+                + "  \"recordings\": " + recordingsJson + ",\n"
                 + "  \"sha256\": {\n"
                 + "    \"snapshot\": \"" + digestDirectory(snapshotDir) + "\",\n"
                 + "    \"log\": \"" + digestDirectory(logDir) + "\"\n"

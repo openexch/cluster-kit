@@ -6,7 +6,7 @@
 
     <groupId>com.openexchange</groupId>
     <artifactId>cluster-kit</artifactId>
-    <version>0.1.3</version>
+    <version>0.1.4</version>
     <packaging>jar</packaging>
 
     <name>Cluster Kit</name>
@@ -76,6 +76,19 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.5.6</version>
+                <configuration>
+                    <!-- Agrona reaches jdk.internal.misc.Unsafe for every buffer it
+                         touches, so any test that builds a real Aeron counter needs
+                         these opens. The engines already pass them at runtime (and in
+                         their own surefire config); without them here a counter-backed
+                         test fails with NoClassDefFoundError on org.agrona.BufferUtil,
+                         which reads as a broken test rather than a missing flag. -->
+                    <argLine>
+                        --add-opens java.base/jdk.internal.misc=ALL-UNNAMED
+                        --add-opens java.base/java.nio=ALL-UNNAMED
+                        --add-opens java.base/sun.nio.ch=ALL-UNNAMED
+                    </argLine>
+                </configuration>
             </plugin>
         </plugins>
     </build>

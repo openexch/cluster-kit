@@ -56,6 +56,9 @@ public final class SnapshotLogPruner {
     /** How often the snapshot counter is read. Nothing else happens on these wakeups. */
     private static final long POLL_INTERVAL_MS = 5_000;
 
+    /** How long to wait for the consensus module to answer a members query. */
+    private static final long QUERY_TIMEOUT_MS = 1_000;
+
     private final File clusterDir;
     private final AeronArchive.Context archiveContext;
     private final CountersReader countersReader;
@@ -69,6 +72,13 @@ public final class SnapshotLogPruner {
      * reopening the purge path.
      */
     private volatile java.util.function.LongSupplier watermark = () -> Long.MAX_VALUE;
+
+    // Retention reporting: computed on the leader after each snapshot, logged, and
+    // NOT yet applied to the purge. Null until reportWatermark() wires it.
+    private ClusterMemberPositions positions;
+    private java.util.function.BooleanSupplier isLeader;
+    private RetentionWatermark retention;
+    private volatile String lastWatermarkReport;
 
     private volatile boolean running;
     private Thread thread;
@@ -100,6 +110,28 @@ public final class SnapshotLogPruner {
      */
     public SnapshotLogPruner watermark(final java.util.function.LongSupplier watermark) {
         this.watermark = watermark;
+        return this;
+    }
+
+    /**
+     * Compute the retention watermark on the leader after each snapshot, and REPORT
+     * it. It is not applied to the purge yet.
+     *
+     * <p>That split is deliberate and it is the same one the gateway made. The
+     * watermark replaces a boolean whose two branches are "strand a member" and
+     * "grow without bound", so it is a real improvement, but it changes what gets
+     * DELETED from a live money ledger and the direction that hurts is deleting
+     * what a member still needed. Watching the computed numbers under real traffic
+     * costs nothing; being wrong costs a reseed of the ledger.</p>
+     *
+     * @param positions how to ask the consensus module (leader only; see that class)
+     * @param isLeader  whether this node is the leader right now
+     */
+    public SnapshotLogPruner reportWatermark(final ClusterMemberPositions positions,
+                                             final java.util.function.BooleanSupplier isLeader) {
+        this.positions = positions;
+        this.isLeader = isLeader;
+        this.retention = new RetentionWatermark();
         return this;
     }
 
@@ -153,6 +185,9 @@ public final class SnapshotLogPruner {
                 if (archive == null) {
                     archive = AeronArchive.connect(archiveContext);
                 }
+
+                reportRetentionWatermark();
+
                 final ArchiveHousekeeping.Result result =
                     ArchiveHousekeeping.purgeBelow(clusterDir, archive, watermark.getAsLong());
                 seenSnapshots = count;
@@ -174,6 +209,68 @@ public final class SnapshotLogPruner {
         } finally {
             CloseHelper.quietClose(archive);
         }
+    }
+
+    /**
+     * Ask the leader's consensus module how far every member has got, work out what
+     * that would allow, and say so. Nothing acts on the answer yet.
+     *
+     * <p>Only on the leader: a follower's consensus module does not track anyone
+     * else's position, so its answer would be a confident description of nothing.</p>
+     */
+    private void reportRetentionWatermark() {
+        if (retention == null || !isLeader.getAsBoolean()) {
+            return;
+        }
+        try {
+            final long snapshotPosition = latestSnapshotPosition();
+            if (snapshotPosition < 0) {
+                return;
+            }
+            final ClusterMemberPositions.Snapshot answer = positions.query(QUERY_TIMEOUT_MS);
+            final RetentionWatermark.Result result = retention.compute(
+                snapshotPosition, answer, -1, -1, System.currentTimeMillis());
+
+            lastWatermarkReport = result.toString();
+            System.out.println("[RETENTION] would purge below " + result.position
+                + " (limiter=" + result.limiter + ", inputs=" + result.detail
+                + (answer == null
+                    ? ", CONSENSUS MODULE DID NOT ANSWER - holding at the last known positions"
+                    : ", members=" + answer.members.size() + " leader=" + answer.leaderMemberId)
+                + ") - not applied yet, purging to the snapshot at " + snapshotPosition);
+
+            for (final int member : result.stranded) {
+                // Loud by design: this is a decision to stop waiting for a member,
+                // and the only remedy is a reseed. An accidental disk-full is what
+                // happens when nobody says this out loud.
+                System.err.println("[RETENTION] member " + member + " STRANDED: it has held the "
+                    + "retention watermark past the bound and been written off. It cannot "
+                    + "log-catch-up and must be reseeded.");
+            }
+        } catch (final Exception e) {
+            // Reporting must never be the reason a purge does not happen.
+            System.err.println("[RETENTION] could not compute the watermark: " + e);
+        }
+    }
+
+    /** This node's newest valid snapshot position, or -1. */
+    private long latestSnapshotPosition() {
+        long latest = -1;
+        try (io.aeron.cluster.RecordingLog recordingLog =
+                 new io.aeron.cluster.RecordingLog(clusterDir, false)) {
+            for (final io.aeron.cluster.RecordingLog.Entry entry : recordingLog.entries()) {
+                if (entry.type == io.aeron.cluster.RecordingLog.ENTRY_TYPE_SNAPSHOT
+                    && entry.isValid && entry.logPosition > latest) {
+                    latest = entry.logPosition;
+                }
+            }
+        }
+        return latest;
+    }
+
+    /** The last retention report, for status and tests. */
+    public String lastWatermarkReport() {
+        return lastWatermarkReport;
     }
 
     /**

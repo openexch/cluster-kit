@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+# The publish below is check-then-deploy; two quick merges to main can race it.
+# One at a time, the next one queues.
+concurrency:
+  group: publish-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -12,7 +18,32 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
+        with:
+          # The version guard diffs against the merge-base with main.
+          fetch-depth: 0
+
+      # Publish is existence-gated, so source changes without a version bump are
+      # published NOWHERE: consumers pinning the old version keep old bytes and
+      # nothing ever says so (it happened: d3c0f91 changed BundleCapture and
+      # StagingArchive and stayed unreachable until b8d47c1 bumped 0.1.3).
+      - name: "Guard: version must move when src does"
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          BASE=$(git merge-base HEAD origin/main)
+          if git diff --quiet "$BASE" HEAD -- src/main; then
+            echo "src/main unchanged; no bump needed."
+            exit 0
+          fi
+          # Project version = the line after this pom's own artifactId.
+          OLD=$(git show "$BASE:pom.xml" | awk '/<artifactId>cluster-kit<\/artifactId>/{getline; print; exit}')
+          NEW=$(awk '/<artifactId>cluster-kit<\/artifactId>/{getline; print; exit}' pom.xml)
+          if [ "$OLD" = "$NEW" ]; then
+            echo "::error::src/main changed but pom.xml <version> did not ($NEW). Publish is existence-gated: without a bump these changes are unreachable by any consumer. Bump the version."
+            exit 1
+          fi
+          echo "version moves with src: $OLD -> $NEW"
       - uses: actions/setup-java@v5
         with:
           java-version: '21'

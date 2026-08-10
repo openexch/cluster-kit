@@ -34,7 +34,7 @@
              engine supplies and shades its own, and building here against the
              floor is what keeps a 1.51 consumer working. Raise this only when
              the slowest engine has moved. -->
-        <aeron.version>1.51.0</aeron.version>
+        <aeron.version>1.52.2</aeron.version>
         <agrona.version>2.4.1</agrona.version>
         <junit.version>4.13.2</junit.version>
     </properties>

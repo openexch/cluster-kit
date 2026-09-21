@@ -33,7 +33,7 @@
              two clusters on one substrate; match and oms were already there),
              so this now matches all three consumers. -->
         <aeron.version>1.53.0</aeron.version>
-        <agrona.version>2.6.0</agrona.version>
+        <agrona.version>2.6.1</agrona.version>
         <junit.version>4.13.2</junit.version>
     </properties>
 

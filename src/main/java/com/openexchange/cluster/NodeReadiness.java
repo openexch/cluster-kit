@@ -2,162 +2,171 @@
 package com.openexchange.cluster;
 
 import io.aeron.cluster.service.Cluster.Role;
-
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 
 /**
- * What a cluster node answers when an orchestrator asks "are you alive?" and
- * "may I send you work, or restart the next one?".
- *
- * <p>This exists because the orchestrator replaces the supervisor. A rolling
- * restart is one pod at a time, and each step waits for the previous pod to
- * report ready. If ready means "the port is open", the orchestrator will happily
- * restart the second node while the first is still catching up, and a
- * three-member cluster loses quorum. So readiness here means <b>caught up</b>,
- * and everything it cannot prove counts against it.</p>
- *
- * <h2>Liveness is not readiness</h2>
- *
- * <p>Liveness answers "should this process be killed". Readiness answers
- * "should traffic and rolling restarts wait for it". They are separate because
- * a node that is replaying the log is perfectly healthy and must not be killed,
- * yet must not be counted as a working member either.</p>
- *
- * <h2>The tick is the point</h2>
- *
- * <p>Both answers hang off {@link #tick()}, called from the duty cycle. A JVM
- * whose agent thread has stopped still accepts TCP connections and still
- * answers an HTTP handler on another thread: that is exactly how a process that
- * had OOMed kept reporting itself up for hours. A stale tick is therefore
- * treated as dead rather than as missing information.</p>
- *
- * <h2>What this cannot see</h2>
- *
- * <p>Aeron gives the service no explicit "the log replay finished" callback. A
- * node counts as caught up once it has both started and observed a role while
- * live; engines that can prove it earlier or later should call
- * {@link #catchUpComplete()} / {@link #catchingUp()} themselves. Where nothing
- * is known, the answer is NOT ready, never "probably fine".</p>
+ * Service duty-cycle liveness and bounded, term-fenced catch-up evidence.
+ * Only the service thread supplies observations, after application callbacks return.
+ * Readers see one immutable observation. No network, disk access or waiting is done here.
+ * A role or a manually asserted boolean never establishes readiness.
  */
 public final class NodeReadiness {
-
-    /** A tick older than this means the duty cycle is wedged; the node is dead. */
     public static final long DEFAULT_LIVENESS_STALE_MS = 30_000;
-
-    /** A tick older than this means the node cannot be trusted to be current. */
     public static final long DEFAULT_READINESS_STALE_MS = 5_000;
+    public static final long MAX_CHECKPOINT_AGE_MS = 1_000;
+    public static final long MAX_APPLY_LAG_BYTES = 64 * 1024;
 
-    private final long livenessStaleMs;
-    private final long readinessStaleMs;
-    private final AtomicLong lastTickMs = new AtomicLong();
-    private final AtomicReference<Role> role = new AtomicReference<>();
+    private final long livenessStaleNs;
+    private final long readinessStaleNs;
+    private final LongSupplier clock;
+    private volatile long lastTickNs;
+    private volatile boolean ticked;
     private volatile boolean started;
-    private volatile boolean caughtUp;
     private volatile boolean stopping;
+    private volatile String terminalReason;
+    private volatile Role role;
+    private volatile Evidence evidence;
+    // Service-thread-owned checkpoint state. Hold a target until applied rather
+    // than chasing a moving commit position forever under continuous load.
+    private long target = -1;
+    private long targetObservedNs;
+    private long verified = -1;
+    private long verifiedObservedNs;
+
+    private record Evidence(long source, long term, long elections, Role role,
+                            long applied, long commit, long checkpoint, long checkpointObservedNs,
+                            long observedNs, long consensusAgeMs, String recovery) { }
+
+    /** One response including status and diagnostic body from the same evidence. */
+    public record Probe(boolean live, boolean ready, String detail) { }
 
     public NodeReadiness() {
         this(DEFAULT_LIVENESS_STALE_MS, DEFAULT_READINESS_STALE_MS);
     }
 
     public NodeReadiness(final long livenessStaleMs, final long readinessStaleMs) {
-        this.livenessStaleMs = livenessStaleMs;
-        this.readinessStaleMs = readinessStaleMs;
+        this(livenessStaleMs, readinessStaleMs, System::nanoTime);
     }
 
-    /**
-     * Called from the duty cycle, including on idle. This is the heartbeat both
-     * answers are built on, so it must be reached on every cycle rather than
-     * only when there is work: a quiet market is not a wedged node.
-     */
-    public void tick() {
-        lastTickMs.set(System.currentTimeMillis());
+    NodeReadiness(final long livenessStaleMs, final long readinessStaleMs, final LongSupplier clock) {
+        if (readinessStaleMs <= 0 || livenessStaleMs < readinessStaleMs) {
+            throw new IllegalArgumentException("invalid freshness bounds");
+        }
+        this.livenessStaleNs = TimeUnit.MILLISECONDS.toNanos(livenessStaleMs);
+        this.readinessStaleNs = TimeUnit.MILLISECONDS.toNanos(readinessStaleMs);
+        this.clock = clock;
     }
 
-    /** The service finished {@code onStart}: snapshot loaded, log replay may follow. */
-    public void started() {
-        started = true;
-        tick();
-    }
+    /** Called even when idle; a lack of business events is not a liveness failure. */
+    public void tick() { lastTickNs = clock.getAsLong(); ticked = true; }
+    public void started() { started = true; catchingUp(); tick(); }
 
-    /** The node has consumed the log up to the cluster's committed position. */
-    public void catchUpComplete() {
-        caughtUp = true;
-    }
+    /** Compatibility only: a boolean cannot supply missing application evidence. */
+    @Deprecated public void catchUpComplete() { }
+    public void catchingUp() { target = verified = -1; evidence = null; }
 
-    /** The node is behind again (rejoin, replay, a leadership term it missed). */
-    public void catchingUp() {
-        caughtUp = false;
-    }
-
-    /**
-     * A role was observed. CANDIDATE means an election is in flight, which is
-     * the one time a member is emphatically not ready to be counted on, and
-     * also the moment a rolling restart most wants to pause.
-     */
     public void roleChanged(final Role newRole) {
-        role.set(newRole);
-        if (newRole == Role.LEADER || newRole == Role.FOLLOWER) {
-            caughtUp = true;
-        }
-        tick();
+        if (newRole != role) { catchingUp(); role = newRole; }
     }
 
-    /** Shutdown began: stop advertising readiness before the process goes away. */
-    public void stopping() {
-        stopping = true;
+    public void stopping() { stopping = true; }
+
+    /** Terminal for this process incarnation; restarting does not itself repair state. */
+    public void needsReseed(final String reason) {
+        terminalReason = reason == null ? "unspecified" : reason;
+    }
+
+    /** Withdraw evidence when its source disappears, closes or changes during a read. */
+    public void unavailable(final String reason) {
+        target = verified = -1;
+        evidence = new Evidence(-1, -1, -1, role, -1, -1, -1, 0,
+                clock.getAsLong(), -1, reason);
     }
 
     /**
-     * Liveness. False only when the duty cycle has stopped advancing, which is
-     * the state an external supervisor could never distinguish from healthy.
+     * Observe one consensus incarnation/term, with applied and committed positions
+     * in the SAME cluster log byte space. Consensus age comes from the consensus
+     * agent heartbeat, not from movement of the commit counter.
      */
-    public boolean live() {
-        return sinceTickMs() < livenessStaleMs;
+    public void observe(final long source, final long term, final long elections, final Role observedRole,
+                        final long applied, final long commit, final boolean electionClosed,
+                        final boolean active, final long consensusAgeMs) {
+        roleChanged(observedRole);
+        final long now = clock.getAsLong();
+        final Evidence previous = evidence;
+        if (previous == null || previous.source != source || previous.term != term
+                || previous.elections != elections || previous.applied > applied || previous.commit > commit) {
+            target = verified = -1;
+        }
+        String recovery = "observing";
+        if (!electionClosed || (observedRole != Role.FOLLOWER && observedRole != Role.LEADER)) {
+            recovery = "election";
+        } else if (!active) {
+            recovery = "consensus-inactive";
+        } else if (source < 0 || term < 0 || elections < 0 || applied < 0 || commit < 0) {
+            recovery = "unknown-position";
+        } else if (consensusAgeMs < 0 || TimeUnit.MILLISECONDS.toNanos(consensusAgeMs) >= readinessStaleNs) {
+            recovery = "stale-consensus";
+        }
+        if (!recovery.equals("observing")) {
+            target = verified = -1;
+        } else {
+            if (target < 0) { target = commit; targetObservedNs = now; }
+            if (applied >= target) {
+                verified = target;
+                verifiedObservedNs = targetObservedNs;
+                target = commit;
+                targetObservedNs = now;
+                // Idle and already caught up: the same position is fresh evidence.
+                if (applied >= commit) { verified = commit; verifiedObservedNs = now; }
+            }
+            recovery = verified < 0 ? "catching-up" : "observed";
+        }
+        evidence = new Evidence(source, term, elections, observedRole, applied, commit,
+                verified, verifiedObservedNs, now, consensusAgeMs, recovery);
     }
 
-    /** Readiness, in the orchestrator's sense: safe to route to, safe to move on from. */
-    public boolean ready() {
-        if (stopping || !started || !caughtUp) {
-            return false;
-        }
-        final Role current = role.get();
-        if (current != Role.LEADER && current != Role.FOLLOWER) {
-            return false;
-        }
-        return sinceTickMs() < readinessStaleMs;
+    public boolean live() { return ticked && age(clock.getAsLong(), lastTickNs) < livenessStaleNs; }
+    public boolean ready() { return reason(evidence, clock.getAsLong()).equals("ready"); }
+    public String describe() { return probe().detail; }
+
+    public Probe probe() {
+        final Evidence e = evidence;
+        final long now = clock.getAsLong();
+        final String reason = reason(e, now);
+        final String detail = "role=" + (e == null ? role : e.role) + " recovery=" + reason
+                + " source=" + (e == null ? -1 : e.source)
+                + " term=" + (e == null ? -1 : e.term)
+                + " elections=" + (e == null ? -1 : e.elections)
+                + " applied=" + (e == null ? -1 : e.applied)
+                + " commit=" + (e == null ? -1 : e.commit)
+                + " checkpoint=" + (e == null ? -1 : e.checkpoint)
+                + " observationAgeMs=" + (e == null ? -1 : TimeUnit.NANOSECONDS.toMillis(age(now, e.observedNs)))
+                + " consensusAgeMs=" + (e == null ? -1 : e.consensusAgeMs)
+                + " maxLagBytes=" + MAX_APPLY_LAG_BYTES
+                + " maxCheckpointAgeMs=" + MAX_CHECKPOINT_AGE_MS;
+        return new Probe(ticked && age(now, lastTickNs) < livenessStaleNs, reason.equals("ready"), detail);
     }
 
-    /** Why the current answer is what it is, for the body of the probe response. */
-    public String describe() {
-        if (stopping) {
-            return "stopping";
-        }
-        if (!started) {
-            return "starting";
-        }
-        if (!caughtUp) {
-            return "catching up";
-        }
-        final Role current = role.get();
-        if (current == null) {
-            return "role unknown";
-        }
-        if (current != Role.LEADER && current != Role.FOLLOWER) {
-            return "election in progress (" + current + ")";
-        }
-        final long stale = sinceTickMs();
-        if (stale >= readinessStaleMs) {
-            return "duty cycle last advanced " + stale + "ms ago";
-        }
-        return current.toString().toLowerCase() + ", caught up";
+    private String reason(final Evidence e, final long now) {
+        if (stopping) { return "stopping"; }
+        if (terminalReason != null) { return "needs-reseed:" + terminalReason; }
+        if (!started) { return "starting"; }
+        if (!ticked || age(now, lastTickNs) >= readinessStaleNs) { return "stale-duty-cycle"; }
+        if (e == null || e.role != role) { return "evidence-missing"; }
+        if (age(now, e.observedNs) >= readinessStaleNs) { return "stale-observation"; }
+        if (!e.recovery.equals("observed")) { return e.recovery; }
+        if (e.commit > e.applied && e.commit - e.applied > MAX_APPLY_LAG_BYTES) { return "apply-lag"; }
+        if (e.checkpoint < 0 || age(now, e.checkpointObservedNs)
+                >= TimeUnit.MILLISECONDS.toNanos(MAX_CHECKPOINT_AGE_MS)) { return "stale-checkpoint"; }
+        if (TimeUnit.MILLISECONDS.toNanos(e.consensusAgeMs) + age(now, e.observedNs)
+                >= readinessStaleNs) { return "stale-consensus"; }
+        return "ready";
     }
 
-    private long sinceTickMs() {
-        final long last = lastTickMs.get();
-        if (last == 0) {
-            return Long.MAX_VALUE; // never ticked: unknown counts against us
-        }
-        return System.currentTimeMillis() - last;
+    private static long age(final long now, final long then) {
+        final long elapsed = now - then;
+        return elapsed < 0 ? Long.MAX_VALUE : elapsed;
     }
 }

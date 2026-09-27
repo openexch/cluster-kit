@@ -127,14 +127,28 @@ public final class NodeReadiness {
                 verified, verifiedObservedNs, now, consensusAgeMs, recovery);
     }
 
-    public boolean live() { return ticked && age(clock.getAsLong(), lastTickNs) < livenessStaleNs; }
-    public boolean ready() { return reason(evidence, clock.getAsLong()).equals("ready"); }
+    public boolean live() {
+        final boolean knownTick = ticked;
+        final long tick = lastTickNs;
+        return knownTick && age(clock.getAsLong(), tick) < livenessStaleNs;
+    }
+    public boolean ready() {
+        final boolean knownTick = ticked;
+        final long tick = lastTickNs;
+        final Evidence e = evidence;
+        return reason(e, clock.getAsLong(), knownTick, tick).equals("ready");
+    }
     public String describe() { return probe().detail; }
 
     public Probe probe() {
+        // Capture the writer's timestamp BEFORE reading our clock. Reading it
+        // afterwards can see a newer tick, yielding a negative age on a healthy
+        // busy service. All checks in this response use this captured tick.
+        final boolean knownTick = ticked;
+        final long tick = lastTickNs;
         final Evidence e = evidence;
         final long now = clock.getAsLong();
-        final String reason = reason(e, now);
+        final String reason = reason(e, now, knownTick, tick);
         final String detail = "role=" + (e == null ? role : e.role) + " recovery=" + reason
                 + " source=" + (e == null ? -1 : e.source)
                 + " term=" + (e == null ? -1 : e.term)
@@ -146,14 +160,14 @@ public final class NodeReadiness {
                 + " consensusAgeMs=" + (e == null ? -1 : e.consensusAgeMs)
                 + " maxLagBytes=" + MAX_APPLY_LAG_BYTES
                 + " maxCheckpointAgeMs=" + MAX_CHECKPOINT_AGE_MS;
-        return new Probe(ticked && age(now, lastTickNs) < livenessStaleNs, reason.equals("ready"), detail);
+        return new Probe(knownTick && age(now, tick) < livenessStaleNs, reason.equals("ready"), detail);
     }
 
-    private String reason(final Evidence e, final long now) {
+    private String reason(final Evidence e, final long now, final boolean knownTick, final long tick) {
         if (stopping) { return "stopping"; }
         if (terminalReason != null) { return "needs-reseed:" + terminalReason; }
         if (!started) { return "starting"; }
-        if (!ticked || age(now, lastTickNs) >= readinessStaleNs) { return "stale-duty-cycle"; }
+        if (!knownTick || age(now, tick) >= readinessStaleNs) { return "stale-duty-cycle"; }
         if (e == null || e.role != role) { return "evidence-missing"; }
         if (age(now, e.observedNs) >= readinessStaleNs) { return "stale-observation"; }
         if (!e.recovery.equals("observed")) { return e.recovery; }

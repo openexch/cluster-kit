@@ -5,8 +5,11 @@ requires service application evidence and a live, active consensus module with
 its election closed. A role transition alone cannot establish readiness.
 
 `ConsensusReadiness` reads the already-open `ConsensusModule.Context`. In Aeron
-1.53.0, the service agent invokes background work after log callbacks return, so
-`Cluster.logPosition()` at this point describes completed service application.
+1.53.0, ordinary background work follows log application, but `idle()` can also
+reenter background work before a callback returns. Engines must suppress consensus
+observation during such reentry: `Cluster.logPosition()` is set before the callback
+and is not completion evidence while that callback is still running. Both engines
+guard their application callbacks and publish observations only after return.
 The consensus commit counter bounds that same cluster log in bytes. The counter
 registration ID, leadership term and election count fence observations. A
 changed fence, role, regressed position or unavailable source withdraws proof.

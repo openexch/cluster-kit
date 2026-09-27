@@ -40,7 +40,12 @@ public class ConsensusReadinessTest {
                         default -> throw new AssertionError("unexpected blocking/API call " + method);
                     });
             final NodeReadiness r = new NodeReadiness(); r.started();
-            final ConsensusReadiness probe = new ConsensusReadiness(context, r);
+            final long[] remotePosition = {100};
+            final long[] remoteAge = {0};
+            final boolean[] remoteKnown = {true};
+            final ConsensusReadiness probe = new ConsensusReadiness(context, r, t -> remoteKnown[0]
+                    ? new ConsensusReadiness.LeaderCheckpoint(context.leadershipTermIdCounter().get(),
+                        999, remotePosition[0], t - remoteAge[0]) : null);
             long now = System.nanoTime(); probe.poll(cluster, now);
             assertFalse(r.ready());
             applied[0] = 100; probe.poll(cluster, now += 20_000_000);
@@ -50,8 +55,19 @@ public class ConsensusReadinessTest {
             assertFalse(r.ready()); assertTrue(r.live());
             context.electionStateCounter().set(ElectionState.CLOSED.code());
             context.leadershipTermIdCounter().set(8); context.commitPositionCounter().set(200);
+            remotePosition[0] = 200;
             probe.poll(cluster, now += 20_000_000); assertFalse(r.ready());
             applied[0] = 200; probe.poll(cluster, now += 20_000_000); assertTrue(r.ready());
+            remotePosition[0] = 100_000;
+            probe.poll(cluster, now += 20_000_000);
+            assertFalse("local equality must not hide leader commit lag: " + r.describe(), r.ready());
+            applied[0] = 100_000; context.commitPositionCounter().set(100_000);
+            probe.poll(cluster, now += 20_000_000); assertTrue(r.ready());
+            remoteAge[0] = 6_000_000_000L;
+            probe.poll(cluster, now += 20_000_000); assertFalse("stale leader proof", r.ready());
+            remoteAge[0] = 0; remoteKnown[0] = false;
+            probe.poll(cluster, now += 20_000_000); assertFalse("missing leader proof", r.ready());
+            remoteKnown[0] = true;
             mark.updateActivityTimestamp(System.currentTimeMillis() - 6000);
             probe.poll(cluster, now += 20_000_000); assertFalse(r.ready());
             assertTrue(r.describe().contains("stale-consensus"));

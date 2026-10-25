@@ -186,6 +186,16 @@ public final class ClusterMemberPositions implements AutoCloseable {
                 : extendedDecoder.activeMembers()) {
             members.add(new Member(active.memberId(), active.logPosition(),
                 active.timeOfLastAppendNs()));
+            // Each group entry ends with five variable-length endpoint strings. SBE only
+            // advances to the next entry past the ones that were READ (or skipped); leaving
+            // them unread made every entry after the first decode the previous entry's
+            // endpoint bytes as its ids and positions (found 2026-10-25 by the R03 fixture:
+            // member ids 1818321775 / 808857650, positions in the 10^18 range).
+            active.skipIngressEndpoint();
+            active.skipConsensusEndpoint();
+            active.skipLogEndpoint();
+            active.skipCatchupEndpoint();
+            active.skipArchiveEndpoint();
         }
 
         received = new Snapshot(currentTimeNs, leaderMemberId,

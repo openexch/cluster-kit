@@ -6,7 +6,6 @@ import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Objects;
 
 /**
  * Golden-master comparison for determinism scenarios. JUnit-free: it throws {@link AssertionError}
@@ -52,25 +51,8 @@ public final class GoldenAssert {
         }
     }
 
-    /** Minimal line-oriented diff: '-' expected, '+' actual, for the lines that differ. */
+    /** Minimal line-oriented diff: '-' expected, '+' actual, for the lines that differ ({@link TextDiff}). */
     public static String diff(final String expected, final String actual) {
-        final String[] e = expected.split("\n", -1);
-        final String[] a = actual.split("\n", -1);
-        final StringBuilder sb = new StringBuilder();
-        final int max = Math.max(e.length, a.length);
-        for (int i = 0; i < max; i++) {
-            final String el = i < e.length ? e[i] : null;
-            final String al = i < a.length ? a[i] : null;
-            if (!Objects.equals(el, al)) {
-                sb.append("  @ line ").append(i + 1).append('\n');
-                if (el != null) {
-                    sb.append("  - ").append(el).append('\n');
-                }
-                if (al != null) {
-                    sb.append("  + ").append(al).append('\n');
-                }
-            }
-        }
-        return sb.toString();
+        return TextDiff.diff(expected, actual);
     }
 }

@@ -29,9 +29,14 @@
              bytecode is valid on all of them. `provided` scope: each engine
              supplies and shades its own copy; this pin only sets the compile
              floor. Raise it only when the slowest consumer has moved. The
-             floor moved to 1.52.2/2.5.0 on 2026-08-10 (assets #44 aligned the
-             two clusters on one substrate; match and oms were already there),
-             so this now matches all three consumers. -->
+             floor is 1.53.0/2.6.0 since 2026-09-09 (f692a83 and 46f4436, from
+             1.52.2/2.5.0): assets runs 1.53.0 and match 1.53.1, both on
+             agrona 2.6.0. oms still pins Aeron 1.52.2 with an older kit
+             (0.1.8, ClusterPorts only); it is not covered by this floor until
+             it moves. CI also runs the tests against 1.53.1
+             (-Daeron.version=1.53.1), the version match ships; the
+             1.53.0 -> 1.53.1 delta is recorded in the notebook
+             (RCS/S2/aeron-1.53.1-rediff.txt). -->
         <aeron.version>1.53.0</aeron.version>
         <agrona.version>2.6.0</agrona.version>
         <junit.version>4.13.2</junit.version>

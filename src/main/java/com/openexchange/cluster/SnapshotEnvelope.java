@@ -95,8 +95,20 @@ public final class SnapshotEnvelope {
         final byte[] array = buf.byteArray();
         if (array != null) {
             crc.update(array, buf.wrapAdjustment() + offset, length);
+        } else if (buf.byteBuffer() != null) {
+            // RCS S3: a view of a direct ByteBuffer at a non-zero offset (the shadow image buffer's payload view) has
+            // its own origin at wrapAdjustment(); reading from the ByteBuffer's origin hashed the wrong bytes
+            final int base = (int) buf.wrapAdjustment();
+            crc.update(buf.byteBuffer().duplicate().limit(base + offset + length).position(base + offset));
         } else {
-            crc.update(buf.byteBuffer().duplicate().position(offset).limit(offset + length));
+            // a raw-address buffer: copy through a scratch array
+            final byte[] scratch = new byte[Math.min(length, 64 * 1024)];
+            for (int done = 0; done < length; ) {
+                final int n = Math.min(scratch.length, length - done);
+                buf.getBytes(offset + done, scratch, 0, n);
+                crc.update(scratch, 0, n);
+                done += n;
+            }
         }
         return (int) crc.getValue();
     }

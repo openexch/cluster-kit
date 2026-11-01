@@ -118,6 +118,40 @@ public final class NeverSchedulesScan {
                     rf6.forbiddenAnyOwner(), rf6.forbiddenMembers(), rf6.forbiddenOwnerPrefixMembers(),
                     Map.of("java/lang/System", Map.of("arraycopy", "a pure memory copy: no clock, I/O or state")));
         }
+
+        /**
+         * RCS S3 9.1, the {@code cluster.shadow} package: it may hold Aeron and archive clients its host passes in, but
+         * never a {@code RecordingLog}, a {@code Cluster}, a {@code ClientSession}, a {@code TimerPort}, a timer call,
+         * any media driver type (C13: hosts own the driver), the wall or nano clock of {@code System}, the environment,
+         * a system property, or an engine-specific type. The one {@code System.getProperty} the package has (the
+         * {@code oxs.shadow.unchecked} gate in {@code ShadowSelfCheck}) is scanned with {@link #shadowSelfCheck()}.
+         */
+        public static Rules shadow() {
+            return new Rules(
+                    Set.of("io/aeron/cluster/RecordingLog",
+                            "io/aeron/cluster/service/Cluster",
+                            "io/aeron/cluster/service/ClientSession",
+                            "com/openexchange/cluster/TimerPort",
+                            "io/aeron/driver/MediaDriver",
+                            "io/aeron/archive/ArchivingMediaDriver",
+                            "io/aeron/cluster/ClusterBackupMediaDriver",
+                            "io/aeron/cluster/ClusteredMediaDriver"),
+                    List.of("com/openexchange/assets/", "com/match/"),
+                    Set.of("scheduleTimer", "cancelTimer"),
+                    Map.of("java/lang/System", Set.of("currentTimeMillis", "nanoTime", "getenv", "getProperty",
+                            "getProperties", "setProperty")),
+                    Map.of(),
+                    Map.of());
+        }
+
+        /** {@link #shadow()} without the {@code getProperty} ban: for {@code ShadowSelfCheck} alone. */
+        public static Rules shadowSelfCheck() {
+            final Rules shadow = shadow();
+            return new Rules(shadow.forbiddenTypes(), shadow.forbiddenPrefixes(), shadow.forbiddenAnyOwner(),
+                    Map.of("java/lang/System", Set.of("currentTimeMillis", "nanoTime", "getenv", "getProperties",
+                            "setProperty")),
+                    shadow.forbiddenOwnerPrefixMembers(), shadow.onlyAllowedMembers());
+        }
     }
 
     // ------------------------------------------------------------------------------------------------------ entry

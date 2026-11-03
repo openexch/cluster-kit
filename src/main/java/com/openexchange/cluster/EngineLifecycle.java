@@ -3,6 +3,9 @@ package com.openexchange.cluster;
 
 import io.aeron.CncFileDescriptor;
 import io.aeron.exceptions.AeronException;
+import io.aeron.exceptions.ClientTimeoutException;
+import io.aeron.exceptions.ConductorServiceTimeoutException;
+import io.aeron.exceptions.DriverTimeoutException;
 import org.agrona.concurrent.AgentTerminationException;
 
 import java.io.File;
@@ -21,7 +24,7 @@ import java.util.function.IntConsumer;
  *
  * <p>Rules (RC2 S16 W9, PO 2026-11-03):
  * <ul>
- *   <li>A fatal fault (a FATAL Aeron error with an external driver, i.e. the media driver died; an agent that
+ *   <li>A fatal fault (any other FATAL Aeron error with an external driver; an agent that
  *       terminated unexpectedly; a startup failure such as no CnC within the driver wait) exits with a non-zero
  *       status, never 0: the components are closed on the main thread, then the process halts with the fault's
  *       status; a daemon backstop halts with the same status after the fatal grace if the close hangs.</li>
@@ -32,6 +35,15 @@ import java.util.function.IntConsumer;
  *       recorded) exits 0.</li>
  *   <li>The first stop cause wins, except that a fault upgrades a cluster termination (Aeron runs the termination
  *       hook before it reports the unexpected agent termination behind it). Nothing upgrades a signal stop.</li>
+ *   <li>Driver loss with an external driver (an Aeron client reports {@code DriverTimeoutException},
+ *       {@code ClientTimeoutException} or {@code ConductorServiceTimeoutException}) halts at once, on the thread
+ *       that reported it, with no component close: 1, or 143 when a signal stop is already in progress. That
+ *       client closes itself as soon as its error handler returns and unmaps the CnC (aeron 1.53
+ *       {@code ClientConductor.onClose} lines 190-206, after a 16 ms idle sleep), while agents of the same process
+ *       still write counters in it: an archive whose own client closed decrements its recording-session counter
+ *       in the unmapped page ({@code ArchiveConductor.closeRecordingSession} line 1362) and the JVM dies with
+ *       SIGSEGV (139; RC2 S16 W6 C13, ME 3/3). Closing the components cannot win that race and has nothing
+ *       durable to write without a driver; the restart recovers exactly as from SIGKILL.</li>
  * </ul>
  *
  * <p>This replaces Agrona's {@code ShutdownSignalBarrier} in the engines. That barrier's static JVM hook waits,
@@ -60,6 +72,8 @@ public final class EngineLifecycle {
     public static final int EXIT_FATAL = 1;
     /** Status of a cluster-requested termination. */
     public static final int EXIT_CLUSTER_TERMINATED = 0;
+    /** Status the JVM gives a SIGTERM stop (128 + 15); used when driver loss halts a signal stop in progress. */
+    public static final int EXIT_SIGNAL = 143;
 
     /** Why the node is stopping. */
     public enum Cause { NONE, SIGNAL, CLUSTER_TERMINATED, FATAL }
@@ -200,11 +214,15 @@ public final class EngineLifecycle {
     }
 
     /**
-     * Classify an error the node's Aeron error handler saw. A FATAL Aeron error with an external driver (the driver
-     * died or stopped answering) and an agent that terminated unexpectedly are fatal faults (exit 1); everything
-     * else is only logged by the caller.
+     * Classify an error the node's Aeron error handler saw. With an external driver, driver loss halts at once
+     * ({@link #driverLost}) and any other FATAL Aeron error is a fatal fault (exit 1), as is an agent that
+     * terminated unexpectedly; everything else is only logged by the caller. Call it on the thread that reported
+     * the error, from the Aeron error handler itself, so the halt precedes that client's close.
      */
     public boolean onError(final Throwable t, final boolean externalDriver) {
+        if (externalDriver && isDriverLoss(t)) {
+            return driverLost(t);
+        }
         if (externalDriver && t instanceof AeronException ae && ae.category() == AeronException.Category.FATAL) {
             return fatal(EXIT_FATAL, "FATAL Aeron error in EXTERNAL driver mode: " + t);
         }
@@ -212,6 +230,30 @@ public final class EngineLifecycle {
             return fatal(EXIT_FATAL, "agent terminated unexpectedly: " + t);
         }
         return false;
+    }
+
+    /** The errors after which the reporting Aeron client closes itself and unmaps the CnC. */
+    static boolean isDriverLoss(final Throwable t) {
+        return t instanceof DriverTimeoutException
+                || t instanceof ClientTimeoutException
+                || t instanceof ConductorServiceTimeoutException;
+    }
+
+    /**
+     * Driver loss (see the class rules): log, then halt on the calling thread before its Aeron client unmaps the
+     * CnC. A fault already recorded keeps its status; a signal stop in progress halts with {@link #EXIT_SIGNAL}.
+     * Returns true when this call recorded the fault. With a halter that returns (tests) the lifecycle then
+     * behaves as after {@link #fatal}: the main thread's finish is a no-op halt.
+     */
+    boolean driverLost(final Throwable t) {
+        final String reason = "media driver lost in EXTERNAL driver mode: " + t;
+        final boolean recorded = record(new Stop(Cause.FATAL, EXIT_FATAL, reason));
+        final Stop s = stop.get();
+        final int status = s.cause() == Cause.FATAL ? s.status() : EXIT_SIGNAL;
+        log.accept(name + " FATAL (exit " + status + "): " + reason + " - halting now, no component close: the "
+                + "client unmaps the CnC under running agents (SIGSEGV), and nothing is durable without a driver");
+        halt(status);
+        return recorded;
     }
 
     /**

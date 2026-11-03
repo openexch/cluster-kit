@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.cluster;
 
+import io.aeron.exceptions.AeronException;
 import io.aeron.exceptions.DriverTimeoutException;
 import org.junit.Test;
 
@@ -10,6 +11,7 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -86,13 +88,22 @@ public class EngineLifecycleProcessTest {
     }
 
     @Test
-    public void driverDeathExitsOneEvenWhenTheMainThreadReturnsNormally() throws Exception {
+    public void fatalFaultExitsOneEvenWhenTheMainThreadReturnsNormally() throws Exception {
         final String out = run("fatal", false, 10_000, List.of(1));
         assertTrue(out, out.contains("child closed after FATAL"));
     }
 
     @Test
-    public void driverDeathWithAHangingCloseExitsOneAfterTheGrace() throws Exception {
+    public void driverDeathHaltsOneOnTheReportingThreadWithoutTheClose() throws Exception {
+        final String out = run("driver-lost", false, 5_000, List.of(1));
+        assertTrue(out, out.contains("halting now, no component close"));
+        assertFalse("the reporting thread never got back to its Aeron client: " + out,
+                out.contains("ERROR HANDLER RETURNED"));
+        assertFalse("no component close after driver loss: " + out, out.contains("child closed after FATAL"));
+    }
+
+    @Test
+    public void fatalFaultWithAHangingCloseExitsOneAfterTheGrace() throws Exception {
         run("fatal-close-hangs", false, 5_000, List.of(1), EngineLifecycle.FATAL_EXIT_GRACE_ENV, "300");
     }
 
@@ -168,7 +179,12 @@ public class EngineLifecycleProcessTest {
             System.out.println("READY");
             switch (mode) {
                 case "fatal", "fatal-close-hangs" -> new Thread(() -> lifecycle.onError(
-                        new DriverTimeoutException("MediaDriver keepalive: age=10090ms > timeout=10000ms"), true)).start();
+                        new AeronException("fatal", AeronException.Category.FATAL), true)).start();
+                case "driver-lost" -> new Thread(() -> {
+                    lifecycle.onError(
+                            new DriverTimeoutException("MediaDriver keepalive: age=10090ms > timeout=10000ms"), true);
+                    System.out.println("ERROR HANDLER RETURNED");
+                }).start();
                 case "cluster-terminated" -> new Thread(lifecycle::onClusterTermination).start();
                 default -> { }
             }

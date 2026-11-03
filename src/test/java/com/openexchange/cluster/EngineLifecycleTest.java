@@ -2,6 +2,8 @@
 package com.openexchange.cluster;
 
 import io.aeron.exceptions.AeronException;
+import io.aeron.exceptions.ClientTimeoutException;
+import io.aeron.exceptions.ConductorServiceTimeoutException;
 import io.aeron.exceptions.DriverTimeoutException;
 import org.agrona.concurrent.AgentTerminationException;
 import org.junit.Test;
@@ -28,14 +30,66 @@ public class EngineLifecycleTest {
     }
 
     @Test
-    public void driverDeathWithAnExternalDriverHaltsOneAfterTheCloseNeverZero() {
+    public void driverDeathWithAnExternalDriverHaltsOneOnTheReportingThreadBeforeAnyClose() {
         final EngineLifecycle lf = lifecycle(1_000, 60_000);
         assertTrue(lf.onError(new DriverTimeoutException("MediaDriver keepalive: age=10090ms > timeout=10000ms"), true));
+        // W9b: the halt happens inside onError, i.e. inside the Aeron error handler, before that client unmaps the CnC
+        assertEquals("halted on the reporting thread, before the main thread closes anything", List.of(1), halts);
+        assertEquals(EngineLifecycle.Cause.FATAL, lf.cause());
+        assertTrue(logs.toString(), logs.stream().anyMatch(l -> l.contains("halting now, no component close")));
+        lf.awaitStop();
+        lf.finish();
+        assertEquals("one halt per process", List.of(1), halts);
+    }
+
+    @Test
+    public void everyClientSelfCloseTimeoutIsDriverLoss() {
+        assertTrue(EngineLifecycle.isDriverLoss(new DriverTimeoutException("x")));
+        assertTrue(EngineLifecycle.isDriverLoss(new ClientTimeoutException("x")));
+        assertTrue(EngineLifecycle.isDriverLoss(new ConductorServiceTimeoutException("x")));
+        assertFalse(EngineLifecycle.isDriverLoss(new AeronException("other", AeronException.Category.FATAL)));
+        assertFalse(EngineLifecycle.isDriverLoss(new AgentTerminationException("unexpected Aeron close")));
+    }
+
+    @Test
+    public void otherFatalAeronErrorWithAnExternalDriverClosesFirstThenHaltsOne() {
+        final EngineLifecycle lf = lifecycle(1_000, 60_000);
+        assertTrue(lf.onError(new AeronException("fatal", AeronException.Category.FATAL), true));
         assertTrue("the fault wakes the main thread", lf.stopRequested());
+        assertTrue("no halt before the close", halts.isEmpty());
         lf.awaitStop();
         lf.finish();
         assertEquals(List.of(1), halts);
-        assertEquals(EngineLifecycle.Cause.FATAL, lf.cause());
+    }
+
+    @Test
+    public void driverLossKeepsAnEarlierFaultStatus() {
+        final EngineLifecycle lf = lifecycle(1_000, 60_000);
+        assertTrue(lf.fatal(2, "hot loop"));
+        assertFalse(lf.onError(new DriverTimeoutException("x"), true));
+        assertEquals(List.of(2), halts);
+    }
+
+    @Test
+    public void driverLossBehindTheTerminationHookHaltsOne() {
+        final EngineLifecycle lf = lifecycle(1_000, 60_000);
+        lf.onClusterTermination();
+        assertTrue(lf.onError(new DriverTimeoutException("x"), true));
+        assertEquals(List.of(1), halts);
+    }
+
+    @Test
+    public void driverLossDuringASignalStopHaltsWithTheSignalStatus() throws Exception {
+        final EngineLifecycle lf = lifecycle(5_000, 60_000);
+        final Thread hook = new Thread(lf::onJvmShutdown);
+        hook.start();
+        lf.awaitStop();
+        assertFalse("not recorded: the signal stop keeps its cause", lf.onError(new DriverTimeoutException("x"), true));
+        assertEquals(List.of(EngineLifecycle.EXIT_SIGNAL), halts);
+        assertEquals(EngineLifecycle.Cause.SIGNAL, lf.cause());
+        lf.finish();
+        hook.join(2_000);
+        assertFalse(hook.isAlive());
     }
 
     @Test
@@ -83,7 +137,7 @@ public class EngineLifecycleTest {
         hook.start();
         lf.awaitStop();
         assertFalse("a fault during the signal close is logged, not recorded",
-                lf.onError(new DriverTimeoutException("x"), true));
+                lf.onError(new AgentTerminationException("unexpected Aeron close"), true));
         lf.finish();
         hook.join(2_000);
         assertFalse("the hook returns once the close is done", hook.isAlive());

@@ -148,6 +148,35 @@ public class EngineLifecycleProcessTest {
         }
     }
 
+    @Test
+    public void noQuorumWithinTheWaitExitsOne() throws Exception {
+        // RC2 S17 W12 (K4): the watchdog started after the consensus module launch, on an election that never
+        // leaves CANVASS, exits 1 within the wait plus the fatal grace
+        final String out = run("quorum-stuck", false, 1_000 + EngineLifecycle.DEFAULT_FATAL_EXIT_GRACE_MS + 2_000,
+                List.of(1), EngineLifecycle.QUORUM_WAIT_ENV, "1000");
+        assertTrue(out, out.contains("FATAL (exit 1): no cluster quorum observed within 1000 ms since the consensus "
+                + "module launched (election state CANVASS, elections 0)"));
+        assertTrue(out, out.contains("child closed after FATAL"));
+    }
+
+    @Test
+    public void malformedQuorumWaitRefusesTheStart() throws Exception {
+        for (final String bad : List.of("0", "x")) {
+            final Path log = Files.createTempFile("lifecycle-badquorum-", ".log");
+            final Process p = child(log, "close-fast", EngineLifecycle.QUORUM_WAIT_ENV, bad);
+            try {
+                final long[] r = exitAfter(p, System.nanoTime(), 10_000);
+                final String out = Files.readString(log);
+                assertEquals(out, 1, r[0]);
+                assertTrue(out, out.contains("ENGINE_QUORUM_WAIT_MS must be a positive number of milliseconds, got '"
+                        + bad + "'"));
+            } finally {
+                p.destroyForcibly();
+                Files.deleteIfExists(log);
+            }
+        }
+    }
+
     /** Child: the engine-main shape. */
     public static void main(final String[] args) throws Exception {
         final String mode = args[0];
@@ -186,6 +215,8 @@ public class EngineLifecycleProcessTest {
                     System.out.println("ERROR HANDLER RETURNED");
                 }).start();
                 case "cluster-terminated" -> new Thread(lifecycle::onClusterTermination).start();
+                case "quorum-stuck" -> lifecycle.watchQuorum(
+                        () -> io.aeron.cluster.ElectionState.CANVASS.code(), () -> 0L);
                 default -> { }
             }
             lifecycle.awaitStop();

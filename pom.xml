@@ -38,7 +38,7 @@
              (-Daeron.version=1.53.1), the version match ships; the
              1.53.0 -> 1.53.1 delta is recorded in the notebook
              (RCS/S2/aeron-1.53.1-rediff.txt). -->
-        <aeron.version>1.53.0</aeron.version>
+        <aeron.version>1.54.0</aeron.version>
         <agrona.version>2.6.0</agrona.version>
         <junit.version>4.13.2</junit.version>
         <!-- RC2 S17: reproducible jar (maven-jar entry times), so the kit jar the engines shade is derived by

@@ -43,13 +43,17 @@ public final class NodeEndpoint {
 
         // 200 while the duty cycle is advancing. A failure here is a restart
         // request: the process is up but no longer doing its job.
-        server.createContext("/health", exchange ->
-            respond(exchange, readiness.live() ? 200 : 503, readiness.describe()));
+        server.createContext("/health", exchange -> {
+            final NodeReadiness.Probe probe = readiness.probe();
+            respond(exchange, probe.live() ? 200 : 503, probe.detail());
+        });
 
         // 200 only when this member can be counted on. A rolling restart waits
         // on this, so a false 200 costs quorum.
-        server.createContext("/ready", exchange ->
-            respond(exchange, readiness.ready() ? 200 : 503, readiness.describe()));
+        server.createContext("/ready", exchange -> {
+            final NodeReadiness.Probe probe = readiness.probe();
+            respond(exchange, probe.ready() ? 200 : 503, probe.detail());
+        });
 
         if (metricsBody != null) {
             server.createContext("/metrics", exchange -> {

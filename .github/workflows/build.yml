@@ -57,7 +57,16 @@ jobs:
           server-username: GITHUB_ACTOR
           server-password: GITHUB_TOKEN
 
-      - run: mvn -B clean verify
+      # The compile floor is Aeron 1.53.0 (pom.xml); both engines ship 1.53.1
+      # (assets since RC2 S17 W9). The whole suite runs on both. 1.53.1 goes
+      # first and `clean verify` rebuilds at the floor afterwards, so the jar
+      # that is verified, and published below from main, is always the 1.53.0
+      # build. Bump the version here together with the engines' pins.
+      - name: Tests against Aeron 1.53.1
+        run: mvn -B clean test -Daeron.version=1.53.1
+
+      - name: Tests against Aeron 1.53.0 (the floor), verify
+        run: mvn -B clean verify
 
       # Publish only from main. Both engines consume this artifact, so a
       # version published from a branch would put one engine on code the other

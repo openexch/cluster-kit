@@ -3,107 +3,109 @@ package com.openexchange.cluster;
 
 import io.aeron.cluster.service.Cluster.Role;
 import org.junit.Test;
+import java.util.concurrent.atomic.AtomicLong;
+import static org.junit.Assert.*;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
-
-/**
- * The readiness rules, stated as tests because their failure mode is silent and
- * expensive: a node that answers "ready" too early does not break itself, it
- * lets the orchestrator restart the next member and take the cluster's quorum
- * with it.
- */
 public class NodeReadinessTest {
-
-    private static NodeReadiness live() {
-        final NodeReadiness r = new NodeReadiness();
-        r.started();
-        r.roleChanged(Role.FOLLOWER);
-        return r;
+    private final AtomicLong now = new AtomicLong(1_000_000_000L);
+    private final NodeReadiness r = new NodeReadiness(30_000, 5_000, now::get);
+    private void advance(long ms) { now.addAndGet(ms * 1_000_000); }
+    private void observe(long applied, long commit) {
+        r.tick();
+        r.observe(42, 7, 2, Role.FOLLOWER, applied, commit, true, true, 0);
     }
+    private void start() { r.started(); observe(100, 100); assertTrue(r.describe(), r.ready()); }
 
-    @Test
-    public void aFreshNodeIsNeitherLiveNorReady() {
-        final NodeReadiness r = new NodeReadiness();
-        assertFalse("never ticked, so nothing is known and nothing may be claimed", r.live());
-        assertFalse(r.ready());
-        assertEquals("starting", r.describe());
+    @Test public void unknownStartFailsClosed() {
+        assertFalse(r.live()); assertFalse(r.ready());
+        r.started(); assertTrue(r.live()); assertFalse(r.ready());
     }
-
-    @Test
-    public void startedButRoleUnknownIsNotReady() {
-        final NodeReadiness r = new NodeReadiness();
-        r.started();
-        assertTrue("the duty cycle ticked, so the process is alive", r.live());
-        assertFalse("a member with no role cannot be counted on", r.ready());
+    @Test public void laggingFollowerMustApplyObservedCheckpoint() {
+        r.started(); observe(0, 100); assertFalse(r.ready());
+        observe(100, 120); assertTrue(r.describe(), r.ready());
     }
-
-    @Test
-    public void followerAndLeaderAreReady() {
-        final NodeReadiness r = live();
-        assertTrue(r.ready());
-        r.roleChanged(Role.LEADER);
-        assertTrue(r.ready());
-    }
-
-    @Test
-    public void anElectionMakesTheNodeNotReadyButStillLive() {
-        final NodeReadiness r = live();
-        r.roleChanged(Role.CANDIDATE);
-        assertFalse("an election is exactly when a rolling restart must pause", r.ready());
-        assertTrue("a member in an election is healthy; killing it would prolong the election",
-            r.live());
-        assertTrue(r.describe().contains("election"));
-    }
-
-    @Test
-    public void catchingUpIsNotReady() {
-        final NodeReadiness r = live();
-        r.catchingUp();
-        assertFalse("a replaying member serves stale state", r.ready());
-        assertTrue(r.live());
-        assertEquals("catching up", r.describe());
-
-        r.catchUpComplete();
-        assertTrue(r.ready());
-    }
-
-    @Test
-    public void aWedgedDutyCycleFailsReadinessFirstAndLivenessLater() throws Exception {
-        // Short windows so the wedge is observable without sleeping for 30s.
-        final NodeReadiness r = new NodeReadiness(200, 40);
-        r.started();
-        r.roleChanged(Role.LEADER);
-        assertTrue(r.ready());
-
-        Thread.sleep(80);
-        assertFalse("readiness goes first: stop sending it work", r.ready());
-        assertTrue("but it is too early to kill the process", r.live());
-        assertTrue(r.describe().contains("duty cycle"));
-
-        Thread.sleep(200);
-        assertFalse("now it is wedged, and a restart is the correct answer", r.live());
-    }
-
-    @Test
-    public void tickingKeepsItReady() throws Exception {
-        final NodeReadiness r = new NodeReadiness(200, 40);
-        r.started();
-        r.roleChanged(Role.LEADER);
-        for (int i = 0; i < 5; i++) {
-            Thread.sleep(20);
-            r.tick();
-            assertTrue("an idle but ticking node stays ready: a quiet market is not a wedge",
-                r.ready());
+    @Test public void movingCommitDoesNotRequireInstantEquality() {
+        r.started(); observe(0, 100);
+        for (int i = 1; i <= 1000; i++) {
+            advance(10); observe(i * 100, (i + 1) * 100);
+            assertTrue(r.describe(), r.ready());
         }
     }
-
-    @Test
-    public void stoppingWithdrawsReadinessBeforeTheProcessGoesAway() {
-        final NodeReadiness r = live();
-        r.stopping();
-        assertFalse("drain first: let the orchestrator route away before we die", r.ready());
-        assertEquals("stopping", r.describe());
+    @Test public void idleHeartbeatAndSameCheckpointStayHealthy() {
+        start();
+        for (int i = 0; i < 100; i++) {
+            advance(1000); observe(100, 100);
+            assertTrue(r.live()); assertTrue(r.describe(), r.ready());
+        }
+    }
+    @Test public void stalledApplyCannotReuseAnOldCheckpoint() {
+        start(); advance(10); observe(100, 200);
+        advance(1001); observe(100, 300);
+        assertFalse(r.ready()); assertTrue(r.describe().contains("stale-checkpoint"));
+        observe(300, 300); assertTrue(r.ready());
+    }
+    @Test public void largeLagFailsEvenWithRecentCheckpoint() {
+        start(); advance(10); observe(100, 100 + NodeReadiness.MAX_APPLY_LAG_BYTES + 1);
+        assertFalse(r.ready()); assertTrue(r.describe().contains("apply-lag"));
+    }
+    @Test public void electionInvalidatesEvidenceEvenIfServiceRoleIsStillFollower() {
+        start(); r.observe(42, 7, 2, Role.FOLLOWER, 100, 100, false, true, 0);
+        assertFalse(r.ready()); assertTrue(r.live());
+        assertTrue(r.describe().contains("election"));
+    }
+    @Test public void changedTermSourceOrElectionRequiresNewCheckpoint() {
+        for (int dimension = 0; dimension < 3; dimension++) {
+            start();
+            r.observe(dimension == 0 ? 43 : 42, dimension == 1 ? 8 : 7,
+                    dimension == 2 ? 3 : 2, Role.FOLLOWER, 100, 101, true, true, 0);
+            assertFalse("old proof crossed a fence", r.ready());
+        }
+    }
+    @Test public void roleChangeDoesNotReuseCatchup() {
+        start(); r.roleChanged(Role.LEADER); assertFalse(r.ready());
+        r.observe(42, 8, 3, Role.LEADER, 200, 200, true, true, 0); assertTrue(r.ready());
+    }
+    @Test public void regressedPositionRequiresFreshProof() {
+        start(); observe(90, 95); assertFalse(r.ready());
+        observe(95, 95); assertTrue(r.ready());
+    }
+    @Test public void freshServiceTickCannotRefreshStaleObservation() {
+        start(); advance(5001); r.tick(); assertTrue(r.live()); assertFalse(r.ready());
+        assertTrue(r.describe().contains("stale-observation"));
+    }
+    @Test public void staleConsensusIsSeparateFromIdleBusinessWork() {
+        start(); r.observe(42, 7, 2, Role.FOLLOWER, 100, 100, true, true, 5000);
+        assertFalse(r.ready()); assertTrue(r.live());
+        assertTrue(r.describe().contains("stale-consensus"));
+    }
+    @Test public void stoppedDutyCycleFailsReadinessBeforeLiveness() {
+        start(); advance(5001); assertFalse(r.ready()); assertTrue(r.live());
+        advance(25000); assertFalse(r.live());
+    }
+    @Test public void missingOrInactiveSourceWithdrawsReadiness() {
+        start(); r.unavailable("counter-closed"); assertFalse(r.ready());
+        observe(100, 100); assertTrue(r.ready());
+        r.observe(42, 7, 2, Role.FOLLOWER, 100, 100, true, false, 0); assertFalse(r.ready());
+    }
+    @Test public void needsReseedIsStickyAcrossTicksAndObservations() {
+        start(); r.needsReseed("missing-log"); observe(100, 100);
+        assertFalse(r.ready()); assertTrue(r.describe().contains("needs-reseed:missing-log"));
+        r.started(); observe(100, 100); assertFalse(r.ready());
+    }
+    @Test public void stoppingWithdrawsReadiness() {
+        start(); r.stopping(); observe(100, 100); assertFalse(r.ready());
+        assertTrue(r.describe().contains("stopping"));
+    }
+    @Test public void unknownPositionsAndBackwardsClockFailClosed() {
+        r.started(); observe(-1, -1); assertFalse(r.ready());
+        observe(100, 100); advance(-1); assertFalse(r.ready()); assertFalse(r.live());
+    }
+    @Test public void probeCarriesTheEvidenceUsedForItsStatus() {
+        start(); NodeReadiness.Probe p = r.probe();
+        assertTrue(p.ready()); assertTrue(p.live());
+        for (String field : new String[]{"role=FOLLOWER", "recovery=ready", "term=7", "source=42",
+                "applied=100", "commit=100", "checkpoint=100", "maxLagBytes=65536"}) {
+            assertTrue(p.detail(), p.detail().contains(field));
+        }
     }
 }

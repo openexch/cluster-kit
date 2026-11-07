@@ -12,7 +12,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.function.IntConsumer;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -292,5 +295,62 @@ public class EngineLifecycleTest {
         assertTrue(logs.toString(), logs.stream().anyMatch(
                 l -> l.contains("stopped on SIGTERM, close failed: java.lang.IllegalStateException: archive close failed")));
         assertFalse(logs.toString(), logs.stream().anyMatch(l -> l.contains("stopped cleanly")));
+    }
+
+    @Test
+    public void theLoserOfTheHaltDoesNotReturnBeforeTheWinnerHalts() throws Exception {
+        // Assets PR #131 on CI: on a startup failure the backstop won the halt, the main thread's halt returned at
+        // once, main() returned and the JVM exited 0 before the backstop reached Runtime.halt.
+        final CountDownLatch backstopInHalter = new CountDownLatch(1);
+        final CountDownLatch releaseHalter = new CountDownLatch(1);
+        final CountDownLatch mainPastTheLog = new CountDownLatch(1);
+        final CountDownLatch mainReturned = new CountDownLatch(1);
+        final IntConsumer halter = status -> {
+            halts.add(status);
+            backstopInHalter.countDown();
+            try {
+                // the winner is "still halting" until the test releases it
+                assertTrue("halter never released", releaseHalter.await(10, TimeUnit.SECONDS));
+            } catch (final InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        };
+        final Consumer<String> log = line -> {
+            logs.add(line);
+            if (line.contains("closed after FATAL")) {
+                // hold main before finish() releases closedLatch: the backstop's tiny grace runs out and it wins
+                try {
+                    assertTrue("backstop never entered the halter", backstopInHalter.await(10, TimeUnit.SECONDS));
+                } catch (final InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                mainPastTheLog.countDown();
+            }
+        };
+        final EngineLifecycle lf = new EngineLifecycle("test-node", log, halter, 1_000, 1);
+        final Thread main = new Thread(() -> {
+            lf.startupFailed(new IllegalStateException("No external media driver found at /x after 2000ms"));
+            mainReturned.countDown();
+        }, "test-main");
+        main.start();
+        assertTrue("backstop never entered the halter", backstopInHalter.await(10, TimeUnit.SECONDS));
+        // past the log line, the only place main can park is its losing halt
+        assertTrue("main never got past the FATAL log", mainPastTheLog.await(10, TimeUnit.SECONDS));
+        // main either returns (the bug) or parks in its losing halt (the fix): wait for one of the two, no sleep
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (main.getState() != Thread.State.WAITING && main.getState() != Thread.State.TERMINATED
+                && System.nanoTime() < deadline) {
+            Thread.onSpinWait();
+        }
+        try {
+            assertEquals("main returned while the winner had not halted yet", 1, mainReturned.getCount());
+            assertEquals("main parks in its losing halt", Thread.State.WAITING, main.getState());
+            assertTrue(logs.toString(), logs.stream().anyMatch(l -> l.contains("fatal close exceeded 1 ms")));
+        } finally {
+            releaseHalter.countDown();
+        }
+        assertTrue("main returns once the winner's halter returns", mainReturned.await(10, TimeUnit.SECONDS));
+        main.join(5_000);
+        assertEquals("one halt per process, the backstop's", List.of(1), halts);
     }
 }

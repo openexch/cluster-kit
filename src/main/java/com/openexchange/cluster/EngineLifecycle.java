@@ -102,6 +102,8 @@ public final class EngineLifecycle {
     private final CountDownLatch stopLatch = new CountDownLatch(1);
     private final CountDownLatch closedLatch = new CountDownLatch(1);
     private final AtomicBoolean halted = new AtomicBoolean();
+    /** Released only when the halter returns (tests): until then no thread that lost the halt may return. */
+    private final CountDownLatch haltReturned = new CountDownLatch(1);
     /** RC2 S17 W12 (review V2): the quorum watchdogs, stopped by {@link #awaitStop} before the components close. */
     private final java.util.List<QuorumWatchdog> watchdogs = new java.util.concurrent.CopyOnWriteArrayList<>();
     static final long WATCHDOG_JOIN_MS = 2_000;
@@ -412,14 +414,35 @@ public final class EngineLifecycle {
         }
     }
 
-    /** One halt per process: the main thread's and the backstop's are the same decision. */
+    /**
+     * One halt per process: the main thread's and the backstop's are the same decision. A thread that loses the
+     * halt waits for the winner's halter instead of returning: the main thread returning from {@code main} while the
+     * winner is still on its way to {@link Runtime#halt} ends the JVM with status 0 (the shutdown hook's own halt is
+     * then the loser too), so a fatal fault would look like a clean exit.
+     */
     private void halt(final int status) {
         if (!halted.compareAndSet(false, true)) {
+            boolean interrupted = false;
+            while (true) {
+                try {
+                    haltReturned.await();
+                    break;
+                } catch (final InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
             return;
         }
-        System.out.flush();
-        System.err.flush();
-        halter.accept(status);
+        try {
+            System.out.flush();
+            System.err.flush();
+            halter.accept(status);
+        } finally {
+            haltReturned.countDown();
+        }
     }
 
     private static boolean awaitQuietly(final CountDownLatch latch, final long timeoutMs) {

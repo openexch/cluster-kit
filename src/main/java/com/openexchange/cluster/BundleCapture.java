@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.cluster;
 
+import com.openexchange.cluster.shadow.StubPeek;
+import com.openexchange.cluster.shadow.ShadowStub;
 import io.aeron.Aeron;
 import io.aeron.archive.client.AeronArchive;
+import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.RecordingLog;
 import io.aeron.AeronVersion;
 import io.aeron.version.Version;
+import org.agrona.concurrent.SystemNanoClock;
 
 import java.io.File;
 import java.io.IOException;
@@ -24,6 +28,7 @@ import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 import java.util.jar.Attributes;
 import java.util.jar.Manifest;
 
@@ -80,7 +85,21 @@ public final class BundleCapture {
      * else here is engine-agnostic and lives in exactly one place.
      */
     public record EngineSchema(int id, int version) {
+
+        /**
+         * The service-payload tag a stub-mode member writes in place of a full image (RCS S4 3.2): a bundle whose
+         * snapshot is a stub carries no ledger and is refused (D19). The same constant for every engine.
+         */
+        public long stubTag() {
+            return ShadowStub.STUB_TAG;
+        }
     }
+
+    /** D19 refusals since this class was loaded ({@code bundle_stub_refused_total}). */
+    private static final java.util.concurrent.atomic.AtomicLong STUB_REFUSED = new java.util.concurrent.atomic.AtomicLong();
+
+    /** How long the D19 payload peek may take for one staged service recording. */
+    private static final long PEEK_TIMEOUT_NS = TimeUnit.MINUTES.toNanos(1);
 
     /**
      * One recording in the bundle, described well enough to be served again.
@@ -228,6 +247,16 @@ public final class BundleCapture {
                                  final String cluster, final int nodeId,
                                  final EngineSchema schema,
                                  final long durablePosition) throws IOException {
+        return capture(clusterDir, srcControlChannel, stagingRoot, bundleRoot, cluster, nodeId, schema,
+                durablePosition, true);
+    }
+
+    /** {@code stubPeek=false} only for the RCS S4 11.12 negative control (the pre-D19 capture). */
+    static Result capture(final File clusterDir, final String srcControlChannel,
+                          final File stagingRoot, final File bundleRoot,
+                          final String cluster, final int nodeId,
+                          final EngineSchema schema,
+                          final long durablePosition, final boolean stubPeek) throws IOException {
 
         final SnapshotSelection selection = readLatestSnapshot(clusterDir);
         if (selection == null) {
@@ -254,8 +283,6 @@ public final class BundleCapture {
         }
 
         //noinspection ResultOfMethodCallIgnored
-        bundleRoot.mkdirs();
-        //noinspection ResultOfMethodCallIgnored
         stagingRoot.mkdirs();
 
         final Instant capturedAt = Instant.now();
@@ -263,10 +290,6 @@ public final class BundleCapture {
                 BUNDLE_STAMP.format(capturedAt) + "-pos-" + selection.logPosition);
         final File snapshotDir = new File(bundleDir, "snapshot");
         final File logDir = new File(bundleDir, "log");
-        //noinspection ResultOfMethodCallIgnored
-        snapshotDir.mkdirs();
-        //noinspection ResultOfMethodCallIgnored
-        logDir.mkdirs();
 
         final long logBytes;
         final long snapshotBytes;
@@ -283,6 +306,39 @@ public final class BundleCapture {
                 System.out.println("[BUNDLE] replicated snapshot recording "
                         + entry.recordingId + " (serviceId=" + entry.serviceId + ") -> " + staged);
             }
+
+            // RCS S4 10 (D19, G18): a stub-mode member's service snapshot is a 64-byte stub that names a
+            // local shadow, not a ledger. A bundle of it would pass every checksum and restore nothing, so
+            // peek each staged service payload and refuse before anything is copied or the chain advances.
+            if (stubPeek) {
+                for (int i = 0; i < selection.snapshotEntries.size(); i++) {
+                    final RecordingLog.Entry entry = selection.snapshotEntries.get(i);
+                    if (entry.serviceId == ConsensusModule.Configuration.SERVICE_ID) {
+                        continue;
+                    }
+                    if (isStubSnapshot(staging, stagedSnapshotRecordings.get(i), schema)) {
+                        for (final long staged : stagedSnapshotRecordings) {
+                            try {
+                                staging.purgeRecording(staged);
+                            } catch (final RuntimeException e) {
+                                System.out.println("[BUNDLE] could not delete staged snapshot recording "
+                                        + staged + ", the next successful capture sweeps it: " + e);
+                            }
+                        }
+                        STUB_REFUSED.incrementAndGet();
+                        final String reason = stubRefusal(selection.logPosition);
+                        System.out.println("[BUNDLE] REFUSED (serviceId=" + entry.serviceId + "): " + reason);
+                        return Result.skipped(reason, selection.logPosition);
+                    }
+                }
+            }
+
+            //noinspection ResultOfMethodCallIgnored
+            bundleRoot.mkdirs();
+            //noinspection ResultOfMethodCallIgnored
+            snapshotDir.mkdirs();
+            //noinspection ResultOfMethodCallIgnored
+            logDir.mkdirs();
 
             // The log is LIVE, so it replicates with an explicit stop position -
             // without one this would follow the recording forever and never return.
@@ -413,6 +469,35 @@ public final class BundleCapture {
             System.out.println("[BUNDLE] could not reclaim staged log below "
                     + bound + ": " + e);
         }
+    }
+
+    /** The D19 refusal text (RCS S4 10). */
+    static String stubRefusal(final long snapshotPosition) {
+        return "snapshot at " + snapshotPosition + " is a stub (RCS); a bundle needs a full image or the covering "
+                + "shadow, which BundleCapture cannot capture yet (D19)";
+    }
+
+    /** {@code bundle_stub_refused_total}: captures refused because the newest snapshot was a stub. */
+    public static long stubRefusals() {
+        return STUB_REFUSED.get();
+    }
+
+    /**
+     * The D19 payload peek over one staged service snapshot recording: replay it (session-scoped, bounded by a
+     * deadline, through {@link StubPeek} and so {@code SnapshotImageReader}), skip Aeron's container frames
+     * (snapshot marker BEGIN, client sessions, marker END), and look at the first service message. A stub is
+     * exactly {@link ShadowStub#ENVELOPED_LENGTH} bytes behind the kit envelope with {@code schema.stubTag()} as its
+     * first payload long; the envelope CRC is checked when the whole stub is in hand. The read stops at the first
+     * service message, so a full image is never read past its first chunk.
+     */
+    static boolean isStubSnapshot(final StagingArchive staging, final long recordingId, final EngineSchema schema) {
+        final StagingArchive.Descriptor d = staging.describe(recordingId);
+        if (d == null) {
+            throw new IllegalStateException("[BUNDLE] no catalog entry for staged snapshot recording " + recordingId);
+        }
+        return StubPeek.peek(staging.archive().context().aeron(), staging.archive(), SystemNanoClock.INSTANCE,
+                recordingId, d.startPosition(), d.stopPosition(), SystemNanoClock.INSTANCE.nanoTime()
+                        + PEEK_TIMEOUT_NS) == StubPeek.Kind.STUB;
     }
 
     // ---- recording.log ----

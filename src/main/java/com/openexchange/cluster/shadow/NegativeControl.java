@@ -34,5 +34,22 @@ enum NegativeControl {
     /** NC-9 (kit leg): the writer accepts {@code genesisId <= 0} (W1). */
     GENESIS_CHECK_OFF,
     /** NC-Q0: the writer computes the payload digest with CRC32C again (the pre-amendment format). */
-    DIGEST_AS_CRC32C
+    DIGEST_AS_CRC32C,
+    /** RCS S4 9.1 precondition (D2): every newest group is read as a full image, so a stub is pruned to P_cm. */
+    FLOOR_PRECONDITION_OFF,
+    /** RCS S4 11.7: the floor ignores {@code SHADOW_FLOOR_MARGIN} and prunes to P_cm (NOTE-1). */
+    FLOOR_MARGIN_IGNORED,
+    /** RCS S4 11.7 B1: the margin shadow is taken over all VERIFIED, not over the restorable ones. */
+    FLOOR_MARGIN_OVER_ALL_VERIFIED,
+    /** RCS S4 11.7: covering is the newest VERIFIED {@code >= P_cm} only ({@code verifiedAtOrAbove}). */
+    FLOOR_NEWEST_COVERING_ONLY,
+    /** RCS S4 11.7: the floor reads usable (COMPLETE) shadows instead of VERIFIED ones (S3 NC-15 shape). */
+    FLOOR_READS_USABLE,
+    /**
+     * RCS S4 11.7 FIX-1: every skip-safe VERIFIED shadow above P_cm counts as restorable, not only the one SKIP tries
+     * ({@code newestAtOrAbove(P_cm + 1)}).
+     */
+    FLOOR_SKIP_ANY_ABOVE,
+    /** RCS S4 11.7: retention purges CONFLICT copies like usable ones (deletion picks a winner). */
+    RETENTION_PURGES_CONFLICT
 }

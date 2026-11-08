@@ -80,9 +80,15 @@ public final class SnapshotLogPruner {
     private RetentionWatermark retention;
     private volatile String lastWatermarkReport;
 
+    // RCS S4 9.3 (MF-8): a purge pass may also be requested by the shadow housekeeping, which runs as a hook on
+    // this thread before every decision. Without them the pruner behaves exactly as before.
+    private volatile BooleanSupplier purgeRequested = () -> false;
+    private volatile Runnable wakeHook = () -> { };
+    private volatile long wakesByShadow;
+
     private volatile boolean running;
     private Thread thread;
-    private long prunesRun;
+    private volatile long prunesRun;
     private long bytesReclaimed;
     private volatile String lastError;
 
@@ -110,6 +116,35 @@ public final class SnapshotLogPruner {
      */
     public SnapshotLogPruner watermark(final java.util.function.LongSupplier watermark) {
         this.watermark = watermark;
+        return this;
+    }
+
+    /**
+     * Whether the purge is bounded by exactly {@code supplier} (identity, not equality): the RCS S4 runtime net that
+     * a member in shadow mode prunes behind its {@code ShadowFloor} and nothing else (4.1, review F7).
+     */
+    public boolean watermarkIs(final java.util.function.LongSupplier supplier) {
+        return supplier != null && watermark == supplier;
+    }
+
+    /**
+     * RCS S4 9.3 (MF-8): a purge pass also runs, without a new CM snapshot, when {@code purgeRequested} answers true
+     * after the wake hook ran (the shadow housekeeping: a VERIFIED shadow appeared or the floor rose). Read once per
+     * wake, never consumed here: the watermark supplier consumes it when the purge pass reads the floor. The
+     * caught-up gate still applies. The poll interval is unchanged.
+     */
+    public SnapshotLogPruner wake(final BooleanSupplier purgeRequested) {
+        this.purgeRequested = java.util.Objects.requireNonNull(purgeRequested, "purgeRequested");
+        return this;
+    }
+
+    /**
+     * RCS S4 9.3: {@code hook} runs on this thread after every sleep, before the purge decision (the shadow
+     * housekeeping: catalog scan, paced deep reads, retention). A hook that throws is reported and that wake's
+     * shadow request is ignored; the CM-snapshot path is not affected.
+     */
+    public SnapshotLogPruner onWake(final Runnable hook) {
+        this.wakeHook = java.util.Objects.requireNonNull(hook, "hook");
         return this;
     }
 
@@ -169,15 +204,27 @@ public final class SnapshotLogPruner {
             while (running) {
                 Thread.sleep(POLL_INTERVAL_MS);
 
+                boolean shadowRequested;
+                try {
+                    wakeHook.run();
+                    shadowRequested = purgeRequested.getAsBoolean();
+                } catch (final RuntimeException hookFailed) {
+                    shadowRequested = false;
+                    lastError = "wake hook: " + hookFailed;
+                    System.err.println("[PRUNE] CRITICAL: the wake hook failed, no shadow-requested purge this "
+                        + "wake: " + hookFailed);
+                }
+
                 final long count = snapshotCount();
-                if (count <= seenSnapshots) {
+                final boolean newSnapshot = count > seenSnapshots;
+                if (!newSnapshot && !shadowRequested) {
                     continue;
                 }
                 if (!caughtUp.getAsBoolean()) {
                     // Not an error and not a skip to remember: the next snapshot
                     // will bring us back here, and by then this node is either
                     // caught up or genuinely broken and saying so on /ready.
-                    System.out.println("[PRUNE] snapshot " + count
+                    System.out.println("[PRUNE] " + (newSnapshot ? "snapshot " + count : "shadow purge request")
                         + " seen but this node is not caught up - not purging");
                     continue;
                 }
@@ -190,12 +237,16 @@ public final class SnapshotLogPruner {
 
                 final ArchiveHousekeeping.Result result =
                     ArchiveHousekeeping.purgeBelow(clusterDir, archive, watermark.getAsLong());
-                seenSnapshots = count;
+                seenSnapshots = Math.max(seenSnapshots, count);
+                if (!newSnapshot) {
+                    wakesByShadow++;
+                }
                 prunesRun++;
                 bytesReclaimed += Math.max(0, result.logBytesReclaimed);
                 lastError = result.errors > 0
                     ? result.errors + " snapshot recording(s) missing from the archive" : null;
-                System.out.println("[PRUNE] after snapshot " + count + ": " + result);
+                System.out.println("[PRUNE] after " + (newSnapshot ? "snapshot " + count : "shadow wake")
+                    + ": " + result);
             }
         } catch (final InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -286,6 +337,11 @@ public final class SnapshotLogPruner {
     /** How many purges have run on this node. */
     public long prunesRun() {
         return prunesRun;
+    }
+
+    /** {@code pruner_wakes_by_shadow_total}: purge passes run because a shadow requested one, not a CM snapshot. */
+    public long wakesByShadow() {
+        return wakesByShadow;
     }
 
     /** Total log bytes reclaimed on this node since start. */

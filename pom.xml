@@ -6,7 +6,7 @@
 
     <groupId>com.openexchange</groupId>
     <artifactId>cluster-kit</artifactId>
-    <version>0.1.14-runtime.20261108.shadowfloor.g1c49ca4</version>
+    <version>0.1.15-runtime.20261110.replica.g29e9754</version>
     <packaging>jar</packaging>
 
     <name>Cluster Kit</name>

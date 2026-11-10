@@ -2,7 +2,7 @@
 package com.openexchange.cluster.auth;
 
 /**
- * RC2 S6 R0, moved into the kit in RC2 S17 W12: a session without a valid principal reached the log, a restored
+ * The principal rule, one kit copy for both engines: a session without a valid principal reached the log, a restored
  * container session or a message. Thrown by {@link PrincipalGate}; the engine's live service prints the message,
  * fences its callbacks and fail-fasts; a log reader or a shadow host decides for itself.
  */

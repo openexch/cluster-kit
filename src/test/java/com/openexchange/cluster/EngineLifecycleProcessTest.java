@@ -15,7 +15,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /**
- * RC2 S16 W9: the production {@link EngineLifecycle#install} path in a child JVM, so the exit status is the real one
+ * The production {@link EngineLifecycle#install} path in a child JVM, so the exit status is the real one
  * (shutdown hook, {@link Runtime#halt}). Each mode is the shape of an engine main: a non-daemon application thread
  * stays alive (as the ME's publishers do), so nothing ends the JVM except the lifecycle.
  */
@@ -150,7 +150,7 @@ public class EngineLifecycleProcessTest {
 
     @Test
     public void noQuorumWithinTheWaitExitsOne() throws Exception {
-        // RC2 S17 W12 (K4): the watchdog started after the consensus module launch, on an election that never
+        // The watchdog started after the consensus module launch, on an election that never
         // leaves CANVASS, exits 1 within the wait plus the fatal grace
         final String out = run("quorum-stuck", false, 1_000 + EngineLifecycle.DEFAULT_FATAL_EXIT_GRACE_MS + 2_000,
                 List.of(1), EngineLifecycle.QUORUM_WAIT_ENV, "1000");

@@ -11,7 +11,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
-/** RC1 S2: the splice runner must catch history-dependent state and pass state-only engines. */
+/** The splice runner must catch history-dependent state and pass state-only engines. */
 public class SnapshotSpliceRunnerTest {
 
     /** A toy counter engine: ADD n, EMIT. Its snapshot is the counter; its events are the emitted values. */

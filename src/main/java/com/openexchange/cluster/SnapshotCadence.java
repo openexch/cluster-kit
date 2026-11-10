@@ -14,7 +14,7 @@ import java.util.concurrent.TimeUnit;
  * calls it. Until this class existed the rhythm lived in an external process
  * (the admin gateway's Go scheduler), which is why an engine downloaded on its
  * own never snapshotted, never truncated its log, and eventually filled its
- * disk. On 2026-07-25 that is exactly what happened to the Assets Engine and
+ * disk. On 2026-07-25 that is exactly what happened to the core engine and
  * the money path stopped for seventeen hours. Durability cannot depend on a
  * daemon somebody else has to run.</p>
  *

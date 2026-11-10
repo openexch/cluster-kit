@@ -7,7 +7,7 @@ import org.agrona.MutableDirectBuffer;
 import org.agrona.concurrent.UnsafeBuffer;
 
 /**
- * The full read of one shadow recording (RCS S3 6.4 and 8.2 steps 2-3), shared by {@code verifyDeep} and the loader:
+ * The full read of one shadow recording (the deep verify and the load), shared by {@code verifyDeep} and the loader:
  * message 0 byte-equal to the header the scan read, messages {@code 1..chunkCount} the chunks (each exactly
  * {@code chunkLength} but the last), folded into the SHA-256 payload digest and optionally copied to {@code into} at 0, then exactly one
  * trailer that passes T1-T5 against the header, then nothing. Total length, chunk count and payload digest must equal the
@@ -29,7 +29,7 @@ final class DeepRead {
         final ShadowHeader h = e.header();
         final long chunkCount = h.chunkCount();
         final UnsafeBuffer expectedHeader = new UnsafeBuffer(e.headerBytes());
-        final PayloadDigest digest = new PayloadDigest(); // amendment Q0: SHA-256, never the envelope's CRC32C
+        final PayloadDigest digest = new PayloadDigest(); // SHA-256, never the envelope's CRC32C
         final long[] payload = {0};
         final long[] message = {0};
         final boolean[] trailerSeen = {false};

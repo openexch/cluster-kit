@@ -50,7 +50,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 /**
- * RCS S3 11.6: the catalog against a real archive and a real replication. Raw recordings (offered by hand) build the
+ * The catalog against a real archive and a real replication. Raw recordings (offered by hand) build the
  * crash shapes, the corruptions and the disagreeing copies the writer never produces.
  */
 public class ShadowCatalogTest {
@@ -181,7 +181,7 @@ public class ShadowCatalogTest {
             assertEquals("trailer window delivered 0 message(s)", eii.reason());
             assertEquals(0, s.errors());
             assertFloorKnown(s);
-            nc("NC-19 INVALID_POSITION mapped to SCAN_ERROR", "floor unknown on a classifiable recording", () -> {
+            nc("INVALID_POSITION mapped to SCAN_ERROR", "floor unknown on a classifiable recording", () -> {
                 final ShadowCatalog bad = rig.catalog(100, Set.of(NegativeControl.INVALID_POSITION_AS_SCAN_ERROR));
                 assertFloorKnown(bad.verifyAllComplete());
             });
@@ -315,7 +315,7 @@ public class ShadowCatalogTest {
             assertEquals("in usable", 500, s1.usable().get(0).logPosition());
             assertFalse("not in verified", s1.verified().stream().anyMatch(x -> x.logPosition() == 500));
             assertFloorVerified(s1, false);
-            nc("NC-15 floor consumes scan-only usable", "log purged below an unverified shadow",
+            nc("floor consumes scan-only usable", "log purged below an unverified shadow",
                     () -> assertFloorVerified(s1, true));
             final ShadowCatalog.DeepResult deep = catalog.verifyDeep(s1.entry(bad.recordingId()));
             assertEquals(deep.toString(), ShadowCatalog.DeepResult.Kind.CORRUPT, deep.kind());
@@ -330,7 +330,7 @@ public class ShadowCatalogTest {
                     .entry(bad.recordingId()), new UnsafeBuffer(new byte[LEN])).kind());
             assertEquals(ShadowImageLoader.LoadResult.Kind.CORRUPT, rig.loader().load(s1.entry(bad.recordingId()),
                     new UnsafeBuffer(new byte[LEN])).kind());
-            nc("NC-16 CORRUPT cleared by the next scan", "CORRUPT entry re-labelled COMPLETE on scan 2", () -> {
+            nc("CORRUPT cleared by the next scan", "CORRUPT entry re-labelled COMPLETE on scan 2", () -> {
                 final State st = rig.catalog(100, Set.of(NegativeControl.CORRUPT_CLEARED_BY_SCAN)).scan()
                         .entry(bad.recordingId()).state();
                 if (st != State.CORRUPT) {
@@ -399,7 +399,7 @@ public class ShadowCatalogTest {
             staging.archive.replicate(control, src.recordingId(), partial, AeronArchive.NULL_POSITION);
             final ShadowEntry p1 = dst.scan().entry(partial);
             assertExtendedReclassified(p1);
-            nc("NC-13 structural cache keyed by recording id only", "extended recording reused the partial copy's verdict",
+            nc("structural cache keyed by recording id only", "extended recording reused the partial copy's verdict",
                     () -> assertExtendedReclassified(stale.scan().entry(partial)));
             ShadowRig.green("replicated copy " + s.entry(copy) + "; partial " + p0 + " -> extended " + p1);
         }
@@ -427,7 +427,7 @@ public class ShadowCatalogTest {
             assertEquals(2, s.atPosition(100).copies().size());
             assertEquals(1, s.atPosition(100).producers().size());
             assertEquals(Answer.Kind.FOUND, s.equalAt(100).kind());
-            nc("NC-5 dedupe by recording", "distinctCount 2, expected 1", () -> assertDistinctOne(
+            nc("dedupe by recording", "distinctCount 2, expected 1", () -> assertDistinctOne(
                     new ShadowCatalog(staging.aeron(), staging.archive.archive(), ENGINE, 0, GENESIS,
                             new ShadowVerdicts(), 100, ShadowRig.CLOCK, ShadowRig.TIMEOUT_NS, new ShadowCounters(),
                             new ShadowReplay(staging.aeron(), staging.archive.archive(), ShadowRig.CLOCK),
@@ -480,7 +480,7 @@ public class ShadowCatalogTest {
             assertEquals(Set.of("R3", "F1"), s.conflicts().get(0).producers().keySet());
             assertEquals(2, s.conflicts().get(0).copies().stream().map(e -> e.header().payloadDigest()).distinct().count());
             assertNoUsableAtConflict(s, 300);
-            nc("NC-6b group key includes producer and kind", "two usable shadows at one position with different CRCs",
+            nc("group key includes producer and kind", "two usable shadows at one position with different CRCs",
                     () -> assertNoTwoCrcsUsable(rig.catalog(100,
                             Set.of(NegativeControl.GROUP_KEY_INCLUDES_PRODUCER_AND_KIND)).scan(), 300));
             // a third copy with the ORIGINAL bytes joins the group: still CONFLICT, never majority
@@ -528,7 +528,7 @@ public class ShadowCatalogTest {
 
     /**
      * Amendment Q0 (2026-11-01), flipped from the characterization that found it: two DIFFERENT payloads that each end
-     * in their own CRC32C (every AE image) have EQUAL CRC32C (the residue property), but different SHA-256 digests,
+     * in their own CRC32C (every core image) have EQUAL CRC32C (the residue property), but different SHA-256 digests,
      * so two producers that wrote them at one position are a CONFLICT. NC-Q0: the writers computing the digest with
      * CRC32C again make the two images agree.
      */
@@ -592,7 +592,7 @@ public class ShadowCatalogTest {
             final Scan s = rig.catalog().scan();
             assertEquals(Answer.Kind.CONFLICT, s.equalAt(700).kind());
             assertNoUsableAtConflict(s, 700);
-            nc("NC-6a conflict picks the newer recording", "a CONFLICT copy appeared in usable",
+            nc("conflict picks the newer recording", "a CONFLICT copy appeared in usable",
                     () -> assertNoUsableAtConflict(rig.catalog(100, Set.of(NegativeControl.CONFLICT_NEWEST_WINS))
                             .scan(), 700));
         }
@@ -720,9 +720,9 @@ public class ShadowCatalogTest {
             assertEquals("the last VERIFIED copy of the anchor at 200 is refused: " + last200,
                     ShadowCatalog.PURGE_CODE_ANCHOR, last200.code());
             assertAnchorSurvives(catalog, 200);
-            // NC-20: a third copy at 200, then two purges decided on one stale scan delete both
+            // Negative control: a third copy at 200, then two purges decided on one stale scan delete both
             copies.add(rig.raw(header(R3, 2, ShadowKind.ALIGNED, 200, GENESIS, 0, p), p, Raw.COMPLETE).recordingId());
-            nc("NC-20 purge decides on a stale scan", "second copy of the anchor deleted", () -> {
+            nc("purge decides on a stale scan", "second copy of the anchor deleted", () -> {
                 final ShadowCatalog loose = rig.catalog(100, Set.of(NegativeControl.PURGE_ON_STALE_SCAN));
                 loose.verifyAllComplete();
                 loose.purge(copies.get(1), false);
@@ -733,7 +733,7 @@ public class ShadowCatalogTest {
     }
 
     /**
-     * Review FIX-4, the case D11 exists for: the anchor has one VERIFIED copy A and one COMPLETE copy B (not yet
+     * The case the anchor rule exists for: the anchor has one VERIFIED copy A and one COMPLETE copy B (not yet
      * deep-read, possibly torn). purge(A) is refused (B does not count); purge(B) is allowed; then a COMPLETE sibling
      * C arrives between two purges (a late replication, C2) and only its verification frees A.
      */
@@ -767,7 +767,7 @@ public class ShadowCatalogTest {
         }
     }
 
-    /** Review NOTE-9 (C8): a trailer of a newer version keeps its own meaning, it does not read as a crashed write. */
+    /** A trailer of a newer version keeps its own meaning, it does not read as a crashed write. */
     @Test
     public void aNewerTrailerVersionIsNotNoTrailer() {
         try (ShadowRig rig = new ShadowRig()) {

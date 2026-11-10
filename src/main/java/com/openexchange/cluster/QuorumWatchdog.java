@@ -12,7 +12,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
 
 /**
- * RC2 S17 W12 (R-KIT-Q): a bounded, loud exit when the consensus module never learns of a leader. Nothing else
+ * A bounded, loud exit when the consensus module never learns of a leader. Nothing else
  * bounds "no leader ever": a lone member of a multi-member cluster (its peers halted on a refused state, or never
  * started) stays in canvass and looks merely unready.
  *
@@ -25,7 +25,7 @@ import java.util.function.LongSupplier;
  * it. {@link #start} is called by the launcher when {@code ConsensusModule.launch} returns, so the DNS wait and the
  * external-driver wait are not counted.
  *
- * <p>INIT is not in the set (RC2 S17 W12 review V1): aeron 1.53.1 allocates the election-state counter at INIT in
+ * <p>INIT is not in the set: aeron 1.53.1 allocates the election-state counter at INIT in
  * {@code Context.conclude}, and {@code ConsensusModuleAgent.onStart} stays there (recoverFromSnapshotAndLog) until the
  * service container acknowledges its own onStart, i.e. for the whole service snapshot load. INIT stops the clock
  * like an unreadable counter; the clock starts at the first entry into CANVASS..FOLLOWER_BALLOT. A lone member of a

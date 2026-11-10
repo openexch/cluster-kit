@@ -13,7 +13,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
-/** RCS S3 11.1: the alias grammar (section 4), its refusals (A2), the discovery prefixes, and one archive leg. */
+/** The alias grammar, its refusals (A2), the discovery prefixes, and one archive leg. */
 public class ShadowAliasTest {
 
     static ShadowAlias random(final Random r) {
@@ -47,33 +47,37 @@ public class ShadowAliasTest {
             assertTrue(s, ShadowAlias.prefix(a.engineId()).endsWith(s.substring(0, s.indexOf('.', 7) + 1)));
             maximal = Math.max(maximal, s.length());
         }
-        final ShadowAlias longest = new ShadowAlias(1, Integer.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE,
-                Long.MAX_VALUE, 1, Integer.MAX_VALUE, Long.MAX_VALUE, 1);
-        assertEquals("the longest legal alias (review FIX-10)", 125, longest.format().length());
+        // The longest legal alias: every numeric field at its maximum, under the longest engine token (test99).
+        final ShadowAlias longest = new ShadowAlias(ShadowHeader.ENGINE_TEST, Integer.MAX_VALUE, Long.MAX_VALUE,
+                Long.MAX_VALUE, Long.MAX_VALUE, 1, Integer.MAX_VALUE, Long.MAX_VALUE, 1);
+        assertEquals("the longest legal alias", 125, longest.format().length());
         assertEquals(longest, ShadowAlias.parse(longest.format()));
-        assertEquals("oxs.v1.assets.c0.g24301.p1048576.t3.rR3.s17.k1",
+        final ShadowAlias longestCore = new ShadowAlias(ShadowHeader.ENGINE_CORE, Integer.MAX_VALUE, Long.MAX_VALUE,
+                Long.MAX_VALUE, Long.MAX_VALUE, 1, Integer.MAX_VALUE, Long.MAX_VALUE, 1);
+        assertEquals("the longest core alias", 123, longestCore.format().length());
+        assertEquals("oxs.v1.core.c0.g24301.p1048576.t3.rR3.s17.k1",
                 new ShadowAlias(1, 0, 24301, 1048576, 3, 1, 3, 17, 1).format());
         ShadowRig.green("alias: 10000 seeded round trips, longest seen " + maximal + ", maximal 125");
     }
 
     @Test
     public void mutationsAreRefusedNamingTheToken() {
-        final String good = "oxs.v1.assets.c0.g24301.p1048576.t3.rR3.s17.k1";
+        final String good = "oxs.v1.core.c0.g24301.p1048576.t3.rR3.s17.k1";
         final String[][] cases = {
-                {"oxs.v1.assets.c0.g-24301.p1048576.t3.rR3.s17.k1", "g"},          // sign
-                {"oxs.v1.assets.c0.p1048576.t3.rR3.s17.k1", "tokens"},             // missing token
-                {"oxs.v1.assets.c0.g24301.g24301.p1048576.t3.rR3.s17", "p"},       // duplicated token
-                {"oxs.v1.assets.c0.g24301.t3.p1048576.rR3.s17.k1", "p"},           // swapped p/t
-                {"oxs.v1.assets.c0.g24301.p10x8576.t3.rR3.s17.k1", "p"},           // non-numeric
-                {"oxs.v1.assets.c0.g0.p1048576.t3.rR3.s17.k1", "g"},               // genesis 0
-                {"oxs.v1.assets.c0.g24301.p1048576.t3.rR3.s17.k5", "k"},           // k5
-                {"oxs.v1.assets.c0.g24301.p1048576.t3.rX1.s17.k1", "r"},           // rX1
-                {"oxs.v1.assets.c0.g24301.p01048576.t3.rR3.s17.k1", "p"},          // leading zero
-                {"oxs.v1.assets.c0.g24301.p1048576.t3.rR3.s0.k1", "s"},            // seq 0
-                {"oxs.v1.assets.c0.g9223372036854775808.p1.t3.rR3.s17.k1", "g"},   // overflow
-                {"oxs.v1.assets.c2147483648.g1.p1.t3.rR3.s17.k1", "c"},            // int overflow
+                {"oxs.v1.core.c0.g-24301.p1048576.t3.rR3.s17.k1", "g"},          // sign
+                {"oxs.v1.core.c0.p1048576.t3.rR3.s17.k1", "tokens"},             // missing token
+                {"oxs.v1.core.c0.g24301.g24301.p1048576.t3.rR3.s17", "p"},       // duplicated token
+                {"oxs.v1.core.c0.g24301.t3.p1048576.rR3.s17.k1", "p"},           // swapped p/t
+                {"oxs.v1.core.c0.g24301.p10x8576.t3.rR3.s17.k1", "p"},           // non-numeric
+                {"oxs.v1.core.c0.g0.p1048576.t3.rR3.s17.k1", "g"},               // genesis 0
+                {"oxs.v1.core.c0.g24301.p1048576.t3.rR3.s17.k5", "k"},           // k5
+                {"oxs.v1.core.c0.g24301.p1048576.t3.rX1.s17.k1", "r"},           // rX1
+                {"oxs.v1.core.c0.g24301.p01048576.t3.rR3.s17.k1", "p"},          // leading zero
+                {"oxs.v1.core.c0.g24301.p1048576.t3.rR3.s0.k1", "s"},            // seq 0
+                {"oxs.v1.core.c0.g9223372036854775808.p1.t3.rR3.s17.k1", "g"},   // overflow
+                {"oxs.v1.core.c2147483648.g1.p1.t3.rR3.s17.k1", "c"},            // int overflow
                 {"oxs.v1.bogus.c0.g24301.p1048576.t3.rR3.s17.k1", "engine"},
-                {"oxs.v2.assets.c0.g24301.p1048576.t3.rR3.s17.k1", "oxs.v1"},
+                {"oxs.v2.core.c0.g24301.p1048576.t3.rR3.s17.k1", "oxs.v1"},
         };
         ShadowAlias.parse(good);
         final List<String> missed = new ArrayList<>();
@@ -89,7 +93,7 @@ public class ShadowAliasTest {
             }
         }
         assertTrue(missed.toString(), missed.isEmpty());
-        assertEquals(null, ShadowAlias.tryParse("oxs.v1.assets"));
+        assertEquals(null, ShadowAlias.tryParse("oxs.v1.core"));
     }
 
     @Test
@@ -105,7 +109,7 @@ public class ShadowAliasTest {
             assertFalse(param, (ShadowAlias.PARAM + other.format()).startsWith(
                     ShadowAlias.prefix(a.engineId(), a.clusterId(), a.genesisId())));
         }
-        assertTrue(ShadowAlias.prefix(1).equals("alias=oxs.v1.assets."));
+        assertTrue(ShadowAlias.prefix(1).equals("alias=oxs.v1.core."));
         assertEquals("oxs.v1.match.c1.g2.p3.t4.rF5.s6.k4",
                 ShadowAlias.aliasOfChannel("aeron:ipc?term-length=64k|alias=oxs.v1.match.c1.g2.p3.t4.rF5.s6.k4"));
     }
@@ -145,7 +149,7 @@ public class ShadowAliasTest {
         } catch (final IllegalArgumentException expected) {
             assertTrue(expected.getMessage(), expected.getMessage().contains("URI separator"));
         }
-        nc("NC-1 alias builder allows |", "alias contains a URI separator",
+        nc("alias builder allows |", "alias contains a URI separator",
                 () -> assertNoSeparators(a.format("te|st", 'R', false)));
     }
 }

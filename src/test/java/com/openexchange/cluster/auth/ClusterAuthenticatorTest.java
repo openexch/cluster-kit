@@ -8,14 +8,14 @@ import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 
-import static com.openexchange.cluster.auth.AuthTestPolicies.AE;
+import static com.openexchange.cluster.auth.AuthTestPolicies.CORE;
 import static com.openexchange.cluster.auth.AuthTestPolicies.ME;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
-/** RC2 S6 9.1: the kit authenticator, driven the way SessionManager drives it (the RC1 S3 cases plus the 2.5 additions). */
+/** The kit authenticator, driven the way SessionManager drives it (the v1 cases plus the backup-request additions). */
 public class ClusterAuthenticatorTest {
 
     private static final String SECRET = "ab".repeat(32);
@@ -47,7 +47,7 @@ public class ClusterAuthenticatorTest {
 
     private static ClusterAuthenticator authenticator() {
         return new ClusterAuthenticator(AuthKeyTable.fromSpec("1:ADMIN:" + SECRET + "::users=*;2:TREASURY:" + SECRET
-                + ":9:users=7", AE));
+                + ":9:users=7", CORE));
     }
 
     private static byte[] cred(final String spec) {
@@ -150,7 +150,7 @@ public class ClusterAuthenticatorTest {
     @Test
     public void thePendingMapIsCappedOldestDropped() {
         final ClusterAuthenticator a = new ClusterAuthenticator(
-                AuthKeyTable.fromSpec("1:ADMIN:" + SECRET + "::users=*", AE), 3);
+                AuthKeyTable.fromSpec("1:ADMIN:" + SECRET + "::users=*", CORE), 3);
         for (long id = 1; id <= 5; id++) {
             a.onConnectRequest(id, cred("1:ADMIN:" + SECRET), 0); // never reach onConnectedSession
         }

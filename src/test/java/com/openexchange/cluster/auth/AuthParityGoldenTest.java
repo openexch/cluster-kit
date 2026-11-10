@@ -19,11 +19,11 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * RC2 S6 9.1 (W2): the kit reproduces every RC1 S3 credential byte, principal byte and key-table decision
- * captured from assets 462b98d into {@code auth-parity-v1.txt}. A row marked DELTA differs by design (the
- * tr_TR uppercasing fix, contract 12.9, and the A16 users field, 12.12): there the kit must give the recorded
- * S6 expectation and that expectation must differ from the RC1 capture. Key tables use the AE policy, the one
- * RC1 had. ERR/LOAD_ERR compare by kind only.
+ * The kit reproduces every original credential byte, principal byte and key-table decision captured from
+ * assets 462b98d into {@code auth-parity-v1.txt}. A row marked DELTA differs by design (the tr_TR uppercasing fix,
+ * contract 12.9, and the explicit users field, 12.12): there the kit must give the recorded kit expectation and
+ * that expectation must differ from the capture. Key tables use the core policy, the one the capture had.
+ * ERR/LOAD_ERR compare by kind only.
  */
 public class AuthParityGoldenTest {
 
@@ -117,7 +117,7 @@ public class AuthParityGoldenTest {
     static String table(final String tableSpec, final String credSpec) {
         final AuthKeyTable t;
         try {
-            t = AuthKeyTable.fromSpec(unesc(tableSpec), AuthTestPolicies.AE);
+            t = AuthKeyTable.fromSpec(unesc(tableSpec), AuthTestPolicies.CORE);
         } catch (RuntimeException e) {
             return "LOAD_ERR:" + e.getClass().getSimpleName();
         }
@@ -143,7 +143,7 @@ public class AuthParityGoldenTest {
     }
 
     @Test
-    public void kitDecisionsEqualTheRc1CaptureExceptTheDeltaRows() throws Exception {
+    public void kitDecisionsEqualTheCaptureExceptTheDeltaRows() throws Exception {
         int checked = 0;
         int deltas = 0;
         final List<String> failures = new ArrayList<>();
@@ -151,9 +151,9 @@ public class AuthParityGoldenTest {
             final String kind = row[0];
             final String locale = row[1];
             final int resultAt = "table".equals(kind) ? 4 : 3;
-            final String rc1 = row[resultAt];
+            final String captured = row[resultAt];
             final boolean delta = row.length > resultAt + 1 && "DELTA".equals(row[resultAt + 1]);
-            final String expected = delta ? row[resultAt + 2] : rc1;
+            final String expected = delta ? row[resultAt + 2] : captured;
             final String kit = withLocale(locale, () -> {
                 switch (kind) {
                     case "cred": return cred(unesc(row[2]));
@@ -170,12 +170,13 @@ public class AuthParityGoldenTest {
             }
             if (delta) {
                 deltas++;
-                assertNotEquals("a DELTA row must differ from RC1: " + String.join(" ", row), kind(rc1), kind(expected));
+                assertNotEquals("a DELTA row must differ from the capture: " + String.join(" ", row), kind(captured),
+                        kind(expected));
             }
             checked++;
         }
         assertTrue("parity mismatches:\n" + String.join("\n", failures), failures.isEmpty());
-        assertEquals("the capture's DELTA rows (3 tr_TR credentials, 1 tr_TR table, 7 A16 tables)", 11, deltas);
+        assertEquals("the capture's DELTA rows (3 tr_TR credentials, 1 tr_TR table, 7 users-field tables)", 11, deltas);
         assertTrue("rows checked: " + checked, checked >= 120);
     }
 }

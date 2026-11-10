@@ -2,7 +2,7 @@
 package com.openexchange.cluster.shadow;
 
 /**
- * The archive alias of a shadow recording (RCS S3 section 4):
+ * The archive alias of a shadow recording:
  * {@code oxs.v1.<engine>.c<clusterId>.g<genesisId>.p<P_s>.t<term>.r<R|F><producerId>.s<seq>.k<kind>}.
  * Unsigned decimal, no leading zeros, characters {@code [a-z0-9.RF]} only, never a URI separator. The alias is a
  * locator, never an authority (A1): the header is trusted and the alias must equal its fields. Discovery lists
@@ -12,13 +12,13 @@ package com.openexchange.cluster.shadow;
 public record ShadowAlias(int engineId, int clusterId, long genesisId, long logPosition, long leadershipTermId,
                           int producerKind, int producerId, long producerSeq, int kind) {
 
-    /** The shadow recording stream: a constant, so every host finds every shadow with the kit alone (D-S3-8). */
+    /** The shadow recording stream: a constant, so every host finds every shadow with the kit alone. */
     public static final int STREAM_ID = 4301;
     /** The stream every shadow replay is delivered on; subscriptions are session-scoped (8.1). */
     public static final int REPLAY_STREAM_ID = 4302;
     /** Every replay channel: no linger, sparse (6.6); a {@code term-length} would be ignored by the archive. */
     public static final String REPLAY_CHANNEL = "aeron:ipc?linger=0|sparse=true";
-    /** Bound on the alias length; the longest legal alias is 125 characters (review FIX-10). */
+    /** Bound on the alias length; the longest legal alias is 125 characters (engine token test99; core 123, match 124). */
     public static final int MAX_LENGTH = 128;
     public static final String PARAM = "alias=";
     static final String HEAD = "oxs.v1.";
@@ -39,7 +39,7 @@ public record ShadowAlias(int engineId, int clusterId, long genesisId, long logP
 
     public static String engineToken(final int engineId) {
         return switch (engineId) {
-            case ShadowHeader.ENGINE_ASSETS -> "assets";
+            case ShadowHeader.ENGINE_CORE -> "core";
             case ShadowHeader.ENGINE_MATCH -> "match";
             case ShadowHeader.ENGINE_TEST -> "test99";
             default -> throw new IllegalArgumentException("no alias engine token for engineId " + engineId);
@@ -48,14 +48,14 @@ public record ShadowAlias(int engineId, int clusterId, long genesisId, long logP
 
     static int engineOf(final String token) {
         return switch (token) {
-            case "assets" -> ShadowHeader.ENGINE_ASSETS;
+            case "core" -> ShadowHeader.ENGINE_CORE;
             case "match" -> ShadowHeader.ENGINE_MATCH;
             case "test99" -> ShadowHeader.ENGINE_TEST;
             default -> -1;
         };
     }
 
-    /** {@code alias=oxs.v1.<engine>.}: what the catalog lists on every scan (review FIX-8). */
+    /** {@code alias=oxs.v1.<engine>.}: what the catalog lists on every scan. */
     public static String prefix(final int engineId) {
         return PARAM + HEAD + engineToken(engineId) + ".";
     }
@@ -84,7 +84,7 @@ public record ShadowAlias(int engineId, int clusterId, long genesisId, long logP
         return alias;
     }
 
-    /** {@code checkCharacters=false} only for the NC-1 negative control (the character rule switched off). */
+    /** {@code checkCharacters=false} only for the alias-character negative control (the character rule switched off). */
     String format(final String engineToken, final char producerLetter, final boolean checkCharacters) {
         final String alias = HEAD + engineToken + ".c" + clusterId + ".g" + genesisId + ".p" + logPosition + ".t"
                 + leadershipTermId + ".r" + producerLetter + producerId + ".s" + producerSeq + ".k" + kind;

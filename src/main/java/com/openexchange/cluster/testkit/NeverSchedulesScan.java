@@ -22,7 +22,7 @@ import java.util.function.Predicate;
 import java.util.stream.Stream;
 
 /**
- * The RF-6 "never schedules" scanner: reads compiled class files (nested classes included) and reports every reference
+ * The "never schedules" scanner: reads compiled class files (nested classes included) and reports every reference
  * to something that can schedule, publish, connect, read a clock or the environment.
  *
  * <p>Matching works on the constant pool. Every {@code CONSTANT_Utf8} is read (class constants, field and method
@@ -41,6 +41,13 @@ public final class NeverSchedulesScan {
 
     private NeverSchedulesScan() {
     }
+
+    /**
+     * The engine packages no agnostic half may reference: the core engine under its current and its former package
+     * name (so the rule keeps its meaning on both sides of that rename) and the matching engine.
+     */
+    public static final List<String> ENGINE_PACKAGES =
+            List.of("com/openexchange/assets/", "com/openexchange/core/", "com/match/");
 
     /** One forbidden reference. {@code path} is the chain of classes from the scan root to {@code className}. */
     public record Finding(String className, String rule, String reference, List<String> path) {
@@ -68,7 +75,10 @@ public final class NeverSchedulesScan {
                         Map<String, Set<String>> forbiddenMembers, Map<String, Set<String>> forbiddenOwnerPrefixMembers,
                         Map<String, Map<String, String>> onlyAllowedMembers) {
 
-        /** RF-6 list, used for every scan half: scheduling, publishing, connecting, clocks, environment, properties. */
+        /**
+         * The never-schedules list, used for every scan half: scheduling, publishing, connecting, clocks, environment,
+         * properties.
+         */
         public static Rules rf6() {
             return new Rules(
                     Set.of("io/aeron/cluster/service/Cluster",
@@ -109,18 +119,18 @@ public final class NeverSchedulesScan {
         }
 
         /**
-         * Kit half: RF-6, {@code java/lang/System} only for {@code arraycopy} (a pure copy), and no engine-specific
-         * type.
+         * Kit half: the never-schedules list, {@code java/lang/System} only for {@code arraycopy} (a pure copy), and no
+         * engine-specific type.
          */
         public static Rules kit() {
             final Rules rf6 = rf6();
-            return new Rules(rf6.forbiddenTypes(), List.of("com/openexchange/assets/", "com/match/"),
+            return new Rules(rf6.forbiddenTypes(), ENGINE_PACKAGES,
                     rf6.forbiddenAnyOwner(), rf6.forbiddenMembers(), rf6.forbiddenOwnerPrefixMembers(),
                     Map.of("java/lang/System", Map.of("arraycopy", "a pure memory copy: no clock, I/O or state")));
         }
 
         /**
-         * RCS S3 9.1, the {@code cluster.shadow} package: it may hold Aeron and archive clients its host passes in, but
+         * The {@code cluster.shadow} package: it may hold Aeron and archive clients its host passes in, but
          * never a {@code RecordingLog}, a {@code Cluster}, a {@code ClientSession}, a {@code TimerPort}, a timer call,
          * any media driver type (C13: hosts own the driver), the wall or nano clock of {@code System}, the environment,
          * a system property, or an engine-specific type. The one {@code System.getProperty} the package has (the
@@ -139,7 +149,7 @@ public final class NeverSchedulesScan {
                             // the backup belongs to cluster.replica, never to cluster.shadow
                             "io/aeron/cluster/ClusterBackup",
                             "io/aeron/cluster/ClusterBackupEventsListener"),
-                    List.of("com/openexchange/assets/", "com/match/"),
+                    ENGINE_PACKAGES,
                     Set.of("scheduleTimer", "cancelTimer"),
                     Map.of("java/lang/System", Set.of("currentTimeMillis", "nanoTime", "getenv", "getProperty",
                             "getProperties", "setProperty")),
@@ -167,7 +177,7 @@ public final class NeverSchedulesScan {
                             "java/util/TimerTask",
                             "java/util/concurrent/ScheduledExecutorService",
                             "java/util/concurrent/ScheduledThreadPoolExecutor"),
-                    List.of("com/openexchange/assets/", "com/match/"),
+                    ENGINE_PACKAGES,
                     Set.of("scheduleTimer", "cancelTimer", "newScheduledThreadPool",
                             "newSingleThreadScheduledExecutor"),
                     Map.of("java/lang/System", Set.of("currentTimeMillis", "nanoTime", "getenv", "getProperty",
@@ -222,7 +232,11 @@ public final class NeverSchedulesScan {
 
     // ------------------------------------------------------------------------------------------------------ entry
 
-    /** Every class file under {@code classesRoot} whose internal name {@code include} admits. */
+    /**
+     * Every class file under {@code classesRoot} whose internal name {@code include} admits.
+     *
+     * @throws IllegalStateException when {@code include} admits no class: an empty scan is refused, never clean
+     */
     public static Report scanDirectory(final Path classesRoot, final Predicate<String> include, final Rules rules) {
         final Map<String, byte[]> classes = new TreeMap<>();
         try (Stream<Path> files = Files.walk(classesRoot)) {
@@ -234,6 +248,12 @@ public final class NeverSchedulesScan {
             }
         } catch (final IOException e) {
             throw new UncheckedIOException(e);
+        }
+        if (classes.isEmpty()) {
+            // A predicate that admits nothing (a renamed package, a wrong class root) would report a clean scan of
+            // nothing: refuse it instead.
+            throw new IllegalStateException("scan admitted no class under " + classesRoot
+                    + ": the include predicate matches nothing, so a clean report would prove nothing");
         }
         final List<Finding> findings = new ArrayList<>();
         for (final Map.Entry<String, byte[]> e : classes.entrySet()) {

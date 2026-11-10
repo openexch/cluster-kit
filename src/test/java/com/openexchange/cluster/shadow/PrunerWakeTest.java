@@ -22,11 +22,11 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * RCS S4 11.15 (MF-8, C2, C3, C4): the real {@link SnapshotLogPruner} thread over a real archive, with no consensus
+ * The real {@link SnapshotLogPruner} thread over a real archive, with no consensus
  * module (its snapshot counter never moves), the {@link ShadowHousekeeping} hook on {@code onWake} and the floor's
  * request on {@code wake}. A VERIFIED shadow appearing without a CM snapshot triggers one purge pass within two polls;
  * the request is consumed by the pass (two wakes in one run); a shadow VERIFIED between a restore's scan and the first
- * wake is counted on the first wake. The poll interval is the production 5 s (unchanged by S4).
+ * wake is counted on the first wake. The poll interval is the production 5 s (unchanged by the wake seam).
  */
 public class PrunerWakeTest {
 
@@ -117,7 +117,7 @@ public class PrunerWakeTest {
         }
     }
 
-    /** MF-8: a new VERIFIED shadow (no CM snapshot) is followed by one purge pass within two polls. */
+    /** A new VERIFIED shadow (no CM snapshot) is followed by one purge pass within two polls. */
     static String wakeOnNewVerified(final boolean wakeOff, final long windowMs) {
         final FloorRig rig = new FloorRig();
         rig.shadow(P_1, SAFE_SEQ);
@@ -128,7 +128,7 @@ public class PrunerWakeTest {
             final long written = System.nanoTime();
             if (!await(() -> run.pruner.prunesRun() > before, windowMs)) {
                 fail("no purge within " + TimeUnit.MILLISECONDS.toSeconds(windowMs)
-                        + " s after a new VERIFIED shadow (MF-8)");
+                        + " s after a new VERIFIED shadow");
             }
             final long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - written);
             assertTrue("one purge pass within two polls, took " + tookMs + " ms", tookMs <= 2 * POLL_MS + 1_000);
@@ -143,7 +143,7 @@ public class PrunerWakeTest {
     @Test
     public void aNewVerifiedShadowWakesThePrunerWithoutACmSnapshot() {
         ShadowRig.green("11.15 wake: " + wakeOnNewVerified(false, 2 * POLL_MS + 1_000));
-        nc("S4-11.15 wake seam off", "no purge within 15 s after a new VERIFIED shadow (MF-8)",
+        nc("wake seam off", "no purge within 15 s after a new VERIFIED shadow",
                 () -> wakeOnNewVerified(true, 15_000));
     }
 

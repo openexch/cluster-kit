@@ -24,7 +24,7 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
-/** RCS S2 4.2: the bound, the failure rule, the public surface and contiguity across images (BLOCKER-1). */
+/** The bound, the failure rule, the public surface and contiguity across images. */
 public class ClusterLogReaderBoundTest {
 
     private static RecordedLogFixture fixture;

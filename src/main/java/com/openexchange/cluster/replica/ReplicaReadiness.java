@@ -26,7 +26,7 @@ import java.util.function.LongSupplier;
  *   <li>the newest shadow written within {@code REPLICA_READY_SHADOW_AGE_MS} (0 disables; counted from boot while
  *       none was written in this process, so the first window after boot is "not ready until the first shadow");</li>
  *   <li>{@code wallNow - clusterTime(last applied frame) <=
- *       REPLICA_READY_TIME_LAG_MS} (default 3 000, 0 disables), caught up or not. The AE leader arms its 10 ms drain
+ *       REPLICA_READY_TIME_LAG_MS} (default 3 000, 0 disables), caught up or not. The core leader arms its 10 ms drain
  *       belt on leadership gain, so a healthy log ticks every ~10 ms of cluster time; a still log is a
  *       frozen or partitioned supplier, which a quiet cluster can no longer be mistaken for. The former idle branch
  *       ({@code time-lag-idle}, ready) is gone; only the {@code TIME_LAG_IDLE_ALLOWED} control brings it back.

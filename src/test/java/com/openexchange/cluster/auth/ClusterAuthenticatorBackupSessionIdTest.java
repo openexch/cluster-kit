@@ -12,7 +12,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 /**
- * RC2 S6 review DEFECT-1 (verifier-added). Aeron 1.53 gives EVERY backup-style request (BackupQuery,
+ * Added by an independent verifier. Aeron 1.53 gives EVERY backup-style request (BackupQuery,
  * HeartbeatRequest, StandbySnapshot) the same session id: {@code SessionManager.onBackupAction} builds
  * {@code new ClusterSession(memberId, NULL_VALUE, ...)} and calls {@code authenticator.onConnectRequest(session.id(), ...)},
  * then {@code processPendingSessions} calls {@code onConnectedSession} for whichever pending backup session's
@@ -20,7 +20,7 @@ import static org.junit.Assert.assertTrue;
  * backup requests share one slot: a credential-less request whose response channel connects first receives the
  * REPLICA principal minted for the real backup, and passes {@code isAuthorised(BackupQuery)}.
  *
- * <p>RED on the first S6 candidate (the pending map keyed by id). Fixed fail-closed in {@link ClusterAuthenticator}:
+ * <p>RED on the first candidate (the pending map keyed by id). Fixed fail-closed in {@link ClusterAuthenticator}:
  * a -1 session is authenticated only when its request is the one and only -1 request inside the window.</p>
  */
 public class ClusterAuthenticatorBackupSessionIdTest {

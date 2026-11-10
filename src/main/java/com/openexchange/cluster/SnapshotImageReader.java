@@ -9,7 +9,7 @@ import org.agrona.concurrent.IdleStrategy;
  * Reads a snapshot image to its end. A replay may not have delivered its first fragment yet, and may pause
  * between chunks; stopping at the first empty poll restores nothing, or a truncated payload. This reader
  * polls until {@code isEndOfStream()}, drains what came with it, and throws when the image closes first, so
- * a missing or cut snapshot is never mistaken for an empty or a complete state. The loop the assets engine
+ * a missing or cut snapshot is never mistaken for an empty or a complete state. The loop the core engine
  * runs, moved once into the kit behind a {@link Source} seam so a test can script an image.
  */
 public final class SnapshotImageReader {

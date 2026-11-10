@@ -23,7 +23,7 @@ import java.util.function.LongSupplier;
  * and the pending map is capped (oldest dropped, so that session is rejected when it connects): a session that
  * never reaches {@link #onConnectedSession} cannot leak an entry.</p>
  *
- * <p><b>Backup-style requests (RC2 S6 review DEFECT-1).</b> Aeron 1.53 builds every BackupQuery,
+ * <p><b>Backup-style requests.</b> Aeron 1.53 builds every BackupQuery,
  * HeartbeatRequest and StandbySnapshot session with the same id, {@link Aeron#NULL_VALUE}, and hands this
  * authenticator only the id ({@code SessionManager.onBackupAction}, {@code processPendingSessions}); the
  * {@link SessionProxy} carries no credential, so a decision cannot be bound to its request through Aeron's API.

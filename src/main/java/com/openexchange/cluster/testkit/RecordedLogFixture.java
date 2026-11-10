@@ -37,7 +37,7 @@ import java.util.stream.Stream;
  * and swallows a fragment handler exception) or, for example, {@code RethrowingErrorHandler} (what the service
  * container and ClusterBackup enforce). Test-only: it owns an archive by design.
  *
- * <p>RCS S3 W4: with a control port (constructor {@link #RecordedLogFixture(ErrorHandler, int)}) the archive also
+ * <p>With a control port (constructor {@link #RecordedLogFixture(ErrorHandler, int)}) the archive also
  * listens on {@code aeron:udp?endpoint=localhost:<port>}, so it can be the SOURCE of a real replication
  * ({@link #controlChannel()}); {@link #record(String, int)} records a publication on a caller's channel and stream (the
  * shadow tests' raw path); {@link #replaySessionCount()} reads the archive's replay-session counter and

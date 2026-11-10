@@ -7,7 +7,7 @@ import org.agrona.MutableDirectBuffer;
 import java.nio.ByteOrder;
 
 /**
- * Message 0 of a shadow recording, fixed {@value #LENGTH} bytes, little-endian (RCS S3 3.1). One decode table, H0-H14
+ * Message 0 of a shadow recording, fixed {@value #LENGTH} bytes, little-endian. One decode table, H0-H14
  * (3.4), serves the writer (on the values it is about to encode, {@link #validate}), the catalog and the loader (on
  * bytes read back, {@link #decode}). Enum fields are carried raw; no decoder throws on an unknown value.
  *
@@ -34,7 +34,7 @@ public record ShadowHeader(int engineId, int clusterId, int kind, int producerKi
     /** One unfragmented frame: 32-byte data header + 128-byte body. */
     public static final int FRAME_LENGTH = 160;
     public static final int CRC_OFFSET = 124;
-    public static final int ENGINE_ASSETS = 1;
+    public static final int ENGINE_CORE = 1;
     public static final int ENGINE_MATCH = 2;
     /** The kit's {@code HashChainEngine}: accepted only under {@link Options#allowTestEngine}. */
     public static final int ENGINE_TEST = 99;
@@ -164,7 +164,7 @@ public record ShadowHeader(int engineId, int clusterId, int kind, int producerKi
 
     /** H4-H14 on the values (the writer refuses rather than produce a header its own reader would refuse, 3.4). */
     public Problem validate(final Options options) {
-        if (!(engineId == ENGINE_ASSETS || engineId == ENGINE_MATCH
+        if (!(engineId == ENGINE_CORE || engineId == ENGINE_MATCH
                 || (engineId == ENGINE_TEST && options.allowTestEngine()))) {
             return field("engineId");
         }

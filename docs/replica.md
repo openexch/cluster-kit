@@ -9,8 +9,8 @@ images.
 
 The engine supplies the state machine (`ReplicaEngine`), parses its own
 settings into a `ReplicaConfig` and starts `ReplicaProcess`. The kit never reads
-an environment variable; the engine README lists the setting names (in assets:
-`java -jar assets.jar replica`, settings `REPLICA_*`).
+an environment variable; the engine README lists the setting names (in core:
+`java -jar core-cluster.jar replica`, settings `REPLICA_*`).
 
 ## Threads
 

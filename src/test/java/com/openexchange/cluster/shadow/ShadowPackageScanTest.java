@@ -14,7 +14,7 @@ import java.util.List;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
-/** RCS S3 11.8: the shadow package obeys hard rule 9.1, and the scan can see what it forbids. */
+/** The shadow package obeys its package rule, and the scan can see what it forbids. */
 public class ShadowPackageScanTest {
 
     static final String PKG = "com/openexchange/cluster/shadow/";

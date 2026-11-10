@@ -11,7 +11,7 @@ import java.util.HexFormat;
  * What a client presents on connect (K6 v1, static shared secret):
  * {@code [u8 version=1][u8 class][i32 keyId LE][32 bytes secret]} = 38 bytes. The class is the client's
  * ASSERTION; the key table decides what the key is allowed to be, and the authenticator rejects a mismatch.
- * v1 answers a challenge with empty bytes (the authenticator never challenges). These are the RC1 S3 bytes,
+ * v1 answers a challenge with empty bytes (the authenticator never challenges). These are the v1 bytes,
  * byte-equal to the C++ client and the fixture's {@code credentials.py}.
  *
  * <p>Text form {@code keyId:CLASS:secretHex}, CLASS by name (uppercased with {@code Locale.ROOT}) or decimal

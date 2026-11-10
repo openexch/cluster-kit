@@ -23,7 +23,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
-/** RCS S2 4.4: the runner passes the production wiring and catches every O4 mutation, naming the path. */
+/** The runner passes the production wiring and catches every O4 mutation, naming the path. */
 public class ShadowRestoreRunnerTest {
 
     private static final int APP = SemanticVersion.compose(0, 0, 1);

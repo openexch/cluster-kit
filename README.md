@@ -2,7 +2,7 @@
 
 Shared Aeron Cluster machinery for the two Open Exchange engines: the matching
 engine ([openexch/match](https://github.com/openexch/match)) and the order and
-ledger core ([openexch/assets](https://github.com/openexch/assets)). Java 21,
+ledger core ([openexch/core](https://github.com/openexch/core)). Java 21,
 one jar, no engine code.
 
 Status: nightly prerelease (v1.0.0-nightly.20261105). Not for production.

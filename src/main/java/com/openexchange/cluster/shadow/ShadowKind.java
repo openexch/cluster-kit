@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.cluster.shadow;
 
-/** Why a shadow was written (RCS S3 3.1 {@code kind}); an attribute of a copy, never part of its identity (6.2). */
+/** Why a shadow was written (header {@code kind}); an attribute of a copy, never part of its identity (6.2). */
 public enum ShadowKind {
     ALIGNED(1), STANDBY(2), CADENCE(3), LOCAL(4);
 

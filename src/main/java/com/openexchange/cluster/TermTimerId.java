@@ -5,8 +5,8 @@ package com.openexchange.cluster;
  * Per-leadership-term cluster timer ids: {@code id = base + max(0, leadershipTermId) * TERM_STRIDE}.
  *
  * <p>Aeron's consensus module counts every TimerEvent it consumes while no timer with that id is pending and
- * swallows that many later schedules of the id (the count is never pruned and not snapshotted; RC1 S5 rule
- * 16, critic K3). A timer re-armed by the leader only must therefore carry a fresh id per term: a follower's
+ * swallows that many later schedules of the id (the count is never pruned and not snapshotted). A timer
+ * re-armed by the leader only must therefore carry a fresh id per term: a follower's
  * count for term T can never meet the id its service arms when it leads term T' > T. Any id at or above a
  * base (and below the next kind's base) is that kind; the term is recoverable from the id.</p>
  */

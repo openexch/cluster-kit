@@ -182,7 +182,7 @@ public final class ClusterLogWriter {
         }
     }
 
-    /** WK-11: a MembershipChangeEvent (template 25), which Aeron 1.53 no longer writes; synthetic only. */
+    /** A MembershipChangeEvent (template 25), which Aeron 1.53 no longer writes; synthetic only. */
     public long membershipChange(final long timestamp) {
         final int length = MessageHeaderEncoder.ENCODED_LENGTH + MembershipChangeEventEncoder.BLOCK_LENGTH;
         membershipChange.wrapAndApplyHeader(buffer, 0, messageHeader)

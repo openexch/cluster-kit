@@ -16,7 +16,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /**
- * RC2 S17 W12 (R-KIT-Q, K3 to K3d): a node whose consensus module never learns of a leader exits loudly after
+ * A node whose consensus module never learns of a leader exits loudly after
  * ENGINE_QUORUM_WAIT_MS; a node that has seen any leader-known election state (replay, catch-up, log replication,
  * ready) or CLOSED is disarmed for the process lifetime. Driven with an explicit clock, no thread.
  */

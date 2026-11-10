@@ -41,7 +41,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
-/** RCS S2 4.3: every 3.3 row, the app-version and time-unit rules, the SKIP window and RF-6 (never schedules). */
+/** Every 3.3 row, the app-version and time-unit rules, the SKIP window and the never-schedules rule. */
 public class ReplayContainerSemanticsTest {
 
     private static final int APP = SemanticVersion.compose(0, 0, 1);
@@ -408,7 +408,7 @@ public class ReplayContainerSemanticsTest {
         }
     }
 
-    // ------------------------------------------------------------------------------ RF-6: never schedules (kit)
+    // ------------------------------------------------------------------------------- never schedules (kit)
 
     /** Everything the kit half may reach: cluster.log and the pure new testkit classes (nested included). */
     private static final Pattern KIT_INPUT = Pattern.compile("com/openexchange/cluster/log/[^/]+"
@@ -458,7 +458,7 @@ public class ReplayContainerSemanticsTest {
             assertTrue("kit closure leaves the kit input: " + name, KIT_INPUT.matcher(name).matches());
         }
         assertTrue("kit closure is not vacuous: " + reached.size(), reached.size() >= 25);
-        assertTrue("kit RF-6 + agnostic closure must be clean: " + findings, findings.isEmpty());
+        assertTrue("kit never-schedules + agnostic closure must be clean: " + findings, findings.isEmpty());
         // And every class of the input directory, reached or not.
         final NeverSchedulesScan.Report report = NeverSchedulesScan.scanDirectory(classesOf(ReplayContainer.class),
                 name -> KIT_INPUT.matcher(name).matches(), NeverSchedulesScan.Rules.kit());
@@ -474,7 +474,7 @@ public class ReplayContainerSemanticsTest {
                     report.classes().contains("com/openexchange/cluster/testkit/" + required));
         }
         assertFalse(report.classes().contains("com/openexchange/cluster/testkit/RecordedLogFixture"));
-        assertTrue("kit RF-6 + agnostic scan must be clean: " + report.findings(), report.clean());
+        assertTrue("kit never-schedules + agnostic scan must be clean: " + report.findings(), report.clean());
 
         // Positive controls: the scan can see each kind of reference.
         final NeverSchedulesScan.Rules kit = NeverSchedulesScan.Rules.kit();
@@ -484,6 +484,7 @@ public class ReplayContainerSemanticsTest {
                 .anyMatch(f -> f.reference().endsWith(".scheduleTimer")));
         assertControl(ForbiddenFieldProbe.class, "io/aeron/cluster/service/Cluster");
         assertControl(ForbiddenClockProbe.class, "java/lang/System.currentTimeMillis");
+        assertControl(ForbiddenAgnosticProbe.class, "com.openexchange.core.");
         assertControl(ForbiddenAgnosticProbe.class, "com.openexchange.assets.");
 
         // Behavioural: three timer events reach the engine three times; nothing is re-armed.

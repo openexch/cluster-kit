@@ -13,7 +13,7 @@ import java.util.Set;
 
 /**
  * Host-agnostic values of one replica process: addresses, slot, ports, dirs, timeouts, the source
- * type and the credentials. The host (assets {@code ReplicaSettings}) parses its environment, applies the ranges and
+ * type and the credentials. The host (core {@code ReplicaSettings}) parses its environment, applies the ranges and
  * refusal texts of its settings and builds this; the kit never reads an environment variable. {@link Builder#build}
  * re-checks only what would make the process structurally wrong (a missing value, a non-positive period, a
  * negative-control seam without its gate) and names the setting in the refusal.
@@ -678,7 +678,7 @@ public final class ReplicaConfig {
             Objects.requireNonNull(sourceType, "REPLICA_BACKUP_SOURCE");
             Objects.requireNonNull(floorMargin, "SHADOW_FLOOR_MARGIN");
             if (credentials == null) {
-                throw refused("AE_AUTH_CREDENTIAL", "is required (a REPLICA credential)");
+                throw refused("CORE_AUTH_CREDENTIAL", "is required (a REPLICA credential)");
             }
             if (engineId <= 0) {
                 throw refused("engineId", "must be > 0: " + engineId);
@@ -692,7 +692,7 @@ public final class ReplicaConfig {
                 throw refused("REPLICA_BACKUP_SOURCE", "=FOLLOWER needs >= 2 members; use ANY");
             }
             if (nodePort < 1 || nodePort > 65535) {
-                throw refused("ASSETS_NODE_PORT", "out of range [1,65535]: " + nodePort);
+                throw refused("CORE_NODE_PORT", "out of range [1,65535]: " + nodePort);
             }
             if (shadowBufferMb < 16 || shadowBufferMb > MAX_SHADOW_BUFFER_MB) {
                 throw refused("REPLICA_SHADOW_BUFFER_MB", "=" + shadowBufferMb + " out of range [16,"

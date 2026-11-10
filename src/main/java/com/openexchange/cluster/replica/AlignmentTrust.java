@@ -30,7 +30,7 @@ import java.util.concurrent.TimeUnit;
  * <p>The member payload is looked up by P_cm AND the trigger's leadership term id; a single entry of another term
  * is no match (never compared).</p>
  * <p>The compare runs at EVERY ALIGNED trigger, so a VERIFIED replica that later diverges also fences. A member
- * snapshot in stub mode (RCS_MODE=shadow) carries no state: its genesis, term and P_cm are compared instead (a
+ * snapshot in stub mode (SNAPSHOT_MODE=shadow) carries no state: its genesis, term and P_cm are compared instead (a
  * weaker, identity-only alignment, logged as such).</p>
  *
  * <p>While UNVERIFIED and nothing is held, {@link #tick} also fences when the backup retrieved a member snapshot at a
@@ -366,7 +366,7 @@ public final class AlignmentTrust {
                 return "the member snapshot is a refused stub: " + d.refusal();
             }
             final ShadowStub s = d.stub();
-            System.out.println("[REPLICA] alignment: the member snapshot at " + position + " is a stub (RCS_MODE=shadow):"
+            System.out.println("[REPLICA] alignment: the member snapshot at " + position + " is a stub (SNAPSHOT_MODE=shadow):"
                     + " identity-only alignment (genesis, term, P_cm), no state bytes to compare");
             if (s.genesisId() != genesisId || s.logPosition() != position || s.leadershipTermId() != term) {
                 return "stub genesis=" + s.genesisId() + " term=" + s.leadershipTermId() + " P_cm=" + s.logPosition()

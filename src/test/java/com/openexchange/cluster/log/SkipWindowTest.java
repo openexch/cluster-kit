@@ -13,7 +13,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
-/** RCS S2 3.4: the truth table (7 kinds x {e < s, e == s, e > s}) and the gate. */
+/** The truth table (7 kinds x {e < s, e == s, e > s}) and the gate. */
 public class SkipWindowTest {
 
     private static final long S = 4096;

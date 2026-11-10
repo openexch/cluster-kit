@@ -23,7 +23,7 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * The synchronous shadow write (RCS S3 7.4): one recorded {@link ExclusivePublication} on
+ * The synchronous shadow write: one recorded {@link ExclusivePublication} on
  * {@code aeron:ipc?term-length=<T>|alias=<alias>}, stream {@link ShadowAlias#STREAM_ID}: the header, the enveloped
  * engine image in chunks of {@code maxMessageLength}, and, only after the archive recorded every chunk, the trailer;
  * then {@code stopRecording} and the catalog's stop position awaited. Every wait has a deadline from the injected
@@ -148,7 +148,7 @@ public final class ShadowWriter {
     private final ShadowCounters counters;
     private final Faults faults;
     private final Set<NegativeControl> off;
-    // review NOTE-7: an abort names the write in flight; with none in flight it is a no-op (the next write is not lost)
+    // An abort names the write in flight; with none in flight it is a no-op (the next write is not lost)
     private final java.util.concurrent.atomic.AtomicLong inFlight = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong abortedWrite = new java.util.concurrent.atomic.AtomicLong();
     private long writeIds;
@@ -158,7 +158,7 @@ public final class ShadowWriter {
     private long lastWrittenPosition;
 
     /**
-     * @param ipcTermLength              {@code SHADOW_TERM_LENGTH}, {@code 64k}..{@code 16m} (D-S3-14: every reader on
+     * @param ipcTermLength              {@code SHADOW_TERM_LENGTH}, {@code 64k}..{@code 16m} (every reader on
      *                                   every host maps 3 x T per replay)
      * @param initialProducerSeq         {@code max(producerSeq) + 1} of this producer's local copies, 1 when none (7.2)
      * @param initialLastWrittenPosition {@code max(logPosition)} of this producer's local copies, -1 when none
@@ -185,12 +185,12 @@ public final class ShadowWriter {
         if (selfCheck == ShadowSelfCheck.UNCHECKED_TEST_ONLY && !ShadowSelfCheck.uncheckedAllowed()) {
             throw new IllegalArgumentException("ShadowSelfCheck.UNCHECKED_TEST_ONLY needs -D"
                     + ShadowSelfCheck.UNCHECKED_PROPERTY + "=true: a production writer without a self-check is a"
-                    + " configuration error (RCS S3 7.3)");
+                    + " configuration error");
         }
         final long t = parseSize(Objects.requireNonNull(ipcTermLength, "ipcTermLength"));
         if (t < MIN_TERM_LENGTH || t > MAX_TERM_LENGTH || Long.bitCount(t) != 1) {
             throw new IllegalArgumentException("SHADOW_TERM_LENGTH " + ipcTermLength + " outside [64k, 16m] or not a"
-                    + " power of two (RCS S3 D-S3-14: every replay maps 3 x the recording's term length)");
+                    + " power of two (every replay maps 3 x the recording's term length)");
         }
         this.ipcTermLength = ipcTermLength;
         this.termLength = (int)t;
@@ -252,7 +252,7 @@ public final class ShadowWriter {
 
     /**
      * Polled by every wait loop: the write in flight ends ABORTED(ABORT_REQUESTED). With no write in flight it does
-     * nothing, so it never aborts a later write (review NOTE-7); {@code ShadowWriterThread.close} repeats it while it
+     * nothing, so it never aborts a later write; {@code ShadowWriterThread.close} repeats it while it
      * joins.
      */
     public void requestAbort() {
@@ -313,7 +313,7 @@ public final class ShadowWriter {
         final boolean genesisOff = off.contains(NegativeControl.GENESIS_CHECK_OFF);
         if (genesisId <= 0 && !genesisOff) {
             counters.increment(ShadowCounters.Counter.WRITE_SKIPPED_UNIDENTIFIED_TOTAL);
-            return WriteResult.refused(Reason.UNIDENTIFIED, "genesisId=" + genesisId + " (see RCS S3 5.5)");
+            return WriteResult.refused(Reason.UNIDENTIFIED, "genesisId=" + genesisId + " (no genesis adopted yet)");
         }
         // W2
         if (at.logPosition() <= lastWrittenPosition && !off.contains(NegativeControl.MONOTONE_CHECK_OFF)) {
@@ -344,7 +344,7 @@ public final class ShadowWriter {
         final DirectBuffer payload = image.payloadView();
         final boolean selfCheckLate = off.contains(NegativeControl.SELF_CHECK_AFTER_FIRST_OFFER);
         // W4
-        // amendment Q0: the image's identity is the SHA-256 payload digest, computed before and after the self-check
+        // The image's identity is the SHA-256 payload digest, computed before and after the self-check
         final long digestBefore = digestOf(payload, payloadLength);
         if (!selfCheckLate) {
             final WriteResult refused = selfCheck(payload, payloadLength, digestBefore);

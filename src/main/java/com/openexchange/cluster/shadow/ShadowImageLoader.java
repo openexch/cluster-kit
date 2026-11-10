@@ -12,7 +12,7 @@ import org.agrona.concurrent.UnsafeBuffer;
 import java.util.Objects;
 
 /**
- * A verified load of one shadow into a host buffer (RCS S3 8.2). The loader never calls {@code restore}: the host
+ * A verified load of one shadow into a host buffer. The loader never calls {@code restore}: the host
  * runs, in this order and all mandatory, {@link ShadowIdentity#check} under its policy, {@code container.restore(
  * payload, length, header.logPosition, cursor)} (EQUAL) or with {@code replayFrom = cursor(P_cm)} (SKIP), then
  * {@link ShadowIdentity#matches} against the RESTORED engine; a failure discards the container and the engine. A

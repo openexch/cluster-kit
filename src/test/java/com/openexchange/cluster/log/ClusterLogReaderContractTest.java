@@ -41,9 +41,9 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * RCS S2 4.1: what the reader delivers for every log template against the writer's returned positions, the stop rows
+ * What the reader delivers for every log template against the writer's returned positions, the stop rows
  * of 3.2 (one per row), the abandoned-partial rule F3, a recording that ends inside a message, and the live-oracle leg
- * against a real 1-member cluster (M RCS-M3).
+ * against a real 1-member cluster.
  */
 public class ClusterLogReaderContractTest {
 
@@ -435,7 +435,7 @@ public class ClusterLogReaderContractTest {
         assertEquals(ReaderStop.NONE, reader.stop());
     }
 
-    // ------------------------------------------------------------------------------- live oracle (M RCS-M3)
+    // ------------------------------------------------------------------------------- live oracle
 
     private static void await(final String what, final java.util.function.BooleanSupplier done) {
         final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);

@@ -9,15 +9,15 @@ import io.aeron.cluster.VersionValidator;
 
 /**
  * What an engine gives the kit replica: the members' applier, its identity, the scratch self-check and the members'
- * container app version and validator. Assets binds {@code AssetsLogApplier},
- * {@code AssetsShadowIdentity} and {@code ApplierSelfCheck}; the matching engine binds its own.
+ * container app version and validator. Core binds {@code CoreLogApplier},
+ * {@code CoreShadowIdentity} and {@code ApplierSelfCheck}; the matching engine binds its own.
  *
  * <p>Threads: {@link #engine()} and {@link #identity()} are touched by the follower thread only;
  * {@link #selfCheck()} runs on the writer thread and must build its own scratch engine.</p>
  */
 public interface ReplicaEngine {
 
-    /** {@code ShadowHeader.ENGINE_ASSETS} or {@code ENGINE_MATCH}. */
+    /** {@code ShadowHeader.ENGINE_CORE} or {@code ENGINE_MATCH}. */
     int engineId();
 
     /** The live engine the replica applies the log to; restored or genesis-started once. */

@@ -23,10 +23,10 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * RCS S4 9.2 / 11.7 / 11.15: the one purge owner. Retention N counts positions; only COMPLETE and VERIFIED copies
+ * The one purge owner. Retention N counts positions; only COMPLETE and VERIFIED copies
  * beyond N and not pinned are purged; CONFLICT, FOREIGN, CORRUPT and the crash shapes are never purged by retention
  * (counted); the floor's anchor and margin are pinned against an operator purge without {@code force}; one owner per
- * archive (C9); and the housekeeping hook paces deep reads, the startup pass included (D-S4-9).
+ * archive (C9); and the housekeeping hook paces deep reads, the startup pass included.
  */
 public class ShadowRetentionTest {
 
@@ -116,7 +116,7 @@ public class ShadowRetentionTest {
         final ShadowRetention.Pass pass = retentionPass(Set.of());
         ShadowRig.green("9.2 retention N=2: purged " + pass.purged().size() + ", skipped " + pass.skippedNonUsable()
                 + ", pins " + pass.pinnedPositions());
-        nc("S4-11.7 retention purges a CONFLICT side", "CONFLICT at " + P_160 + " resolved by deletion",
+        nc("retention purges a CONFLICT side", "CONFLICT at " + P_160 + " resolved by deletion",
                 () -> retentionPass(Set.of(NegativeControl.RETENTION_PURGES_CONFLICT)));
     }
 

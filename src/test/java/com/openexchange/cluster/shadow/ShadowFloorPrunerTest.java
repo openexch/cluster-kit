@@ -23,7 +23,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * RCS S4 11.7 (R03 literal + restorable margin, review B1) and the kit half of 11.8, over a real archive with 64 KiB
+ * The floor (literal floor + restorable margin) and the kit half of the anchor rule, over a real archive with 64 KiB
  * segments and a member-shaped {@code recording.log}: the floor decides, {@code ArchiveHousekeeping.purgeBelow}
  * really deletes the log below it (what the pruner's purge pass runs), and the catalog then answers the restore
  * queries a restart would ask. Each negative control switches one floor rule off and its own assertion fails with
@@ -60,13 +60,13 @@ public class ShadowFloorPrunerTest {
         }
     }
 
-    // ---------------------------------------------------------------- D2: the precondition (both RCS_MODEs)
+    // ---------------------------------------------------------------- D2: the precondition (both SNAPSHOT_MODEs)
 
     /** The off-mode oracle: a stub newest group with no shadow must never be pruned below P_cm. */
     static void assertNotPurgedBelowTheStub(final FloorRig r) {
         final long start = r.logStart();
         if (start > 0) {
-            throw new AssertionError("log purged below stub P_cm=" + P_CM + " with no shadow (off mode, D2): log start "
+            throw new AssertionError("log purged below stub P_cm=" + P_CM + " with no shadow (off mode): log start "
                     + start);
         }
     }
@@ -132,15 +132,15 @@ public class ShadowFloorPrunerTest {
     }
 
     /**
-     * FIX-3: a service snapshot recording with the container frames and no service message (truncated or empty
+     * A service snapshot recording with the container frames and no service message (truncated or empty
      * payload). The real {@link StubPeek} answers UNKNOWN and the floor purges nothing, even with margin none.
-     * Control: the pre-FIX-3 reading (such a recording answered FULL, which {@link NegativeControl#FLOOR_PRECONDITION_OFF}
+     * Control: the earlier reading (such a recording answered FULL, which {@link NegativeControl#FLOOR_PRECONDITION_OFF}
      * reproduces: every newest group read as a full image) purges the log below P_cm.
      */
     @Test
     public void preconditionEmptyServiceRecordingPurgesNothing() {
         emptyServiceRecording(Set.of());
-        nc("S4-FIX-3 empty service recording read as FULL", "an empty service recording restores nothing",
+        nc("empty service recording read as FULL", "an empty service recording restores nothing",
                 () -> emptyServiceRecording(Set.of(NegativeControl.FLOOR_PRECONDITION_OFF)));
     }
 
@@ -154,7 +154,7 @@ public class ShadowFloorPrunerTest {
                     r.logStart());
             assertEquals(e.toString(), ShadowFloor.Evaluation.Kind.IMAGE_UNKNOWN, e.kind());
             assertEquals(1, r.hk.get(ShadowHousekeeping.Counter.FLOOR_UNKNOWN));
-            ShadowRig.green("FIX-3 empty service recording -> UNKNOWN, floor 0 (" + e + ")");
+            ShadowRig.green("empty service recording -> UNKNOWN, floor 0 (" + e + ")");
         }
     }
 
@@ -170,7 +170,7 @@ public class ShadowFloorPrunerTest {
     @Test
     public void controlPreconditionOffPrunesAStubNewestGroupBelowPcm() {
         stubNewestGroupNoShadow(Set.of());
-        nc("S4-D2 precondition off", "log purged below stub P_cm=" + P_CM + " with no shadow (off mode, D2)",
+        nc("precondition off", "log purged below stub P_cm=" + P_CM + " with no shadow (off mode)",
                 () -> stubNewestGroupNoShadow(Set.of(NegativeControl.FLOOR_PRECONDITION_OFF)));
     }
 
@@ -216,7 +216,7 @@ public class ShadowFloorPrunerTest {
             r.purge(floor);
             final long start = r.logStart();
             if (start > P_1) {
-                fail("log purged up to the anchor P=" + e.anchorPosition() + " (NOTE-1): log start " + start);
+                fail("log purged up to the anchor P=" + e.anchorPosition() + " (margin ignored): log start " + start);
             }
             assertEquals(e.toString(), P_1, e.floor());
             assertTrue("segments below P_1 must actually go: start " + start, start > 0);
@@ -234,7 +234,7 @@ public class ShadowFloorPrunerTest {
     @Test
     public void twoVerifiedFloorAtThePreviousAndMarginNone() {
         ShadowRig.green("11.7 two VERIFIED -> " + twoVerified(Set.of()));
-        nc("S4-11.7 margin ignored", "log purged up to the anchor P=" + P_CM + " (NOTE-1)",
+        nc("margin ignored", "log purged up to the anchor P=" + P_CM + " (margin ignored)",
                 () -> twoVerified(Set.of(NegativeControl.FLOOR_MARGIN_IGNORED)));
         try (FloorRig r = new FloorRig()) {
             r.shadow(P_1, SAFE_SEQ);
@@ -265,9 +265,9 @@ public class ShadowFloorPrunerTest {
     }
 
     /**
-     * FIX-1: VERIFIED at P_B < P_A, both above P_cm, P_B skip-safe and P_A (the newest, the one SKIP tries) not, margin
+     * VERIFIED at P_B < P_A, both above P_cm, P_B skip-safe and P_A (the newest, the one SKIP tries) not, margin
      * {@code none}, nothing below P_cm. The restore only ever tries {@code newestAtOrAbove(P_cm + 1)} = P_A, abandons
-     * SKIP (not skip-safe, D-S4-3), and then needs a TAIL base or a whole log. So P_B must not count as restorable and
+     * SKIP (not skip-safe), and then needs a TAIL base or a whole log. So P_B must not count as restorable and
      * the log must stay; after the purge the restart queries must still find a path.
      */
     static String olderSkipSafeUnderANewerUnsafe(final Set<NegativeControl> off) {
@@ -297,8 +297,8 @@ public class ShadowFloorPrunerTest {
 
     @Test
     public void olderSkipSafeShadowUnderANewerUnsafeOneIsNotRestorable() {
-        ShadowRig.green("11.7 FIX-1 -> " + olderSkipSafeUnderANewerUnsafe(Set.of()));
-        nc("S4-11.7 FIX-1 any skip-safe above P_cm", "no restore path after the purge: SKIP tries P=" + P_A
+        ShadowRig.green("older skip-safe under a newer unsafe -> " + olderSkipSafeUnderANewerUnsafe(Set.of()));
+        nc("any skip-safe above P_cm", "no restore path after the purge: SKIP tries P=" + P_A
                 + " (not skip-safe)", () -> olderSkipSafeUnderANewerUnsafe(Set.of(NegativeControl.FLOOR_SKIP_ANY_ABOVE)));
         // the newer one skip-safe as well: SKIP takes it, the floor may prune to P_cm with margin none
         try (FloorRig r = new FloorRig()) {
@@ -310,7 +310,7 @@ public class ShadowFloorPrunerTest {
             assertEquals(e.toString(), P_CM, e.floor());
             assertEquals("only the SKIP target is restorable above P_cm", List.of(P_A),
                     e.restorable().stream().map(LogicalShadow::logPosition).toList());
-            ShadowRig.green("11.7 FIX-1 newest skip-safe -> floor P_cm (" + e + ")");
+            ShadowRig.green("newest skip-safe -> floor P_cm (" + e + ")");
         }
     }
 
@@ -346,7 +346,7 @@ public class ShadowFloorPrunerTest {
     @Test
     public void b1MarginIsTheRestorablePreviousNotTheNonSkipSafeOne() {
         ShadowRig.green("11.7 B1 -> " + b1(Set.of()));
-        nc("S4-11.7 B1 prev over all VERIFIED", "margin shadow at " + P_B + " is not restorable: TAIL impossible",
+        nc("prev over all VERIFIED", "margin shadow at " + P_B + " is not restorable: TAIL impossible",
                 () -> b1(Set.of(NegativeControl.FLOOR_MARGIN_OVER_ALL_VERIFIED)));
     }
 
@@ -371,7 +371,7 @@ public class ShadowFloorPrunerTest {
     @Test
     public void equalShadowUnderANonSkipSafeShadowAnchorsAtPcm() {
         ShadowRig.green("11.7 EQUAL under non-skip-safe -> " + equalUnderNonSkipSafe(Set.of()));
-        nc("S4-11.7 newest-only covering", "floor 0 with a restorable EQUAL shadow at " + P_CM,
+        nc("newest-only covering", "floor 0 with a restorable EQUAL shadow at " + P_CM,
                 () -> equalUnderNonSkipSafe(Set.of(NegativeControl.FLOOR_NEWEST_COVERING_ONLY)));
     }
 
@@ -400,7 +400,7 @@ public class ShadowFloorPrunerTest {
         }
     }
 
-    /** Scan-only COMPLETE must never feed the floor (G4 / S3 G7). */
+    /** Scan-only COMPLETE must never feed the floor. */
     static String completeDoesNotFeedTheFloor(final Set<NegativeControl> off) {
         try (FloorRig r = new FloorRig()) {
             r.shadow(P_1, SAFE_SEQ);
@@ -423,7 +423,7 @@ public class ShadowFloorPrunerTest {
     @Test
     public void onlyVerifiedFeedsTheFloor() {
         ShadowRig.green("11.7 COMPLETE ignored -> " + completeDoesNotFeedTheFloor(Set.of()));
-        nc("S4-11.7 scan-only COMPLETE feeds the floor", "floor raised on an unverified shadow at " + P_CM,
+        nc("scan-only COMPLETE feeds the floor", "floor raised on an unverified shadow at " + P_CM,
                 () -> completeDoesNotFeedTheFloor(Set.of(NegativeControl.FLOOR_READS_USABLE)));
     }
 
@@ -485,7 +485,7 @@ public class ShadowFloorPrunerTest {
     @Test
     public void tailReplayNeedsRetainedLogKitHalf() {
         ShadowRig.green("11.8 kit half -> " + tailNeedsRetainedLog(Set.of()));
-        nc("S4-11.8 floor from the anchor", "tail start " + P_2 + " below log start",
+        nc("floor from the anchor", "tail start " + P_2 + " below log start",
                 () -> tailNeedsRetainedLog(Set.of(NegativeControl.FLOOR_MARGIN_IGNORED)));
     }
 

@@ -13,14 +13,14 @@ import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 /**
- * The member's purge watermark (RCS S4 9.1): the R03-literal floor (D11) with a restorable margin (S3 carry 1, review
- * B1, D-S4-13). Plugged into {@code SnapshotLogPruner.watermark} in BOTH {@code RCS_MODE}s; {@code ArchiveHousekeeping}
+ * The member's purge watermark: the literal floor (the newest restorable base) with a restorable margin. Plugged
+ * into {@code SnapshotLogPruner.watermark} in BOTH {@code SNAPSHOT_MODE}s; {@code ArchiveHousekeeping}
  * purges to {@code min(latest snapshot, this)}.
  *
  * <p>Precondition (a fallback needs one): the table below applies only when the newest snapshot group at P_cm holds a
  * STUB service payload. When it holds a FULL service image the log below P_cm is not needed to restore, so the answer
  * is P_cm (today's pruning, unchanged). When the kind cannot be read the answer is 0 (purge nothing, fail closed).
- * An {@code off}-mode node still meets stubs: the MF-1 skip-window snapshot and a mode switch from {@code shadow}.</p>
+ * An {@code off}-mode node still meets stubs: the skip-window snapshot and a mode switch from {@code shadow}.</p>
  *
  * <pre>
  * P_cm &lt; 0                      -> NO_SNAPSHOT, 0
@@ -28,7 +28,7 @@ import java.util.function.Supplier;
  * newest group kind unreadable  -> IMAGE_UNKNOWN, 0 (purge nothing)
  * newest group STUB, then:
  * !scan.known()                 -> UNKNOWN, 0 (purge nothing)
- * skip     = scan.newestAtOrAbove(P_cm + 1): the ONE shadow above P_cm a restore tries (SKIP, D-S4-3)
+ * skip     = scan.newestAtOrAbove(P_cm + 1): the ONE shadow above P_cm a restore tries (SKIP)
  * R        = VERIFIED v with v.P_s <= P_cm, or v == skip (FOUND) and skipSafe(v)   (restorable by THIS node)
  * covering = { v in R : v.P_s >= P_cm }; empty -> 0 (no purge below P_cm without a covering local shadow)
  * anchor   = the OLDEST covering shadow
@@ -36,7 +36,7 @@ import java.util.function.Supplier;
  * margin previous-verified -> prev = newest v in R below anchor; none -> 0; else min(P_cm, prev.P_s)
  * </pre>
  *
- * <p>{@code restorable} mirrors the restore order exactly (review FIX-1): SKIP tries only the newest usable position
+ * <p>{@code restorable} mirrors the restore order exactly: SKIP tries only the newest usable position
  * above P_cm and abandons SKIP for the boot when it is CONFLICT, not skip-safe or refused, so an older VERIFIED shadow
  * above P_cm is never a restore path while a newer one exists, whatever its own journal seq. Skip-safety is per
  * candidate ({@code localDurableSeq >= candidate.journalSeq}), so an older shadow can be safe while the newest is not;
@@ -52,11 +52,11 @@ import java.util.function.Supplier;
  */
 public final class ShadowFloor implements LongSupplier {
 
-    /** {@code SHADOW_FLOOR_MARGIN} (S4 3.5). */
+    /** {@code SHADOW_FLOOR_MARGIN}. */
     public enum Margin {
         /** Keep the log from the newest restorable shadow below the anchor (default while one producer exists). */
         PREVIOUS_VERIFIED("previous-verified"),
-        /** Prune to P_cm once a covering shadow exists (S7's D14 anchors). */
+        /** Prune to P_cm once a covering shadow exists (discovery anchors). */
         NONE("none");
 
         private final String text;
@@ -69,7 +69,7 @@ public final class ShadowFloor implements LongSupplier {
             return text;
         }
 
-        /** @throws IllegalArgumentException with the S4 3.5 refusal text */
+        /** @throws IllegalArgumentException with the margin refusal text */
         public static Margin parse(final String value) {
             for (final Margin m : values()) {
                 if (m.text.equals(value)) {
@@ -149,7 +149,7 @@ public final class ShadowFloor implements LongSupplier {
      * @param latestSnapshotPosition P_cm: this node's newest valid CM snapshot position, or -1 (the host reads its
      *                               {@code RecordingLog}; this package never opens one)
      * @param newestImage            the newest group's service payload kind (the precondition of the table)
-     * @param skipSafe               S4 8.1 over this node's journal tail: may a shadow above P_cm be SKIP-restored here
+     * @param skipSafe               the skip rule over this node's journal tail: may a shadow above P_cm be SKIP-restored here
      * @param margin                 {@code SHADOW_FLOOR_MARGIN}
      * @param logStartPosition       the local log recording's start position, read from the archive on each call
      */
@@ -280,7 +280,7 @@ public final class ShadowFloor implements LongSupplier {
     /**
      * The position SKIP would try ({@code newestAtOrAbove(P_cm + 1)} FOUND), or -1 when SKIP has no candidate (EMPTY,
      * or CONFLICT: SKIP is abandoned). Under {@link NegativeControl#FLOOR_SKIP_ANY_ABOVE} every position above P_cm
-     * answers itself (the pre-FIX-1 reading).
+     * answers itself (the reading before SKIP was limited to the one shadow it tries).
      */
     private long skipTarget(final long pCm, final Scan s) {
         if (off.contains(NegativeControl.FLOOR_SKIP_ANY_ABOVE)) {
@@ -291,8 +291,8 @@ public final class ShadowFloor implements LongSupplier {
     }
 
     /**
-     * {@code restorable(v)} of S4 9.1: an EQUAL or TAIL base at or below P_cm, or the ONE shadow SKIP tries when it is
-     * skip-safe on this node (review FIX-1).
+     * {@code restorable(v)} of the floor: an EQUAL or TAIL base at or below P_cm, or the ONE shadow SKIP tries when it is
+     * skip-safe on this node.
      */
     private boolean restorable(final LogicalShadow v, final long pCm, final long skipTarget) {
         if (v.logPosition() <= pCm) {

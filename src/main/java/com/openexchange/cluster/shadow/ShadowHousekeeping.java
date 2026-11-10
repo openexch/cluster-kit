@@ -16,18 +16,18 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLongArray;
 
 /**
- * The member's shadow housekeeping (RCS S4 9.3): the hook {@code SnapshotLogPruner.onWake} runs on the pruner thread
+ * The member's shadow housekeeping: the hook {@code SnapshotLogPruner.onWake} runs on the pruner thread
  * before every purge decision. One {@link #poll} does, in order:
  *
  * <ol>
  *   <li>a catalog scan every {@code SHADOW_SCAN_PERIOD_MS} (structural verdicts are cached: no replay for an unchanged
  *       descriptor);</li>
  *   <li>at most ONE deep read, and only when {@code SHADOW_DEEP_READ_PACE_MS} passed since the previous one (the
- *       measured 1.8 s tmpfs release, S3 README D4; D-S4-9): the startup pass (every COMPLETE copy without a verdict,
+ *       measured 1.8 s tmpfs release): the startup pass (every COMPLETE copy without a verdict,
  *       newest first) is paced the same way, and only after it finished without a SCAN_ERROR does this archive's
- *       {@code startupPassDone} flip, so the floor stays UNKNOWN until then (S3 handoff, MF-7). Never more than one
+ *       {@code startupPassDone} flip, so the floor stays UNKNOWN until then. Never more than one
  *       replay open at a time: every read is synchronous on this thread;</li>
- *   <li>the host's {@code refresh} (the journal tail behind {@code skipSafe}, S4 8.2);</li>
+ *   <li>the host's {@code refresh} (the journal tail behind {@code skipSafe});</li>
  *   <li>{@link ShadowRetention#apply} (the one purge owner), then a fresh scan for the floor;</li>
  *   <li>{@link ShadowFloor#requestPurge} when a VERIFIED position appeared that the last poll did not see, or the
  *       floor rose above what the last purge pass applied (C3: "requested" means a VERIFIED shadow appeared or the
@@ -40,7 +40,7 @@ import java.util.concurrent.atomic.AtomicLongArray;
  */
 public final class ShadowHousekeeping implements Runnable {
 
-    /** The S4 section 13 shadow counters this package owns, exported by the host through {@code metricsBody()}. */
+    /** The floor and retention shadow counters this package owns, exported by the host through {@code metricsBody()}. */
     public enum Counter {
         FLOOR_POSITION("shadow_floor_position"),
         FLOOR_UNKNOWN("shadow_floor_unknown"),

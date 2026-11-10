@@ -15,15 +15,15 @@ import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * The ONE purge owner of the shadows in one archive (RCS S4 9.2, S3 carries 2 and 3, D-S4-5, D-S4-6). Runs on the
+ * The ONE purge owner of the shadows in one archive. Runs on the
  * housekeeping thread only. It is the only production path that deletes a shadow recording; the call-site scans in
- * both trees hold that ({@code ShadowPurgeCallSiteTest}, {@code NoPurgeCallSiteInAssetsTest}). An operator purge
+ * both trees hold that ({@code ShadowPurgeCallSiteTest}, {@code NoPurgeCallSiteInCoreTest}). An operator purge
  * reaches it through the node endpoint ({@link #purge}), never over the archive control channel.
  *
  * <ul>
  *   <li><b>Pinned</b> (never purged by retention; {@link #purge} refuses them with {@link #PURGE_CODE_PINNED} unless
  *       {@code force}): the floor's anchor and margin shadow (9.1), every restorable VERIFIED shadow between them,
- *       and the newest VERIFIED shadow (the S3 anchor rule, which {@link ShadowCatalog#purge} also enforces).
+ *       and the newest VERIFIED shadow (the anchor rule, which {@link ShadowCatalog#purge} also enforces).
  *       Pins are recomputed from each scan (C4).</li>
  *   <li><b>Retention N</b>: keep the {@code SHADOW_RETAIN_N} newest usable POSITIONS plus the pins; purge the
  *       COMPLETE or VERIFIED copies of older positions.</li>
@@ -96,7 +96,7 @@ public final class ShadowRetention implements AutoCloseable {
         return retainN;
     }
 
-    /** The pins of S4 9.2 over {@code scan} and the floor evaluation of the same scan. */
+    /** The retention pins over {@code scan} and the floor evaluation of the same scan. */
     public Set<Long> pins(final Scan scan, final ShadowFloor.Evaluation e) {
         final Set<Long> pins = new TreeSet<>();
         if (!scan.verified().isEmpty()) {

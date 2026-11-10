@@ -16,7 +16,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
-/** RCS S3 11.2: header (3.1, rules H0-H14 of 3.4) and trailer (3.2, T1-T5) codecs. */
+/** Header (rules H0-H14) and trailer (T1-T5) codecs. */
 public class ShadowImageCodecTest {
 
     static final ShadowHeader.Options TEST = ShadowHeader.Options.forEngine(99);
@@ -67,7 +67,7 @@ public class ShadowImageCodecTest {
         return accepted;
     }
 
-    /** NC-2: H1 switched off (the CRC is recomputed over the flipped bytes before decoding). */
+    /** Negative control: H1 switched off (the CRC is recomputed over the flipped bytes before decoding). */
     static ShadowHeader.Decoded decodeWithoutCrc(final UnsafeBuffer flipped) {
         final UnsafeBuffer copy = new UnsafeBuffer(new byte[ShadowHeader.LENGTH]);
         copy.putBytes(0, flipped, 0, ShadowHeader.LENGTH);
@@ -83,7 +83,7 @@ public class ShadowImageCodecTest {
 
     @Test
     public void negativeControlNc2HeaderCrcNotChecked() {
-        nc("NC-2 header CRC not checked", "flipped bit accepted at offset", () -> {
+        nc("header CRC not checked", "flipped bit accepted at offset", () -> {
             final List<String> accepted = acceptedFlips(false);
             assertTrue(accepted.isEmpty() ? "" : accepted.get(0), accepted.isEmpty());
         });
@@ -165,7 +165,7 @@ public class ShadowImageCodecTest {
         }
     }
 
-    /** Review NOTE-10: the digest definition (SHA-256, first 8 bytes, big-endian) and its absolute offsets. */
+    /** The digest definition (SHA-256, first 8 bytes, big-endian) and its absolute offsets. */
     @Test
     public void theDigestIsSha256First8BytesAtHeader104AndTrailer24() {
         final byte[] abc = "abc".getBytes(java.nio.charset.StandardCharsets.US_ASCII);

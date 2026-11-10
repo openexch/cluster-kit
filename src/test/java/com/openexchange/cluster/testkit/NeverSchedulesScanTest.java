@@ -14,7 +14,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
-/** RCS S2 3.7: the scanner reads descriptors, matches exactly, walks a closure with paths, and sees the controls. */
+/** The scanner reads descriptors, matches exactly, walks a closure with paths, and sees the controls. */
 public class NeverSchedulesScanTest {
 
     private static Path classesOf(final Class<?> type) {
@@ -133,9 +133,35 @@ public class NeverSchedulesScanTest {
     }
 
     @Test
-    public void agnosticListFlagsAReflectiveAssetsName() {
-        assertTrue(scan(ForbiddenAgnosticProbe.class, NeverSchedulesScan.Rules.kit()).stream()
-                .anyMatch(f -> f.rule().equals("forbidden package")));
+    public void aScanThatAdmitsNoClassIsRefused() {
+        final Path classes = classesOf(ForbiddenAgnosticProbe.class);
+        try {
+            NeverSchedulesScan.scanDirectory(classes, n -> n.startsWith("com/openexchange/nosuchpackage/"),
+                    NeverSchedulesScan.Rules.kit());
+            org.junit.Assert.fail("a scan of nothing must be refused, not reported clean");
+        } catch (final IllegalStateException expected) {
+            assertTrue(expected.getMessage(), expected.getMessage().contains("admitted no class"));
+        }
+    }
+
+    @Test
+    public void enginePackagesNameTheCoreUnderBothPackageNamesAndTheMatchingEngine() {
+        assertEquals(List.of("com/openexchange/assets/", "com/openexchange/core/", "com/match/"),
+                NeverSchedulesScan.ENGINE_PACKAGES);
+        for (final NeverSchedulesScan.Rules rules : List.of(NeverSchedulesScan.Rules.kit(),
+                NeverSchedulesScan.Rules.shadow(), NeverSchedulesScan.Rules.replica())) {
+            assertEquals(NeverSchedulesScan.ENGINE_PACKAGES, rules.forbiddenPrefixes());
+        }
+    }
+
+    @Test
+    public void agnosticListFlagsAReflectiveCoreNameUnderBothPackageNames() {
+        final List<NeverSchedulesScan.Finding> findings = scan(ForbiddenAgnosticProbe.class,
+                NeverSchedulesScan.Rules.kit());
+        for (final String name : List.of("com.openexchange.core.domain.Probe", "com.openexchange.assets.domain.Probe")) {
+            assertTrue(name + " must be flagged: " + findings, findings.stream()
+                    .anyMatch(f -> f.rule().equals("forbidden package") && f.reference().equals(name)));
+        }
         assertEquals("the agnostic list is the kit half's only", List.of(),
                 scan(ForbiddenAgnosticProbe.class, NeverSchedulesScan.Rules.rf6()));
     }

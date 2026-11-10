@@ -23,7 +23,7 @@ import static org.junit.Assert.assertEquals;
 public class BundleWatermarkTest {
 
     private static final String[] POSITIONAL = {
-            "/cluster", "aeron:udp?endpoint=localhost:9301", "/staging", "/bundles", "assets", "2",
+            "/cluster", "aeron:udp?endpoint=localhost:9301", "/staging", "/bundles", "core", "2",
     };
 
     private static long parse(final String... extra) throws Exception {

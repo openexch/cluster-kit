@@ -16,7 +16,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
-/** RC2 S6 9.1: the 38-byte K6 v1 credential, one kit copy (RC1 S3 bytes). */
+/** The 38-byte v1 credential, one kit copy (the original bytes). */
 public class ClusterCredentialsTest {
 
     private static final byte[] SECRET = HexFormat.of().parseHex(SA);
@@ -45,7 +45,7 @@ public class ClusterCredentialsTest {
 
     @Test
     public void goldenBytes() {
-        // [u8 1][u8 class][i32 keyId LE][32 B]: the S11 C++ goldens and credentials.py produce the same bytes.
+        // [u8 1][u8 class][i32 keyId LE][32 B]: the C++ goldens and credentials.py produce the same bytes.
         assertEquals("010206000000" + SA, HexFormat.of().formatHex(ClusterCredentials.fromSpec("6:FORWARDER:" + SA).encode()));
         assertEquals("0104feffffff" + SA, HexFormat.of().formatHex(ClusterCredentials.fromSpec("-2:ADMIN:" + SA).encode()));
         assertEquals("0107ffffff7f" + SA, HexFormat.of().formatHex(ClusterCredentials.fromSpec("2147483647:REPLICA:" + SA).encode()));

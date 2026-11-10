@@ -7,8 +7,8 @@ import org.agrona.MutableDirectBuffer;
 import java.nio.ByteOrder;
 
 /**
- * The last message of a shadow recording, {@value #LENGTH}-byte body in one {@value #FRAME_LENGTH}-byte frame (RCS S3
- * 3.2). Offered only after every chunk is recorded (7.4 W8-W9), so it also witnesses that the writer saw the archive
+ * The last message of a shadow recording, {@value #LENGTH}-byte body in one {@value #FRAME_LENGTH}-byte frame.
+ * Offered only after every chunk is recorded (7.4 W8-W9), so it also witnesses that the writer saw the archive
  * durable through the last chunk. Aeron pads before a frame that does not fit a term, never after, so the trailer of a
  * complete recording always starts at {@code stopPosition - 96}.
  *

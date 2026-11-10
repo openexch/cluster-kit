@@ -2,8 +2,8 @@
 package com.openexchange.cluster.shadow;
 
 /**
- * The engine's replicated identity values a shadow header carries (RCS S3 5.1; S2 2.3 option (b): the
- * {@code ShadowEngine} surface stays at nine methods). Read on the apply thread at the same instant as
+ * The engine's replicated identity values a shadow header carries (a separate source, so
+ * the {@code ShadowEngine} surface stays at nine methods). Read on the apply thread at the same instant as
  * {@code ShadowEngine.serialize}, between two frames; because that rests on the host, every load re-reads the source
  * from the RESTORED engine and compares ({@link ShadowIdentity#matches}).
  */

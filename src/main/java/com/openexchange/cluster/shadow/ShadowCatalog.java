@@ -19,8 +19,8 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * The shadows one archive holds, derived from the archive catalog on every scan (RCS S3 section 6; G2: the archive is
- * the only registry). The archive client may be local (member housekeeping, replica) or remote (S7 discovery).
+ * The shadows one archive holds, derived from the archive catalog on every scan (the archive is
+ * the only registry). The archive client may be local (member housekeeping, replica) or remote (discovery).
  *
  * <ul>
  *   <li>{@link #scan}: lists {@code alias=oxs.v1.<engine>.} on {@link ShadowAlias#STREAM_ID}, classifies each recording
@@ -50,7 +50,7 @@ public final class ShadowCatalog {
     public static final int SCAN_CODE_TIMEOUT = -2001;
     public static final int SCAN_CODE_IMAGE_CLOSED = -2002;
     public static final int SCAN_CODE_CLIENT = -2003;
-    /** The replay ended before its range (review FIX-1): unknown, retried next scan, never cached. */
+    /** The replay ended before its range: unknown, retried next scan, never cached. */
     public static final int SCAN_CODE_ENDED_EARLY = -2004;
 
     /** A restore-attempt query: one logical shadow, nothing, or a conflict the host must treat as loud. */
@@ -104,7 +104,7 @@ public final class ShadowCatalog {
             return null;
         }
 
-        /** S4 EQUAL restore attempt (D12): total, {@code CONFLICT} is loud. */
+        /** EQUAL restore attempt: total, {@code CONFLICT} is loud. */
         public Answer equalAt(final long p) {
             for (final LogicalShadow c : conflicts) {
                 if (c.logPosition() == p) {
@@ -119,12 +119,12 @@ public final class ShadowCatalog {
             return Answer.EMPTY;
         }
 
-        /** S4 SKIP restore attempt: the newest position {@code >= p}; CONFLICT if that position is in conflict. */
+        /** SKIP restore attempt: the newest position {@code >= p}; CONFLICT if that position is in conflict. */
         public Answer newestAtOrAbove(final long p) {
             return newestIn(p, Long.MAX_VALUE, true);
         }
 
-        /** S4 TAIL restore attempt: the newest position in {@code [floor, p)}; same CONFLICT rule. */
+        /** TAIL restore attempt: the newest position in {@code [floor, p)}; same CONFLICT rule. */
         public Answer newestBelow(final long p, final long floor) {
             return newestIn(floor, p, false);
         }
@@ -148,7 +148,7 @@ public final class ShadowCatalog {
             return p >= low && (highInclusive ? p <= high : p < high);
         }
 
-        /** Every copy at {@code p} whatever its state (S7 dedupe, {@code DualProducerCrcTest}, {@code shadow list}). */
+        /** Every copy at {@code p} whatever its state (dedupe, {@code DualProducerCrcTest}, {@code shadow list}). */
         public LogicalShadow atPosition(final long p) {
             final List<ShadowEntry> copies = new ArrayList<>();
             boolean conflict = false;
@@ -165,7 +165,7 @@ public final class ShadowCatalog {
                     : new LogicalShadow(first.engineId(), first.clusterId(), first.genesisId(), p, copies, conflict);
         }
 
-        /** S4 {@code ShadowFloor} first branch and D19: the newest VERIFIED position {@code >= p} (G7). */
+        /** {@code ShadowFloor} first branch and the bundle stub refusal: the newest VERIFIED position {@code >= p}. */
         public Floor verifiedAtOrAbove(final long p) {
             if (!known()) {
                 return new Floor(Floor.Kind.UNKNOWN, null);
@@ -187,7 +187,7 @@ public final class ShadowCatalog {
         }
 
         /**
-         * Retention N: logical shadows, which are positions (MF-9, review NOTE-6): every agreeing position group is one
+         * Retention N: logical shadows, which are positions: every agreeing position group is one
          * entry of {@code usable}, however many recordings hold it.
          */
         public int distinctCount() {
@@ -449,7 +449,7 @@ public final class ShadowCatalog {
         } catch (final ArchiveException ae) {
             if (trailerWindow && ae.errorCode() == ArchiveException.INVALID_POSITION
                     && !off.contains(NegativeControl.INVALID_POSITION_AS_SCAN_ERROR)) {
-                // 6.2 step 3, review FIX-1: the offset falls inside a torn frame: classifiable, not an error
+                // 6.2 step 3: the offset falls inside a torn frame: classifiable, not an error
                 w.error = (c, d, alias) -> c.entry(d, alias, null, null, 0, null, State.NO_TRAILER,
                         "INVALID_POSITION at stop - 96", ae.errorCode());
             } else {
@@ -492,7 +492,7 @@ public final class ShadowCatalog {
             }
         }
         // a bootstrap catalog (genesis unknown) that sees COMPLETE copies of more than one genesis cannot tell which
-        // cluster it belongs to: every such copy is FOREIGN (loud), never a restore candidate (RCS S3 deviation D-G)
+        // cluster it belongs to: every such copy is FOREIGN (loud), never a restore candidate
         if (genesisId == 0) {
             final java.util.Set<Long> geneses = new java.util.TreeSet<>();
             for (final ShadowEntry e : all) {
@@ -634,7 +634,7 @@ public final class ShadowCatalog {
         return new LogicalShadow(h.engineId(), h.clusterId(), h.genesisId(), h.logPosition(), copies, conflict);
     }
 
-    /** {@code (producer, seq)} used at more than one position: a diagnostic, never identity (D-S3-4). */
+    /** {@code (producer, seq)} used at more than one position: a diagnostic, never identity. */
     private static int seqReuse(final List<ShadowEntry> all) {
         final Map<String, Set<Long>> positions = new HashMap<>();
         for (final ShadowEntry e : all) {
@@ -717,7 +717,7 @@ public final class ShadowCatalog {
     }
 
     /**
-     * 6.4 MF-7, the host's startup obligation: scan, deep-verify every COMPLETE copy without a verdict (newest position
+     * 6.4, the host's startup obligation: scan, deep-verify every COMPLETE copy without a verdict (newest position
      * first), mark the startup pass done for this archive when no SCAN_ERROR occurred, then scan again (no replay for
      * unchanged descriptors) and return that scan. Until it finished, floor queries answer UNKNOWN.
      */
@@ -743,7 +743,7 @@ public final class ShadowCatalog {
     // ------------------------------------------------------------------------------------------------------ purge
 
     /**
-     * 6.5, review FIX-5 (R03 D8 is enforced here and nowhere else): re-scans, then refuses with
+     * 6.5 (the last-VERIFIED-anchor rule is enforced here and nowhere else): re-scans, then refuses with
      * {@link #PURGE_CODE_ANCHOR} the last VERIFIED copy of the anchor (the newest VERIFIED position; a CORRUPT or
      * CONFLICT newest does not anchor), and any COMPLETE or VERIFIED copy while no VERIFIED anchor exists; refuses with
      * {@link #PURGE_CODE_UNKNOWN} while the fresh scan has errors or the startup pass is not done. {@code force}
@@ -751,7 +751,7 @@ public final class ShadowCatalog {
      * refusal (e.g. {@code ACTIVE_RECORDING} 2 while a replay is in progress) is surfaced with its code.
      * Non-usable targets (FOREIGN, CONFLICT, CORRUPT, NO_TRAILER, ...) are not guarded by the anchor rule: deleting one
      * side of a CONFLICT makes the other side usable on the next scan, so resolving a CONFLICT by purge is an operator
-     * action, never a retention one (review NOTE-2; which states retention may purge is S4's).
+     * action, never a retention one (which states retention may purge is {@link ShadowRetention}'s).
      */
     public PurgeResult purge(final long recordingId, final boolean force) {
         final Scan s = off.contains(NegativeControl.PURGE_ON_STALE_SCAN) && lastScan != null ? lastScan : scan();

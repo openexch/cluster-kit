@@ -12,7 +12,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
 /**
- * Review (RCS S2 review-kit DEFECT-1, FIX-1). RED until fixed: the container knows its image position, so it must
+ * Found by review. RED until fixed: the container knows its image position, so it must
  * refuse a skip that a correct SKIP window could never produce, and an engine apply of a frame the image already holds.
  */
 public class ReviewKitRedSkipGuardTest {

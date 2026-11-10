@@ -2,17 +2,18 @@
 package com.openexchange.cluster.auth;
 
 /**
- * RC2 S6 R0 as one kit rule for both engines (RC2 S17 W12, R-KIT-R0). Authentication is always on and every live
+ * The principal rule, one kit rule for both engines. Authentication is always on and every live
  * session is minted with a real class ({@link ClusterPrincipal} refuses {@link ClusterSessionClass#UNSET} at
  * encode), so a principal-less session in the replicated log, in a restored container session or behind an ingress
- * frame can only be pre-S6 history or a session id Aeron does not know. The decision reads replicated bytes only
+ * frame can only be history from before session principals or a session id Aeron does not know. The decision
+ * reads replicated bytes only
  * (the principal Aeron hands with the session), so every member refuses at the same log position.
  *
  * <p>The check allocates nothing on the accepted path (the ME calls it per ingress frame).
  */
 public final class PrincipalGate {
     public static final String PRINCIPAL_LESS_MESSAGE =
-            "principal-less session in log: pre-S6 history, clean genesis required";
+            "principal-less session in log: history from before session principals, clean genesis required";
 
     private PrincipalGate() {
     }

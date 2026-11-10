@@ -16,7 +16,7 @@ import java.util.concurrent.TimeUnit;
  * healthy?" and then either purge everything below the snapshot or purge
  * nothing. Both answers are wrong. One strands a member that was offline at
  * snapshot time; the other grows without bound, and that branch is what left the
- * Assets Engine with an unbounded log, a full /dev/shm and a dead money path for
+ * core engine with an unbounded log, a full /dev/shm and a dead money path for
  * seventeen hours while every health check stayed green.</p>
  *
  * <p>A watermark has neither failure mode. It becomes conservative on its own

@@ -16,7 +16,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
-/** RCS S2 3.6: a model engine passes R1-R7; each rule has an engine that breaks only it, and the rule catches it. */
+/** A model engine passes R1-R7; each rule has an engine that breaks only it, and the rule catches it. */
 public class ShadowEngineConformanceTest {
 
     enum Defect { NONE, GENESIS_TWICE, SERIALIZE_MUTATES, RESTORE_LOSES_SESSIONS, TERM_MUTATES, UNKNOWN_CLOSE_FOLDS,

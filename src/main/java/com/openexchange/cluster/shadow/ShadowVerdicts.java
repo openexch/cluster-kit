@@ -6,12 +6,12 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Deep verdicts for the life of the process (RCS S3 6.4, D-S3-15): {@code VERIFIED} or {@code CORRUPT(reason)} for one
- * immutable recording. Never persisted (a verdict file beside the archive would be a second registry, G2). The only
- * object the shadow package shares between threads: thread-safe, values immutable (NOTE-1).
+ * Deep verdicts for the life of the process: {@code VERIFIED} or {@code CORRUPT(reason)} for one
+ * immutable recording. Never persisted (a verdict file beside the archive would be a second registry). The only
+ * object the shadow package shares between threads: thread-safe, values immutable.
  *
  * <p>Key: the contract's {@code (recordingId, startPosition, stopPosition)} plus the archive id and the header CRC.
- * The archive id keeps a remote catalog's recording 5 (S7 discovery) from answering for the local recording 5 when one
+ * The archive id keeps a remote catalog's recording 5 (discovery) from answering for the local recording 5 when one
  * process shares this cache; the header CRC makes a recording id reused after an archive wipe a different key. A
  * stopped recording cannot change, so the key changes only when the recording does (C4).</p>
  */

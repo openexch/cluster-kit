@@ -31,7 +31,7 @@ import static com.openexchange.cluster.shadow.ShadowRig.GENESIS;
 import static com.openexchange.cluster.shadow.ShadowRig.R3;
 
 /**
- * RCS S4 11.7 / 11.8 / 11.15 rig: a {@link ShadowRig} archive whose segment files are 64 KiB (so a purge below a
+ * Floor rig: a {@link ShadowRig} archive whose segment files are 64 KiB (so a purge below a
  * position really deletes segments), a member-shaped cluster dir ({@code recording.log} with one term entry and one
  * CM + service snapshot group at P_cm), a stopped log recording of {@link #LOG_BYTES} bytes, and raw shadows at chosen
  * positions with chosen journal seqs. The floor reads the archive's log start, never memory (C4).
@@ -49,7 +49,7 @@ final class FloorRig implements AutoCloseable {
     static final long P_2 = 500_000;
     static final long P_B = 900_000;
     static final long P_A = 1_000_000;
-    /** This node's durable journal seq: a shadow with {@code journalSeq <= DURABLE} is skip-safe (S4 8.1). */
+    /** This node's durable journal seq: a shadow with {@code journalSeq <= DURABLE} is skip-safe. */
     static final long DURABLE = 50;
     static final long SAFE_SEQ = 41;
     static final long UNSAFE_SEQ = 99;
@@ -61,7 +61,7 @@ final class FloorRig implements AutoCloseable {
     final ShadowHousekeeping.Counters hk = new ShadowHousekeeping.Counters();
     private long seq = 1;
 
-    /** The newest group's service payload (FIX-3 adds a recording with markers only). */
+    /** The newest group's service payload (EMPTY adds a recording with markers only). */
     enum Service { STUB, FULL, EMPTY }
 
     FloorRig() {
@@ -256,7 +256,7 @@ final class FloorRig implements AutoCloseable {
         return rig.raw(h, payload, ShadowRig.Raw.COMPLETE).recordingId();
     }
 
-    /** A second copy at {@code p} with different content: the position becomes CONFLICT (S3 D-S3-5). */
+    /** A second copy at {@code p} with different content: the position becomes CONFLICT. */
     long conflictAt(final long p, final long journalSeq) {
         return shadow(p, journalSeq, payload(p + 7), GENESIS);
     }

@@ -14,15 +14,15 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * RCS S4 11.15 (kit half): the stub round trip and decode rules S0-S8 of 3.2, each refused by its rule; a stub
+ * The stub round trip and decode rules S0-S8, each refused by its rule; a stub
  * reader refuses a v5-shaped payload ({@code NOT_A_STUB}); the stub rides in the kit envelope, so a torn stub never
- * decodes (RF-2).
+ * decodes.
  */
 public class ShadowStubCodecTest {
 
-    static final int ASSETS = 1;
+    static final int CORE = 1;
     static final int CLUSTER = 7;
-    static final ShadowStub STUB = new ShadowStub(ASSETS, CLUSTER, 0x5EEDL, 4, 1_048_576, 1_000_000, 12);
+    static final ShadowStub STUB = new ShadowStub(CORE, CLUSTER, 0x5EEDL, 4, 1_048_576, 1_000_000, 12);
 
     static UnsafeBuffer encoded(final ShadowStub s) {
         final UnsafeBuffer b = new UnsafeBuffer(new byte[ShadowStub.LENGTH]);
@@ -44,7 +44,7 @@ public class ShadowStubCodecTest {
     @Test
     public void roundTripIsExactAndSixtyFourBytes() {
         final UnsafeBuffer b = encoded(STUB);
-        final ShadowStub.Decoded d = ShadowStub.decode(b, 0, ShadowStub.LENGTH, ASSETS, CLUSTER);
+        final ShadowStub.Decoded d = ShadowStub.decode(b, 0, ShadowStub.LENGTH, CORE, CLUSTER);
         assertTrue(String.valueOf(d.refusal()), d.ok());
         assertEquals(STUB, d.stub());
         assertEquals(64, ShadowStub.LENGTH);
@@ -55,8 +55,8 @@ public class ShadowStubCodecTest {
         assertEquals(0, b.getInt(20, ByteOrder.LITTLE_ENDIAN));
         assertEquals(1_048_576, b.getLong(40, ByteOrder.LITTLE_ENDIAN));
         // hints at -1 (none) are legal; genesis 0 (pre-ADOPT) is legal
-        final ShadowStub noHints = new ShadowStub(ASSETS, CLUSTER, 0, 0, 0, -1, -1);
-        assertEquals(noHints, ShadowStub.decode(encoded(noHints), 0, 64, ASSETS, CLUSTER).stub());
+        final ShadowStub noHints = new ShadowStub(CORE, CLUSTER, 0, 0, 0, -1, -1);
+        assertEquals(noHints, ShadowStub.decode(encoded(noHints), 0, 64, CORE, CLUSTER).stub());
         ShadowRig.green("stub round trip: " + STUB);
     }
 
@@ -66,10 +66,10 @@ public class ShadowStubCodecTest {
         final UnsafeBuffer b = new UnsafeBuffer(new byte[ShadowStub.ENVELOPED_LENGTH]);
         assertEquals(ShadowStub.ENVELOPED_LENGTH, STUB.encodeEnveloped(env, b));
         assertTrue(ShadowStub.isStubPayload(b, SnapshotEnvelope.payloadOffset(), ShadowStub.LENGTH));
-        assertEquals(STUB, ShadowStub.openEnveloped(env, b, ShadowStub.ENVELOPED_LENGTH, ASSETS, CLUSTER).stub());
+        assertEquals(STUB, ShadowStub.openEnveloped(env, b, ShadowStub.ENVELOPED_LENGTH, CORE, CLUSTER).stub());
         b.putByte(SnapshotEnvelope.payloadOffset() + 41, (byte)(b.getByte(SnapshotEnvelope.payloadOffset() + 41) ^ 1));
         try {
-            ShadowStub.openEnveloped(env, b, ShadowStub.ENVELOPED_LENGTH, ASSETS, CLUSTER);
+            ShadowStub.openEnveloped(env, b, ShadowStub.ENVELOPED_LENGTH, CORE, CLUSTER);
             fail("a torn stub must not decode");
         } catch (final IllegalStateException expected) {
             assertTrue(expected.getMessage(), expected.getMessage().contains("CRC32C mismatch"));
@@ -80,20 +80,20 @@ public class ShadowStubCodecTest {
     @Test
     public void everyRuleRefusesByName() {
         // S0
-        assertRefused(ShadowStub.decode(encoded(STUB), 0, 63, ASSETS, CLUSTER), ShadowStub.Rule.STUB_LENGTH, "S0");
+        assertRefused(ShadowStub.decode(encoded(STUB), 0, 63, CORE, CLUSTER), ShadowStub.Rule.STUB_LENGTH, "S0");
         // S1
         UnsafeBuffer b = encoded(STUB);
         b.putLong(0, -5L, ByteOrder.LITTLE_ENDIAN);
-        assertRefused(ShadowStub.decode(b, 0, 64, ASSETS, CLUSTER), ShadowStub.Rule.NOT_A_STUB, "S1");
+        assertRefused(ShadowStub.decode(b, 0, 64, CORE, CLUSTER), ShadowStub.Rule.NOT_A_STUB, "S1");
         // S2
         b = encoded(STUB);
         b.putInt(8, 2, ByteOrder.LITTLE_ENDIAN);
-        assertRefused(ShadowStub.decode(b, 0, 64, ASSETS, CLUSTER), ShadowStub.Rule.STUB_VERSION_UNSUPPORTED, "S2");
+        assertRefused(ShadowStub.decode(b, 0, 64, CORE, CLUSTER), ShadowStub.Rule.STUB_VERSION_UNSUPPORTED, "S2");
         // S3
         assertRefused(ShadowStub.decode(encoded(STUB), 0, 64, 2, CLUSTER), ShadowStub.Rule.STUB_ENGINE,
                 "engineId 1, host 2");
         // S4
-        assertRefused(ShadowStub.decode(encoded(STUB), 0, 64, ASSETS, 8), ShadowStub.Rule.STUB_CLUSTER,
+        assertRefused(ShadowStub.decode(encoded(STUB), 0, 64, CORE, 8), ShadowStub.Rule.STUB_CLUSTER,
                 "clusterId 7, host 8");
         // S5-S8: bytes the writer never writes, forged after encoding
         final int[] offsets = {40, 32, 24, 48, 56};
@@ -103,7 +103,7 @@ public class ShadowStubCodecTest {
         for (int i = 0; i < offsets.length; i++) {
             b = encoded(STUB);
             b.putLong(offsets[i], -2L, ByteOrder.LITTLE_ENDIAN);
-            assertRefused(ShadowStub.decode(b, 0, 64, ASSETS, CLUSTER), rules[i], ids[i]);
+            assertRefused(ShadowStub.decode(b, 0, 64, CORE, CLUSTER), rules[i], ids[i]);
         }
         ShadowRig.green("rules S0-S8 each refused by name");
     }
@@ -111,11 +111,11 @@ public class ShadowStubCodecTest {
     @Test
     public void theWriterRefusesWhatTheReaderRefuses() {
         final ShadowStub[] bad = {
-            new ShadowStub(ASSETS, CLUSTER, 1, 0, -1, -1, -1),
-            new ShadowStub(ASSETS, CLUSTER, 1, -1, 0, -1, -1),
-            new ShadowStub(ASSETS, CLUSTER, -1, 0, 0, -1, -1),
-            new ShadowStub(ASSETS, CLUSTER, 1, 0, 0, -2, -1),
-            new ShadowStub(ASSETS, CLUSTER, 1, 0, 0, -1, -2)};
+            new ShadowStub(CORE, CLUSTER, 1, 0, -1, -1, -1),
+            new ShadowStub(CORE, CLUSTER, 1, -1, 0, -1, -1),
+            new ShadowStub(CORE, CLUSTER, -1, 0, 0, -1, -1),
+            new ShadowStub(CORE, CLUSTER, 1, 0, 0, -2, -1),
+            new ShadowStub(CORE, CLUSTER, 1, 0, 0, -1, -2)};
         final ShadowStub.Rule[] rules = {ShadowStub.Rule.STUB_POSITION, ShadowStub.Rule.STUB_TERM,
             ShadowStub.Rule.STUB_GENESIS, ShadowStub.Rule.STUB_HINT, ShadowStub.Rule.STUB_HINT};
         for (int i = 0; i < bad.length; i++) {
@@ -136,9 +136,9 @@ public class ShadowStubCodecTest {
         final UnsafeBuffer v5 = new UnsafeBuffer(new byte[4096]);
         v5.putLong(0, -5L);
         assertFalse(ShadowStub.isStubPayload(v5, 0, 4096));
-        assertRefused(ShadowStub.decode(v5, 0, 64, ASSETS, CLUSTER), ShadowStub.Rule.NOT_A_STUB, "tag -5");
+        assertRefused(ShadowStub.decode(v5, 0, 64, CORE, CLUSTER), ShadowStub.Rule.NOT_A_STUB, "tag -5");
         // a real-length v5 image is refused by S0 first (the rules are evaluated in order)
-        assertRefused(ShadowStub.decode(v5, 0, 4096, ASSETS, CLUSTER), ShadowStub.Rule.STUB_LENGTH, "length 4096");
+        assertRefused(ShadowStub.decode(v5, 0, 4096, CORE, CLUSTER), ShadowStub.Rule.STUB_LENGTH, "length 4096");
         assertFalse(ShadowStub.isStubPayload(v5, 0, 7));
         ShadowRig.green("v5 payload is not a stub");
     }

@@ -64,7 +64,7 @@ import static org.junit.Assert.assertTrue;
  * cluster (UDP archive control, source ANY), with {@link HashChainEngine} as the engine. It drives the real
  * {@code ClusterBackup} recording, the follower's attach, the SNAPSHOT (flags 0) and STANDBY_SNAPSHOT (flags 1) toggles
  * into ALIGNED and STANDBY shadows, housekeeping's VERIFIED verdicts, and a restart that restores from the newest
- * local shadow. The engine-specific cases are the assets tests'.
+ * local shadow. The engine-specific cases are the core tests'.
  */
 public class ReplicaProcessSmokeTest {
 

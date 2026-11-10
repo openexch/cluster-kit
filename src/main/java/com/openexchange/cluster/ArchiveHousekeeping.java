@@ -10,14 +10,14 @@ import java.util.Comparator;
 import java.util.List;
 
 /**
- * Reclaims the Assets Engine's archive disk after cluster snapshots.
+ * Reclaims the core engine's archive disk after cluster snapshots.
  *
  * Aeron snapshots do NOT truncate the cluster log — they only ADD recordings
  * (consensus module state + service state) plus a recording.log entry. Disk
  * reclamation is a separate, explicit archive operation, and until this class
- * existed the AE had none: its log grew forever. On 2026-07-25 that filled
+ * existed the core had none: its log grew forever. On 2026-07-25 that filled
  * /dev/shm, the archive began failing writes with "No space left on device",
- * AE nodes terminated, the settlement bridge could no longer map a journal
+ * core nodes terminated, the settlement bridge could no longer map a journal
  * replay image, and the money path stopped for seventeen hours. A bigger box
  * only moves that day further out. This is what removes it.
  *
@@ -40,7 +40,7 @@ import java.util.List;
  *
  * Ported from the matching engine's tool (match-cluster) rather than shared:
  * the logic is pure Aeron (RecordingLog + AeronArchive) with nothing
- * engine-specific, and the AE must not take a compile dependency on
+ * engine-specific, and the core must not take a compile dependency on
  * match-cluster. Keep the two in step when either changes.
  *
  * Loud-limits principle: every action and every skipped action is reported.

@@ -9,7 +9,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
 /**
- * One daemon thread ({@code shadow-writer-<producer>}) with one slot in front of a {@link ShadowWriter} (RCS S3 7.5).
+ * One daemon thread ({@code shadow-writer-<producer>}) with one slot in front of a {@link ShadowWriter}.
  * {@link #offer} never blocks: it returns false while a write is in flight or the slot is taken
  * ({@code shadow_write_skipped_busy_total} +1). The listener is called on the writer thread with the request (and so
  * the host's buffer) and the result. The busy flag has exactly one reset path: the end of a write, after the listener
@@ -55,7 +55,7 @@ public final class ShadowWriterThread implements AutoCloseable {
     private volatile java.util.function.BooleanSupplier fenceLatch = () -> false;
 
     /**
-     * @param errorHandler the host's: receives every {@code Throwable} from a write or the listener (review FIX-2);
+     * @param errorHandler the host's: receives every {@code Throwable} from a write or the listener;
      *                     an {@code Error} also ends the thread, so the host's halt path sees it
      */
     public ShadowWriterThread(final ShadowWriter writer, final ShadowWriteListener listener,
@@ -63,7 +63,7 @@ public final class ShadowWriterThread implements AutoCloseable {
         this(writer, listener, errorHandler, counters, false);
     }
 
-    /** {@code guardOff=true} only for the NC-23 negative control (the pre-FIX-2 thread). */
+    /** {@code guardOff=true} only for the writer-thread negative control (the thread before the error guard). */
     ShadowWriterThread(final ShadowWriter writer, final ShadowWriteListener listener,
                        final org.agrona.ErrorHandler errorHandler, final ShadowCounters counters,
                        final boolean guardOff) {
@@ -194,7 +194,10 @@ public final class ShadowWriterThread implements AutoCloseable {
         }
     }
 
-    /** NC-23: the thread as it was before review FIX-2 (listener unguarded, an Error ends it with running still true). */
+    /**
+     * Negative control: the thread as it was before the error guard (listener unguarded, an Error ends it with
+     * running still true).
+     */
     private void runUnguarded() {
         while (running) {
             final Request r = slot.getAndSet(null);
@@ -238,7 +241,7 @@ public final class ShadowWriterThread implements AutoCloseable {
     /**
      * Aborts the in-flight write ({@code ABORTED(ABORT_REQUESTED)} through the W7 cleanup) and joins up to
      * {@code timeoutMs}. The abort is repeated while it joins, so a write that started just as close was called is
-     * aborted too (an abort with no write in flight is a no-op, review NOTE-7).
+     * aborted too (an abort with no write in flight is a no-op).
      *
      * @return true when the thread ended within the timeout
      */

@@ -25,7 +25,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
-/** RCS S3 11.5: the one-slot writer thread, its busy flag (reset twice per run, C4) and its close-aborts rule. */
+/** The one-slot writer thread, its busy flag (reset twice per run, C4) and its close-aborts rule. */
 public class ShadowWriterThreadTest {
 
     final java.util.List<Throwable> errors = new java.util.concurrent.CopyOnWriteArrayList<>();
@@ -79,7 +79,7 @@ public class ShadowWriterThreadTest {
         }
     }
 
-    /** The FIX-2 rule: after an Error the thread refuses offers and is idle; it never accepts-and-loses. */
+    /** The error-guard rule: after an Error the thread refuses offers and is idle; it never accepts-and-loses. */
     static void assertNoDeadThreadAcceptingOffers(final ShadowWriterThread t) throws InterruptedException {
         if (!await(() -> !t.thread().isAlive(), 10_000)) {
             throw new AssertionError("the writer thread did not end on the Error");
@@ -121,7 +121,7 @@ public class ShadowWriterThreadTest {
             assertTrue(t.close(1_000));
         }
         try (ShadowRig rig = new ShadowRig()) {
-            ShadowRig.nc("NC-23 writer thread without the FIX-2 guard", "a dead writer thread accepted an offer", () -> {
+            ShadowRig.nc("writer thread without the error guard", "a dead writer thread accepted an offer", () -> {
                 final ShadowWriterThread t = new ShadowWriterThread(rig.writer(R3, 1, -1, fatalAtFirstOffer(),
                         Set.of(), ShadowRig.CLOCK), (req, res) -> { }, errors::add, rig.counters, true);
                 assertTrue(t.offer(ShadowWriterThread.Request.of(image(ShadowRig.CHUNK, 1), ENGINE, ShadowKind.ALIGNED,

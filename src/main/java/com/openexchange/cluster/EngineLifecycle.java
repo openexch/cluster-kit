@@ -19,10 +19,10 @@ import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 
 /**
- * Process lifecycle of an engine node (match and assets run the same code): how the node stops and which exit
+ * Process lifecycle of an engine node (match and core run the same code): how the node stops and which exit
  * status the process manager sees.
  *
- * <p>Rules (RC2 S16 W9, PO 2026-11-03):
+ * <p>Rules:
  * <ul>
  *   <li>A fatal fault (any other FATAL Aeron error with an external driver; an agent that
  *       terminated unexpectedly; a startup failure such as no CnC within the driver wait) exits with a non-zero
@@ -42,9 +42,9 @@ import java.util.function.IntConsumer;
  *       {@code ClientConductor.onClose} lines 190-206, after a 16 ms idle sleep), while agents of the same process
  *       still write counters in it: an archive whose own client closed decrements its recording-session counter
  *       in the unmapped page ({@code ArchiveConductor.closeRecordingSession} line 1362) and the JVM dies with
- *       SIGSEGV (139; RC2 S16 W6 C13, ME 3/3). Closing the components cannot win that race and has nothing
+ *       SIGSEGV (139, seen on all three ME members). Closing the components cannot win that race and has nothing
  *       durable to write without a driver; the restart recovers exactly as from SIGKILL.</li>
- *   <li>No leader ever known (RC2 S17 W12): the consensus module's election stays in a no-leader state for the
+ *   <li>No leader ever known: the consensus module's election stays in a no-leader state for the
  *       quorum wait after its launch; {@link QuorumWatchdog} records a fatal fault, exit 1.</li>
  * </ul>
  *
@@ -70,7 +70,7 @@ public final class EngineLifecycle {
     public static final String DRIVER_WAIT_PROP = "transport.external.driver.timeout.ms";
     public static final long DEFAULT_DRIVER_WAIT_MS = 30_000;
     /**
-     * RC2 S17 W12 (R-KIT-Q): how long the consensus module may stay without any known leader, from its launch,
+     * How long the consensus module may stay without any known leader, from its launch,
      * before the node exits 1 ({@link QuorumWatchdog}). Formation needs a quorum of members in canvass within this
      * wait of each other's launch: size it against the supervisor's restart backoff.
      */
@@ -78,7 +78,7 @@ public final class EngineLifecycle {
     public static final String QUORUM_WAIT_PROP = "engine.quorum.wait.ms";
     public static final long DEFAULT_QUORUM_WAIT_MS = 120_000;
 
-    /** Status of a fatal fault (driver death, unexpected agent termination, startup failure); C13 per PO-3. */
+    /** Status of a fatal fault (driver death, unexpected agent termination, startup failure). */
     public static final int EXIT_FATAL = 1;
     /** Status of a cluster-requested termination. */
     public static final int EXIT_CLUSTER_TERMINATED = 0;
@@ -104,7 +104,7 @@ public final class EngineLifecycle {
     private final AtomicBoolean halted = new AtomicBoolean();
     /** Released only when the halter returns (tests): until then no thread that lost the halt may return. */
     private final CountDownLatch haltReturned = new CountDownLatch(1);
-    /** RC2 S17 W12 (review V2): the quorum watchdogs, stopped by {@link #awaitStop} before the components close. */
+    /** The quorum watchdogs, stopped by {@link #awaitStop} before the components close. */
     private final java.util.List<QuorumWatchdog> watchdogs = new java.util.concurrent.CopyOnWriteArrayList<>();
     static final long WATCHDOG_JOIN_MS = 2_000;
     /** Set when a component close threw during the stop, so a signal stop is not reported clean. */
@@ -161,7 +161,7 @@ public final class EngineLifecycle {
     }
 
     /**
-     * RC2 S17 W12 (R-KIT-Q): call right after {@code ConsensusModule.launch} (or {@code ClusteredMediaDriver.launch})
+     * Call right after {@code ConsensusModule.launch} (or {@code ClusteredMediaDriver.launch})
      * returns, before the service container launches: starts the {@link QuorumWatchdog} clock now, on the context's
      * election-state counter, with this lifecycle's quorum wait. Both driver modes: the watchdog reads a counter,
      * not the driver.

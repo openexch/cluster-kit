@@ -6,7 +6,7 @@ import org.junit.Test;
 
 import java.util.HexFormat;
 
-import static com.openexchange.cluster.auth.AuthTestPolicies.AE;
+import static com.openexchange.cluster.auth.AuthTestPolicies.CORE;
 import static com.openexchange.cluster.auth.AuthTestPolicies.ME;
 import static com.openexchange.cluster.auth.AuthTestPolicies.SA;
 import static com.openexchange.cluster.auth.AuthTestPolicies.SB;
@@ -18,7 +18,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
-/** RC2 S6 9.1: the node-local key table (contract 2.4 rules 1-6), both engine policies, decision A16. */
+/** The node-local key table (contract 2.4 rules 1-6), both engine policies, the explicit users field. */
 public class AuthKeyTableTest {
 
     @After
@@ -37,7 +37,7 @@ public class AuthKeyTableTest {
     @Test
     public void rule1BlankEntriesSkippedAndEntriesTrimmed() {
         final AuthKeyTable t = AuthKeyTable.fromSpec(" ;;1:ADMIN:" + SA + "::users=* ; ;2:TREASURY:" + SB
-                + ":77:users=7|9|8 ;", AE);
+                + ":77:users=7|9|8 ;", CORE);
         assertEquals(2, t.size());
         final ClusterPrincipal admin = t.authenticate(ClusterCredentials.fromSpec("1:ADMIN:" + SA));
         assertTrue(admin.anyUser());
@@ -55,30 +55,30 @@ public class AuthKeyTableTest {
         assertEquals("blank identity is keyId", 5, p.identity());
         assertEquals(ClusterSessionClass.FORWARDER, p.sessionClass());
         // Java split drops trailing empties: a trailing ':' leaves three parts, i.e. no users field (A16)
-        assertTrue(refused("1:ADMIN:" + SA + ":", AE).getMessage().contains("no users field"));
-        assertTrue(refused("1:ADMIN:" + SA + "::users=*:x", AE).getMessage().contains("malformed"));
-        assertTrue(refused("1:ADMIN", AE).getMessage().contains("entry 1"));
+        assertTrue(refused("1:ADMIN:" + SA + ":", CORE).getMessage().contains("no users field"));
+        assertTrue(refused("1:ADMIN:" + SA + "::users=*:x", CORE).getMessage().contains("malformed"));
+        assertTrue(refused("1:ADMIN", CORE).getMessage().contains("entry 1"));
     }
 
     @Test
     public void rule4UsersFieldIsMandatoryA16() {
-        final IllegalArgumentException none = refused("1:ADMIN:" + SA, AE);
-        assertTrue(none.getMessage(), none.getMessage().contains("ASSETS_AUTH_KEYS entry 1 (keyId 1)"));
+        final IllegalArgumentException none = refused("1:ADMIN:" + SA, CORE);
+        assertTrue(none.getMessage(), none.getMessage().contains("CORE_AUTH_KEYS entry 1 (keyId 1)"));
         assertTrue(none.getMessage(), none.getMessage().contains("users=*"));
-        final IllegalArgumentException empty = refused("1:ADMIN:" + SA + "::users=", AE);
+        final IllegalArgumentException empty = refused("1:ADMIN:" + SA + "::users=", CORE);
         assertTrue(empty.getMessage(), empty.getMessage().contains("entry 1 (keyId 1)"));
         assertTrue(empty.getMessage(), empty.getMessage().contains("users=*"));
         final IllegalArgumentException third = refused("1:ADMIN:" + SA + "::users=*;2:TOOL:" + SA
-                + "::users=*;;7:TOOL:" + SB + ":7", AE);
-        assertTrue(third.getMessage(), third.getMessage().contains("ASSETS_AUTH_KEYS entry 4 (keyId 7): no users field"));
-        refused("1:ADMIN:" + SA + "::users=7||9", AE);
-        refused("1:ADMIN:" + SA + "::users=7|", AE);
-        refused("1:ADMIN:" + SA + "::users=*|7", AE);
-        refused("1:ADMIN:" + SA + "::users=x", AE);
-        refused("1:ADMIN:" + SA + "::users=7|7", AE);
-        refused("1:ADMIN:" + SA + "::scope=7", AE);
-        final byte[] star = AuthKeyTable.fromSpec("1:ADMIN:" + SA + "::users=*", AE).principalOf(1).encode();
-        assertArrayEquals("users=* mints the RC1 implicit any-user bytes",
+                + "::users=*;;7:TOOL:" + SB + ":7", CORE);
+        assertTrue(third.getMessage(), third.getMessage().contains("CORE_AUTH_KEYS entry 4 (keyId 7): no users field"));
+        refused("1:ADMIN:" + SA + "::users=7||9", CORE);
+        refused("1:ADMIN:" + SA + "::users=7|", CORE);
+        refused("1:ADMIN:" + SA + "::users=*|7", CORE);
+        refused("1:ADMIN:" + SA + "::users=x", CORE);
+        refused("1:ADMIN:" + SA + "::users=7|7", CORE);
+        refused("1:ADMIN:" + SA + "::scope=7", CORE);
+        final byte[] star = AuthKeyTable.fromSpec("1:ADMIN:" + SA + "::users=*", CORE).principalOf(1).encode();
+        assertArrayEquals("users=* mints the original implicit any-user bytes",
                 ClusterPrincipal.anyUser(ClusterSessionClass.ADMIN, 1).encode(), star);
         assertEquals("01040100010000000000", HexFormat.of().formatHex(star));
     }
@@ -106,26 +106,26 @@ public class AuthKeyTableTest {
         final IllegalArgumentException scoped = refused("2:FORWARDER:" + SA + "::users=7", ME);
         assertTrue(scoped.getMessage(), scoped.getMessage().contains("users=*"));
         assertNotNull(AuthKeyTable.fromSpec("2:FORWARDER:" + SA + "::users=*", ME).principalOf(2));
-        assertNotNull(AuthKeyTable.fromSpec("2:TREASURY:" + SA + "::users=7", AE).principalOf(2));
-        refused("1:ADMIN:" + SA + "::users=*;1:TOOL:" + SB + "::users=*", AE);
-        refused("1:ADMIN:abcd::users=*", AE);
-        refused("1:ADMIN:" + SA + "00::users=*", AE);
-        refused("1:ADMIN:zz" + SA.substring(2) + "::users=*", AE);
-        refused("1:NOBODY:" + SA + "::users=*", AE);
-        refused("1:0:" + SA + "::users=*", AE);
-        refused("1:UNSET:" + SA + "::users=*", AE);
-        refused("x:ADMIN:" + SA + "::users=*", AE);
-        refused("1:ADMIN:" + SA + ":y:users=*", AE);
+        assertNotNull(AuthKeyTable.fromSpec("2:TREASURY:" + SA + "::users=7", CORE).principalOf(2));
+        refused("1:ADMIN:" + SA + "::users=*;1:TOOL:" + SB + "::users=*", CORE);
+        refused("1:ADMIN:abcd::users=*", CORE);
+        refused("1:ADMIN:" + SA + "00::users=*", CORE);
+        refused("1:ADMIN:zz" + SA.substring(2) + "::users=*", CORE);
+        refused("1:NOBODY:" + SA + "::users=*", CORE);
+        refused("1:0:" + SA + "::users=*", CORE);
+        refused("1:UNSET:" + SA + "::users=*", CORE);
+        refused("x:ADMIN:" + SA + "::users=*", CORE);
+        refused("1:ADMIN:" + SA + ":y:users=*", CORE);
         final StringBuilder ids = new StringBuilder();
         for (int i = 1; i <= 511; i++) {
             ids.append(i == 1 ? "" : "|").append(i);
         }
-        refused("6:TREASURY:" + SA + "::users=" + ids, AE);
+        refused("6:TREASURY:" + SA + "::users=" + ids, CORE);
     }
 
     @Test
     public void authenticateNeedsKeyClassAndSecret() {
-        final AuthKeyTable t = AuthKeyTable.fromSpec("1:ADMIN:" + SA + "::users=*", AE);
+        final AuthKeyTable t = AuthKeyTable.fromSpec("1:ADMIN:" + SA + "::users=*", CORE);
         assertNull(t.authenticate(null));
         assertNull(t.authenticate(ClusterCredentials.fromSpec("2:ADMIN:" + SA)));
         assertNull(t.authenticate(ClusterCredentials.fromSpec("1:ADMIN:" + SB)));

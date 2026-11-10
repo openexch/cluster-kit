@@ -7,7 +7,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
-/** RC2 S6 9.1 (K3): per-leadership-term timer ids, the AE arithmetic in one kit helper. */
+/** Per-leadership-term timer ids, the core arithmetic in one kit helper. */
 public class TermTimerIdTest {
 
     private static final long BASE = 1_000_000_000_000L;
@@ -32,7 +32,7 @@ public class TermTimerIdTest {
         assertFalse("a TimerManager counter id is never the flush kind", TermTimerId.isKind(12_345L, BASE));
         assertEquals(42, TermTimerId.termOf(id, BASE));
         assertEquals(0, TermTimerId.termOf(BASE, BASE));
-        // AssetsLogApplier's ids are exactly these (RCS S4 moves them onto this helper)
+        // CoreLogApplier's ids are exactly these (it computes them with this helper)
         assertEquals(BASE + 7 * 1_000_000L, TermTimerId.of(BASE, 7));
     }
 }

@@ -22,7 +22,7 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
- * The live oracle (M RCS-M3): a service that appends one record per callback, keyed by {@code cluster.logPosition()},
+ * The live oracle: a service that appends one record per callback, keyed by {@code cluster.logPosition()},
  * to an append-only file outside the cluster directory, so the trace survives a node restart. A message whose payload
  * starts with {@code TIMER} schedules timer {@link #TIMER_ID} 20 ms ahead. It writes nothing into its snapshots.
  *

@@ -15,7 +15,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
-/** RC2 S6 9.1 (M Q12): the kit snapshot loader waits for end of stream. */
+/** The kit snapshot loader waits for end of stream. */
 public class SnapshotImageReaderTest {
 
     /** One scripted poll: the fragments it delivers and whether end of stream / close holds after it. */

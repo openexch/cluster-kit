@@ -14,7 +14,7 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
-/** RC2 S6 9.1: the principal every member reads from SessionOpen; decode leniency and the hot-path class read. */
+/** The principal every member reads from SessionOpen; decode leniency and the hot-path class read. */
 public class ClusterPrincipalTest {
 
     private static byte[] p(final int... b) {

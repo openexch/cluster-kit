@@ -7,7 +7,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLongArray;
 
 /**
- * The shadow counters of RCS S3 section 10, plain longs the host exports (no Aeron counter). Written by the writer
+ * The shadow counters, plain longs the host exports (no Aeron counter). Written by the writer
  * thread and the catalog's owner thread, read by the host's exporter: every slot is atomic. Gauges ({@code *_last},
  * {@code catalog_*}, positions) are set, totals incremented.
  */
@@ -21,7 +21,7 @@ public final class ShadowCounters {
         CATALOG_DISTINCT, CATALOG_INCOMPLETE, CATALOG_CONFLICT_TOTAL, CATALOG_CORRUPT, CATALOG_CORRUPT_TOTAL,
         CATALOG_FOREIGN, CATALOG_SEQ_REUSE_TOTAL, CATALOG_STARTUP_PASS_DONE, NEWEST_VERIFIED_POSITION,
         NEWEST_USABLE_POSITION, REPLAY_TIMEOUTS_TOTAL, IDENTITY_CROSSCHECK_FAILURES_TOTAL,
-        /** review FIX-2: a Throwable from a write or the listener on the writer thread. */
+        /** A Throwable from a write or the listener on the writer thread. */
         WRITER_THREAD_ERRORS_TOTAL;
 
         /** The exported name, {@code shadow_<lower>}. */

@@ -14,7 +14,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * RCS S4 9.2 / 11.15 (review F6, D-S4-6): one purge owner per archive, held structurally in the kit. Every main class
+ * One purge owner per archive, held structurally in the kit. Every main class
  * under {@code com/openexchange/cluster/} is scanned for calls to {@code AeronArchive.purgeRecording} and
  * {@code ShadowCatalog.purge}; the only callers allowed are {@link ShadowRetention} (the owner),
  * {@link ShadowCatalog} itself (its {@code purge}, the archive call at the end), {@link ShadowWriter} (its own aborted
@@ -91,7 +91,7 @@ public class ShadowPurgeCallSiteTest {
         final List<NeverSchedulesScan.Finding> withProbe = new ArrayList<>(mainFindings());
         withProbe.addAll(NeverSchedulesScan.scanClass(PKG + "shadow/ForbiddenPurgeProbe",
                 ShadowPackageScanTest.bytes(ForbiddenPurgeProbe.class), purgeRules()));
-        ShadowRig.nc("S4-11.15 kit purge probe", "purge call site outside ShadowRetention: " + PKG
+        ShadowRig.nc("kit purge probe", "purge call site outside ShadowRetention: " + PKG
                 + "shadow/ForbiddenPurgeProbe", () -> check(withProbe));
     }
 }

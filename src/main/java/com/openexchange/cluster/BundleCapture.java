@@ -87,8 +87,8 @@ public final class BundleCapture {
     public record EngineSchema(int id, int version) {
 
         /**
-         * The service-payload tag a stub-mode member writes in place of a full image (RCS S4 3.2): a bundle whose
-         * snapshot is a stub carries no ledger and is refused (D19). The same constant for every engine.
+         * The service-payload tag a stub-mode member writes in place of a full image: a bundle whose
+         * snapshot is a stub carries no ledger and is refused. The same constant for every engine.
          */
         public long stubTag() {
             return ShadowStub.STUB_TAG;
@@ -251,7 +251,7 @@ public final class BundleCapture {
                 durablePosition, true);
     }
 
-    /** {@code stubPeek=false} only for the RCS S4 11.12 negative control (the pre-D19 capture). */
+    /** {@code stubPeek=false} only for the stub-peek negative control (the capture before the stub refusal). */
     static Result capture(final File clusterDir, final String srcControlChannel,
                           final File stagingRoot, final File bundleRoot,
                           final String cluster, final int nodeId,
@@ -307,7 +307,7 @@ public final class BundleCapture {
                         + entry.recordingId + " (serviceId=" + entry.serviceId + ") -> " + staged);
             }
 
-            // RCS S4 10 (D19, G18): a stub-mode member's service snapshot is a 64-byte stub that names a
+            // A stub-mode member's service snapshot is a 64-byte stub that names a
             // local shadow, not a ledger. A bundle of it would pass every checksum and restore nothing, so
             // peek each staged service payload and refuse before anything is copied or the chain advances.
             if (stubPeek) {
@@ -471,10 +471,10 @@ public final class BundleCapture {
         }
     }
 
-    /** The D19 refusal text (RCS S4 10). */
+    /** The stub refusal text. */
     static String stubRefusal(final long snapshotPosition) {
-        return "snapshot at " + snapshotPosition + " is a stub (RCS); a bundle needs a full image or the covering "
-                + "shadow, which BundleCapture cannot capture yet (D19)";
+        return "snapshot at " + snapshotPosition + " is a stub (shadow snapshot mode); a bundle needs a full image or "
+                + "the covering shadow, which BundleCapture cannot capture yet";
     }
 
     /** {@code bundle_stub_refused_total}: captures refused because the newest snapshot was a stub. */
@@ -585,7 +585,7 @@ public final class BundleCapture {
             // point at a recording that does not exist.
             final Path tmp = stagingRoot.toPath().resolve("bundle-state.properties.tmp");
             try (var out = Files.newOutputStream(tmp)) {
-                props.store(out, "Assets Engine bundle chain state");
+                props.store(out, "Core bundle chain state");
             }
             Files.move(tmp, stagingRoot.toPath().resolve("bundle-state.properties"),
                     StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);

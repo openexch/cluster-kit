@@ -12,7 +12,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
-/** RC1 S2: the one snapshot envelope both engines verify before decoding a byte. */
+/** The one snapshot envelope both engines verify before decoding a byte. */
 public class SnapshotEnvelopeTest {
 
     private static ExpandableArrayBuffer sealed(final int payloadLength, final int[] lengthOut) {

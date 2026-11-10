@@ -22,7 +22,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
-/** RC2 S16 W9: the exit decision of {@link EngineLifecycle}, in-JVM with a recording halter. */
+/** The exit decision of {@link EngineLifecycle}, in-JVM with a recording halter. */
 public class EngineLifecycleTest {
 
     private final List<Integer> halts = new CopyOnWriteArrayList<>();
@@ -299,7 +299,7 @@ public class EngineLifecycleTest {
 
     @Test
     public void theLoserOfTheHaltDoesNotReturnBeforeTheWinnerHalts() throws Exception {
-        // Assets PR #131 on CI: on a startup failure the backstop won the halt, the main thread's halt returned at
+        // core PR #131 on CI: on a startup failure the backstop won the halt, the main thread's halt returned at
         // once, main() returned and the JVM exited 0 before the backstop reached Runtime.halt.
         final CountDownLatch backstopInHalter = new CountDownLatch(1);
         final CountDownLatch releaseHalter = new CountDownLatch(1);

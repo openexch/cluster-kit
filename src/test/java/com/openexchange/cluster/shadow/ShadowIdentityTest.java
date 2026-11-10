@@ -15,7 +15,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
-/** RCS S3 11.3: identity rows I1-I8 under the three policies, the post-restore cross-check, the boot guard. */
+/** Identity rows I1-I8 under the three policies, the post-restore cross-check, the boot guard. */
 public class ShadowIdentityTest {
 
     static ShadowHeader header(final int engine, final int cluster, final long genesis, final long term,
@@ -122,7 +122,8 @@ public class ShadowIdentityTest {
                 ShadowIdentity.requireProducible(g);
                 fail("accepted " + g);
             } catch (final IllegalStateException e) {
-                assertEquals("shadow producer refused: recorded genesisId <= 0 (" + g + "); see RCS S3 5.5",
+                assertEquals("shadow producer refused: recorded genesisId <= 0 (" + g + "); produce only after the engine is"
+                        + " restored or has replayed its ADOPT",
                         e.getMessage());
             }
         }

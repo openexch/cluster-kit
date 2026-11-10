@@ -42,7 +42,7 @@ public enum ClusterSessionClass {
 
     /**
      * Parse a class from its text form: a decimal code (first character a digit) or a name, uppercased with
-     * {@link Locale#ROOT}. The RC1 S3 rules: an unknown code or name, and UNSET, are refused with an
+     * {@link Locale#ROOT}. The v1 rules: an unknown code or name, and UNSET, are refused with an
      * {@link IllegalArgumentException} ({@link NumberFormatException} for a malformed number).
      */
     public static ClusterSessionClass parse(final String text) {

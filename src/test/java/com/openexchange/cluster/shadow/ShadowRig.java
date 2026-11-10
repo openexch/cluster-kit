@@ -22,7 +22,7 @@ import java.util.Random;
 import java.util.Set;
 
 /**
- * RCS S3 test rig: a real {@link RecordedLogFixture} archive, writers, catalogs and loaders over it, HashChainEngine-
+ * Shadow test rig: a real {@link RecordedLogFixture} archive, writers, catalogs and loaders over it, HashChainEngine-
  * shaped payloads with a real self-check, and the raw path (header, chunks, optional trailer, offered by hand) for the
  * crash shapes and corruptions the writer never produces.
  */
@@ -128,7 +128,7 @@ final class ShadowRig implements AutoCloseable {
         return out;
     }
 
-    /** The real round trip WK-6 asks for, over a scratch HashChainEngine: restore, re-serialize, compare. */
+    /** The real self-check round trip, over a scratch HashChainEngine: restore, re-serialize, compare. */
     static final class HashChainSelfCheck implements ShadowSelfCheck {
         int calls;
 

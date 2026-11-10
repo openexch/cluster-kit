@@ -15,8 +15,8 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * Review (RCS S2 review-kit DEFECT-2, FIX-3). RED until fixed: the closure must not silently drop an in-prefix class it
- * cannot find, and RF-6 must see every JDK way to schedule, read a clock or read the environment.
+ * Found by review. RED until fixed: the closure must not silently drop an in-prefix class it
+ * cannot find, and the never-schedules list must see every JDK way to schedule, read a clock or read the environment.
  */
 public class ReviewKitRedScanSoundnessTest {
 
@@ -40,7 +40,7 @@ public class ReviewKitRedScanSoundnessTest {
     @Test
     public void anInPrefixReferenceOutsideTheClassRootIsNotDroppedSilently() {
         // The root lives in test-classes and references com/openexchange/cluster/log/LogCursor in classes: the same
-        // shape as AssetsLogApplier (assets-cluster) reaching 113 classes in assets-common.
+        // shape as CoreLogApplier (core-cluster) reaching 113 classes in core-common.
         final String root = ClosureCrossRoot.class.getName().replace('.', '/');
         final NeverSchedulesScan.Report report;
         try {
@@ -67,6 +67,6 @@ public class ReviewKitRedScanSoundnessTest {
                 missing.add(reference);
             }
         }
-        assertEquals("RF-6 blind to", List.of(), missing);
+        assertEquals("never-schedules list blind to", List.of(), missing);
     }
 }

@@ -24,7 +24,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /**
- * RCS S4 11.12 (D19, G18): a cluster dir whose newest snapshot group's service recording holds an enveloped stub is
+ * A cluster dir whose newest snapshot group's service recording holds an enveloped stub is
  * refused with the D19 text, the staging chain is not advanced and nothing is copied; a v5-shaped payload (any
  * non-stub tag) is captured as today. Real archives and a real replication from a source archive with a UDP control
  * channel; the service snapshot recording carries Aeron's container frames (marker BEGIN, marker END) before the
@@ -149,8 +149,8 @@ public class BundleCaptureStubRefusalTest {
             final BundleCapture.Result refused = capture(src, stubDir, work, true);
             assertNoStubBundle(refused, src.logStop);
             assertEquals(BundleCapture.stubRefusal(src.logStop), refused.reason);
-            assertEquals("snapshot at " + src.logStop + " is a stub (RCS); a bundle needs a full image or the "
-                    + "covering shadow, which BundleCapture cannot capture yet (D19)", refused.reason);
+            assertEquals("snapshot at " + src.logStop + " is a stub (shadow snapshot mode); a bundle needs a full image "
+                    + "or the covering shadow, which BundleCapture cannot capture yet", refused.reason);
             assertEquals(src.logStop, refused.snapshotPosition);
             assertEquals(refusedBefore + 1, BundleCapture.stubRefusals());
             assertTrue("nothing copied", empty(new File(work, "bundles")));
@@ -175,11 +175,11 @@ public class BundleCaptureStubRefusalTest {
             final BundleCapture.Result unpeeked = capture(src, stubDir, ncWork, false);
             try {
                 assertNoStubBundle(unpeeked, src.logStop);
-                throw new IllegalStateException("negative control did not fail: the assertion cannot see D19");
+                throw new IllegalStateException("negative control did not fail: the assertion cannot see the stub refusal");
             } catch (final AssertionError expected) {
                 assertTrue(expected.getMessage(), expected.getMessage()
                         .contains("bundle captured with a stub snapshot at " + src.logStop));
-                System.out.println("NC S4-11.12 peek off -> " + expected.getMessage());
+                System.out.println("NC stub peek off -> " + expected.getMessage());
             }
         }
     }

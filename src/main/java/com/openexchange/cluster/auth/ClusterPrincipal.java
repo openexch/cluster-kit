@@ -9,11 +9,11 @@ import java.util.Arrays;
  * What the authenticator mints for an accepted session and what every member reads from the SessionOpen log
  * event or a restored container session: the session class, its user scope and an identity for logs.
  * {@code [u8 version=1][u8 class][u8 flags][u8 reserved][i32 identity LE][u16 userCount LE][i64 userId LE x userCount]},
- * at most 4096 bytes (Aeron's principal limit), so at most 510 ids. These are the RC1 S3 bytes; they ride the
- * replicated log and the AE snapshot, so they never change.
+ * at most 4096 bytes (Aeron's principal limit), so at most 510 ids. These are the v1 bytes; they ride the
+ * replicated log and the core snapshot, so they never change.
  *
  * <p>Encode writes reserved 0 and flags 1 (ANY user, count 0) or 0 (1..510 ascending unique ids). Decode keeps
- * RC1's leniency exactly: it ignores the reserved byte and flag bits 1-7 and checks version, class 1..7, the
+ * the original leniency exactly: it ignores the reserved byte and flag bits 1-7 and checks version, class 1..7, the
  * length, ANY-with-count-0 / scoped-with-count-above-0 and ascending unique ids; anything else is
  * {@link #NONE}. It never throws.</p>
  */

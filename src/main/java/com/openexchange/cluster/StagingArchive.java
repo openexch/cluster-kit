@@ -51,7 +51,7 @@ import java.util.concurrent.TimeUnit;
  */
 public final class StagingArchive implements AutoCloseable {
 
-    /** Segment size matches the live AE archive, so purge arithmetic agrees. */
+    /** Segment size matches the live core archive, so purge arithmetic agrees. */
     private static final int SEGMENT_FILE_LENGTH = 64 * 1024 * 1024;
 
     private static final long REPLICATION_TIMEOUT_NS = TimeUnit.MINUTES.toNanos(10);

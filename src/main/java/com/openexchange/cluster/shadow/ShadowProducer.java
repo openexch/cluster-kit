@@ -4,8 +4,8 @@ package com.openexchange.cluster.shadow;
 import java.util.Objects;
 
 /**
- * The producer's own identity and the cluster id, from host configuration (RCS S3 5.1, G3): a member passes
- * {@code cluster.context().clusterId()} and its member id, the replica its configured ids (D-S3-11).
+ * The producer's own identity and the cluster id, from host configuration: a member passes
+ * {@code cluster.context().clusterId()} and its member id, the replica its configured ids.
  */
 public record ShadowProducer(int clusterId, ProducerKind kind, int producerId) {
 

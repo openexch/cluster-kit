@@ -13,7 +13,8 @@ import org.agrona.concurrent.UnsafeBuffer;
 import java.util.Objects;
 
 /**
- * The service-payload peek of one service snapshot recording (RCS S4 9.1 precondition and 10, D19): replay the
+ * The service-payload peek of one service snapshot recording (the floor precondition and the bundle stub
+ * refusal): replay the
  * recording session-scoped through {@link ShadowReplay}, skip Aeron's container frames (snapshot marker BEGIN, the
  * client sessions, marker END: {@code ClusteredServiceAgent.snapshotState} writes them before
  * {@code service.onTakeSnapshot}), and look at the first service message. A stub is exactly
@@ -29,12 +30,12 @@ public final class StubPeek {
     public enum Kind {
         /** A full service image (no stub tag): the log below it is not needed to restore. */
         FULL,
-        /** A {@link ShadowStub}: restoring it needs a local shadow or the log (S4 6). */
+        /** A {@link ShadowStub}: restoring it needs a local shadow or the log. */
         STUB,
         /**
          * The replay reached the stop position without a service message after the END marker (no END marker, or an
-         * empty or truncated service payload): nothing says what this snapshot restores, so fail closed (review
-         * FIX-3). The floor purges nothing.
+         * empty or truncated service payload): nothing says what this snapshot restores, so fail closed.
+         * The floor purges nothing.
          */
         UNKNOWN
     }

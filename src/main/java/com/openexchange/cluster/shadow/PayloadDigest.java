@@ -7,7 +7,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 
 /**
- * The shadow payload digest (RCS S3 amendment Q0, 2026-11-01): the first 8 bytes of SHA-256 over the payload bytes as
+ * The shadow payload digest (since 2026-11-01): the first 8 bytes of SHA-256 over the payload bytes as
  * stored, the engine envelope (and its own CRC) included, read big-endian into a {@code long}. It is the identity of a
  * producer image: content agreement, the loader and the deep read compare it. CRC32C must not be used here: an
  * engine image that ends with the CRC32C of what precedes it (every kit {@code SnapshotEnvelope} image) has the same

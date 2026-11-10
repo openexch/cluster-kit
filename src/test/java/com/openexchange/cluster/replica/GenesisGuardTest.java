@@ -13,7 +13,7 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * Kit half of the named-snapshot genesis compare and its pacing: {@link GenesisGuard} with a fake source (what the
- * backup responses named, the local copies, their genesis). The engine-level matrix is the assets {@code ReplicaReGenesisMatrixTest}.
+ * backup responses named, the local copies, their genesis). The engine-level matrix is the core {@code ReplicaReGenesisMatrixTest}.
  */
 public class GenesisGuardTest {
 

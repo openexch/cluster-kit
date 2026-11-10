@@ -4,8 +4,8 @@ package com.openexchange.cluster.shadow;
 import java.util.Objects;
 
 /**
- * Whether a shadow belongs to this cluster's history (RCS S3 5.3-5.5). Identity is the replicated {@code genesisId}
- * plus the term base of the shadow's term as this host knows it (WK-1): a member builds {@link TermBaseLookup} from
+ * Whether a shadow belongs to this cluster's history. Identity is the replicated {@code genesisId}
+ * plus the term base of the shadow's term as this host knows it: a member builds {@link TermBaseLookup} from
  * its {@code RecordingLog} term entries (read side), a replica from the term events its reader saw, so a replica
  * shadow passes a member's check with no term 0 anywhere (RF-f). Pure: no clock, no I/O.
  */
@@ -33,7 +33,7 @@ public final class ShadowIdentity {
     /**
      * STRICT (default): OK only. ALLOW_UNVERIFIED_HISTORY: OK or HISTORY_UNVERIFIED. BOOTSTRAP_ADOPT: OK,
      * HISTORY_UNVERIFIED or GENESIS_UNVERIFIED, valid only together with {@link #matches} after the restore (the ADOPT
-     * frame is inside the shadow, so that is the only check left; review FIX-7).
+     * frame is inside the shadow, so that is the only check left).
      */
     public enum Policy { STRICT, ALLOW_UNVERIFIED_HISTORY, BOOTSTRAP_ADOPT }
 
@@ -119,7 +119,7 @@ public final class ShadowIdentity {
     }
 
     /**
-     * 5.5, the host boot guard: a producer (S5 replica, S8 follower) calls it once the engine is restored or has
+     * The host boot guard: a producer (the replica, a follower) calls it once the engine is restored or has
      * replayed the ADOPT, before arming any trigger.
      *
      * @throws IllegalStateException for {@code genesisId <= 0}
@@ -127,7 +127,7 @@ public final class ShadowIdentity {
     public static void requireProducible(final long genesisId) {
         if (genesisId <= 0) {
             throw new IllegalStateException("shadow producer refused: recorded genesisId <= 0 (" + genesisId
-                    + "); see RCS S3 5.5");
+                    + "); produce only after the engine is restored or has replayed its ADOPT");
         }
     }
 }

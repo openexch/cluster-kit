@@ -20,7 +20,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * RCS S3 11.7, budget half (review FIX-3; incident 2026-08-11), measured rather than assumed. Four new shadows at
+ * The shm budget (incident 2026-08-11), measured rather than assumed. Four new shadows at
  * {@code T = 4m}: a scan opens exactly 8 window replays and a startup pass 4 full reads; the driver's publication log
  * files are sampled at every replay open and every 100 ms afterwards. What holds on Aeron 1.53 (and what this test
  * asserts): every replay log is sparse (allocated bytes, the tmpfs cost, are the touched pages, not {@code 3 x T});

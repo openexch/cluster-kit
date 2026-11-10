@@ -33,7 +33,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
-/** RCS S3 11.7 (reading half): the trailer rule against padding, session scoping, deadlines and cleanup, NC-3. */
+/** The reading half: the trailer rule against padding, session scoping, deadlines and cleanup. */
 public class ShadowReplayReadTest {
 
     static final int MAX_FRAME_PAYLOAD = ShadowRig.MTU - 32;
@@ -150,7 +150,7 @@ public class ShadowReplayReadTest {
             assertEquals(ShadowHeader.FRAME_LENGTH + p.length + ShadowTrailer.FRAME_LENGTH, crash.stop());
             final ShadowEntry e = rig.catalog().scan().entry(crash.recordingId());
             assertNotComplete(e);
-            nc("NC-3 trailer rule replaced by the length equation", "incomplete recording classified COMPLETE",
+            nc("trailer rule replaced by the length equation", "incomplete recording classified COMPLETE",
                     () -> assertNotComplete(rig.catalog(100,
                             Set.of(NegativeControl.TRAILER_RULE_REPLACED_BY_LENGTH_EQUATION)).scan()
                             .entry(crash.recordingId())));
@@ -269,7 +269,7 @@ public class ShadowReplayReadTest {
                     + " saw " + bare.size() + " sessions, scoped reads under it: " + outcome);
         }
         try (ShadowRig rig = new ShadowRig()) {
-            nc("NC-18 replay subscription not session-scoped", "messages from more than one replay", () -> {
+            nc("replay subscription not session-scoped", "messages from more than one replay", () -> {
                 final List<byte[]> trailer = new ArrayList<>();
                 try {
                     concurrent(rig, false, trailer, new byte[1][], null);
@@ -349,13 +349,13 @@ public class ShadowReplayReadTest {
                 assertNotCorrupt(late);
                 // let the foreign subscriber's stall from the first replay end, so the next replay gets its own
                 java.util.concurrent.locks.LockSupport.parkNanos(800_000_000L);
-                nc("NC-21 replay join-position check off", "a late join is unknown, never CORRUPT", () -> {
+                nc("replay join-position check off", "a late join is unknown, never CORRUPT", () -> {
                     final ShadowCatalog.DeepResult r = new ShadowCatalog(rig.fixture.aeron(), rig.archive(),
                             ShadowRig.ENGINE, 0, ShadowRig.GENESIS, new ShadowVerdicts(), 100, ShadowRig.CLOCK,
                             ShadowRig.TIMEOUT_NS, new ShadowCounters(), new ShadowReplay(rig.fixture.aeron(),
                             rig.archive(), ShadowRig.CLOCK, true, new LateJoin(true)),
                             java.util.EnumSet.noneOf(NegativeControl.class)).verifyDeep(e);
-                    System.out.println("DIAG NC-21 result " + r);
+                    System.out.println("DIAG join check off result " + r);
                     assertNotCorrupt(r);
                 });
             } finally {
@@ -408,9 +408,9 @@ public class ShadowReplayReadTest {
     }
 
     /**
-     * Review FIX-1: a replay stopped by another archive client (as {@code stopAllReplays} from the CLI, or a segment
+     * A replay stopped by another archive client (as {@code stopAllReplays} from the CLI, or a segment
      * read error) ends with end of stream at a partial position. That is SCAN_ERROR with no verdict, never CORRUPT
-     * (final) or NO_TRAILER (cached); the next read VERIFIES. NC-22: the end-position check off reads it as CORRUPT.
+     * (final) or NO_TRAILER (cached); the next read VERIFIES. Negative control: the end-position check off reads it as CORRUPT.
      */
     @Test
     public void aReplayStoppedEarlyIsAnErrorNeverAVerdict() {
@@ -438,10 +438,10 @@ public class ShadowReplayReadTest {
                         || first.state() == ShadowEntry.State.COMPLETE);
                 assertEquals("re-classified on the next scan", ShadowEntry.State.COMPLETE,
                         windows.scan().entry(b.recordingId()).state());
-                // NC-22: the end-position check off; up to 10 attempts (the clean end-of-stream path is a race with
+                // Negative control: the end-position check off; up to 10 attempts (the clean end-of-stream path is a race with
                 // the client's image close, which reads as "closed before end of stream" = ERROR either way)
                 final List<String> seen = new ArrayList<>();
-                nc("NC-22 replay end-position check off", "a replay stopped early was read as CORRUPT", () -> {
+                nc("replay end-position check off", "a replay stopped early was read as CORRUPT", () -> {
                     for (int k = 0; k < 10; k++) {
                         final ShadowCatalog loose = new ShadowCatalog(rig.fixture.aeron(), rig.archive(),
                                 ShadowRig.ENGINE, 0, ShadowRig.GENESIS, new ShadowVerdicts(), 100, ShadowRig.CLOCK,
@@ -453,7 +453,7 @@ public class ShadowReplayReadTest {
                         assertEarlyEndIsNotCorrupt(x);
                     }
                 });
-                ShadowRig.green("replay stopped early: " + r + "; window " + first + "; NC-22 attempts " + seen);
+                ShadowRig.green("replay stopped early: " + r + "; window " + first + "; end check off attempts " + seen);
             } finally {
                 org.agrona.CloseHelper.quietClose(other);
             }

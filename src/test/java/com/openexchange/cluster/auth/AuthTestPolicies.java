@@ -6,9 +6,9 @@ import java.util.HexFormat;
 /** The two engine policies as the engines declare them (contract 2.7), rebuilt here so the kit tests need no engine. */
 final class AuthTestPolicies {
 
-    /** assets: classes 1..7, explicit user scope allowed, the RC1 S3 names. */
-    static final AuthPolicy AE = AuthPolicy.of("assets", "assets.auth.keys", "ASSETS_AUTH_KEYS",
-            "assets.auth.credential", "AE_AUTH_CREDENTIAL", true,
+    /** core: classes 1..7, explicit user scope allowed. */
+    static final AuthPolicy CORE = AuthPolicy.of("core", "core.auth.keys", "CORE_AUTH_KEYS",
+            "core.auth.credential", "CORE_AUTH_CREDENTIAL", true,
             ClusterSessionClass.GATEWAY, ClusterSessionClass.FORWARDER, ClusterSessionClass.BRIDGE,
             ClusterSessionClass.ADMIN, ClusterSessionClass.TOOL, ClusterSessionClass.TREASURY,
             ClusterSessionClass.REPLICA);

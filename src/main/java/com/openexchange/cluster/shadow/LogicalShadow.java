@@ -7,10 +7,10 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * One position group (RCS S3 6.2 step 4): the content identity {@code (engineId, clusterId, genesisId, logPosition)}
+ * One position group: the content identity {@code (engineId, clusterId, genesisId, logPosition)}
  * with its copies. Producer, kind, seq and layout hint are attributes of a copy; retention and "newest" count
- * positions, never recordings (MF-9). {@code conflict} = the copies disagree on content: every copy is excluded from
- * every query and the host raises CRITICAL; there is never a winner (R Q-R11, MF-5).
+ * positions, never recordings. {@code conflict} = the copies disagree on content: every copy is excluded from
+ * every query and the host raises CRITICAL; there is never a winner.
  */
 public record LogicalShadow(int engineId, int clusterId, long genesisId, long logPosition, List<ShadowEntry> copies,
                             boolean conflict) {

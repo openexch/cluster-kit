@@ -80,7 +80,7 @@ public final class SnapshotLogPruner {
     private RetentionWatermark retention;
     private volatile String lastWatermarkReport;
 
-    // RCS S4 9.3 (MF-8): a purge pass may also be requested by the shadow housekeeping, which runs as a hook on
+    // A purge pass may also be requested by the shadow housekeeping, which runs as a hook on
     // this thread before every decision. Without them the pruner behaves exactly as before.
     private volatile BooleanSupplier purgeRequested = () -> false;
     private volatile Runnable wakeHook = () -> { };
@@ -120,15 +120,15 @@ public final class SnapshotLogPruner {
     }
 
     /**
-     * Whether the purge is bounded by exactly {@code supplier} (identity, not equality): the RCS S4 runtime net that
-     * a member in shadow mode prunes behind its {@code ShadowFloor} and nothing else (4.1, review F7).
+     * Whether the purge is bounded by exactly {@code supplier} (identity, not equality): the runtime net that
+     * a member in shadow mode prunes behind its {@code ShadowFloor} and nothing else.
      */
     public boolean watermarkIs(final java.util.function.LongSupplier supplier) {
         return supplier != null && watermark == supplier;
     }
 
     /**
-     * RCS S4 9.3 (MF-8): a purge pass also runs, without a new CM snapshot, when {@code purgeRequested} answers true
+     * A purge pass also runs, without a new CM snapshot, when {@code purgeRequested} answers true
      * after the wake hook ran (the shadow housekeeping: a VERIFIED shadow appeared or the floor rose). Read once per
      * wake, never consumed here: the watermark supplier consumes it when the purge pass reads the floor. The
      * caught-up gate still applies. The poll interval is unchanged.
@@ -139,7 +139,7 @@ public final class SnapshotLogPruner {
     }
 
     /**
-     * RCS S4 9.3: {@code hook} runs on this thread after every sleep, before the purge decision (the shadow
+     * {@code hook} runs on this thread after every sleep, before the purge decision (the shadow
      * housekeeping: catalog scan, paced deep reads, retention). A hook that throws is reported and that wake's
      * shadow request is ignored; the CM-snapshot path is not affected.
      */

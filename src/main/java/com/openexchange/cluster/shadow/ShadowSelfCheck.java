@@ -4,7 +4,7 @@ package com.openexchange.cluster.shadow;
 import org.agrona.DirectBuffer;
 
 /**
- * WK-6 (RCS S3 7.3): the engine round trip on the in-memory buffer BEFORE the first chunk is offered, because a
+ * The engine round trip on the in-memory buffer BEFORE the first chunk is offered, because a
  * recording is listable the moment it exists. The round trip (restore into a scratch engine, re-serialize, compare,
  * invariants) is the host's (it needs a second engine); the writer calls it, treats {@code false} or a throw as
  * {@code SELF_CHECK_FAILED}, and compares the SHA-256 payload digest before and after ({@code SELF_CHECK_MUTATED_BUFFER}).

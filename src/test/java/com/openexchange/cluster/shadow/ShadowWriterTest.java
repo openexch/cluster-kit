@@ -32,7 +32,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * RCS S3 11.4: the synchronous writer (7.4 W0-W11) against a real archive (64 KiB terms, the default 1,408-byte IPC
+ * The synchronous writer (W0-W11) against a real archive (64 KiB terms, the default 1,408-byte IPC
  * MTU: every chunk fragments and terms rotate).
  */
 public class ShadowWriterTest {
@@ -110,7 +110,7 @@ public class ShadowWriterTest {
             final ShadowWriter.WriteResult r = rig.writer(R3).write(image(PAYLOAD, 2), ENGINE, ShadowKind.ALIGNED, bad, ID);
             assertEquals(ShadowWriter.Reason.INVALID_CURSOR, r.reason());
             assertNoNewShadow(rig, 0, "header clusterTime -1 written");
-            nc("NC-12 cursor -1 accepted", "header clusterTime -1 written", () -> {
+            nc("cursor -1 accepted", "header clusterTime -1 written", () -> {
                 final ShadowWriter.WriteResult x = rig.writer(R3, 1, -1, ShadowWriter.Faults.NONE,
                         Set.of(NegativeControl.CURSOR_CHECK_OFF), ShadowRig.CLOCK)
                         .write(image(PAYLOAD, 2), ENGINE, ShadowKind.ALIGNED, bad, ID);
@@ -130,7 +130,7 @@ public class ShadowWriterTest {
             }
             assertNoNewShadow(rig, 0, "shadow written with genesisId <= 0");
             assertEquals(2, rig.counters.get(ShadowCounters.Counter.WRITE_SKIPPED_UNIDENTIFIED_TOTAL));
-            nc("NC-9 (kit leg) writer accepts genesisId <= 0", "shadow written with a negative genesisId", () -> {
+            nc("writer accepts genesisId <= 0", "shadow written with a negative genesisId", () -> {
                 final ShadowWriter.WriteResult x = rig.writer(R3, 1, -1, ShadowWriter.Faults.NONE,
                         Set.of(NegativeControl.GENESIS_CHECK_OFF), ShadowRig.CLOCK).write(image(PAYLOAD, 3), ENGINE,
                         ShadowKind.ALIGNED, cursor(4096), new ShadowRig.Id(-7, false, 0, 0));
@@ -146,7 +146,7 @@ public class ShadowWriterTest {
             ShadowRig.writeOk(w, image(PAYLOAD, 4), ShadowKind.ALIGNED, cursor(4096));
             final ShadowWriter.WriteResult again = w.write(image(PAYLOAD, 4), ENGINE, ShadowKind.LOCAL, cursor(4096), ID);
             assertEquals(ShadowWriter.Reason.NOT_MONOTONE, again.reason());
-            // a restarted producer seeded from its startup scan (7.2, review FIX-9)
+            // a restarted producer seeded from its startup scan (7.2)
             final ShadowWriter restarted = rig.writer(R3, 2, 4096, ShadowWriter.Faults.NONE, Set.of(), ShadowRig.CLOCK);
             assertEquals(ShadowWriter.Reason.NOT_MONOTONE,
                     restarted.write(image(PAYLOAD, 4), ENGINE, ShadowKind.ALIGNED, cursor(4096), ID).reason());
@@ -154,7 +154,7 @@ public class ShadowWriterTest {
             assertEquals(2, rig.counters.get(ShadowCounters.Counter.WRITE_SKIPPED_NOT_MONOTONE_TOTAL));
             final int count = rig.shadowRecordingCount();
             assertEquals(2, count);
-            nc("NC-10 monotone check off", "two shadows at one position by one producer", () -> {
+            nc("monotone check off", "two shadows at one position by one producer", () -> {
                 final ShadowWriter loose = rig.writer(R3, 3, 4096 + 32, ShadowWriter.Faults.NONE,
                         Set.of(NegativeControl.MONOTONE_CHECK_OFF), ShadowRig.CLOCK);
                 loose.write(image(PAYLOAD, 5), ENGINE, ShadowKind.LOCAL, cursor(4096 + 32), ID);
@@ -195,7 +195,7 @@ public class ShadowWriterTest {
                     w.write(image(PAYLOAD, 7), ENGINE, ShadowKind.ALIGNED, cursor(4096), ID).reason());
             assertSelfCheckSawNothing(rig, listedDuringCheck[0]);
             assertEquals(1, rig.counters.get(ShadowCounters.Counter.SELFCHECK_FAILURES_TOTAL));
-            // NOTE-7: a self-check that writes into the buffer it was handed
+            // A self-check that writes into the buffer it was handed
             final ShadowSelfCheck mutates = (payload, length) -> {
                 ((org.agrona.MutableDirectBuffer)payload).putByte(length - 1, (byte)(payload.getByte(length - 1) ^ 1));
                 return true;
@@ -206,7 +206,7 @@ public class ShadowWriterTest {
             assertEquals(ShadowWriter.Reason.SELF_CHECK_MUTATED_BUFFER,
                     m.write(image(PAYLOAD, 7), ENGINE, ShadowKind.ALIGNED, cursor(4096), ID).reason());
             assertNoNewShadow(rig, 0, "a recording exists after SELF_CHECK_MUTATED_BUFFER");
-            nc("NC-4 self-check after the first offer", "a recording exists after SELF_CHECK_FAILED", () -> {
+            nc("self-check after the first offer", "a recording exists after SELF_CHECK_FAILED", () -> {
                 final ShadowWriter late = new ShadowWriter(rig.fixture.aeron(), rig.archive(), R3, refuses,
                         ShadowRig.T, ShadowRig.CLOCK, ShadowRig.TIMEOUT_NS, ShadowRig.TIMEOUT_NS, ShadowRig.TIMEOUT_NS,
                         1, -1, rig.counters, ShadowWriter.Faults.NONE, Set.of(NegativeControl.SELF_CHECK_AFTER_FIRST_OFFER));
@@ -219,7 +219,7 @@ public class ShadowWriterTest {
     static void assertSelfCheckSawNothing(final ShadowRig rig, final int listedDuringCheck) {
         if (listedDuringCheck != 0) {
             throw new AssertionError("a recording exists after SELF_CHECK_FAILED: " + listedDuringCheck
-                    + " listable while the self-check ran (WK-6)");
+                    + " listable while the self-check ran");
         }
         assertNoNewShadow(rig, 0, "a recording exists after SELF_CHECK_FAILED");
     }
@@ -317,7 +317,7 @@ public class ShadowWriterTest {
         }
     }
 
-    /** Review NOTE-7: an abort requested while no write is in flight is a no-op; the next write is not lost. */
+    /** An abort requested while no write is in flight is a no-op; the next write is not lost. */
     @Test
     public void anAbortWithNoWriteInFlightDoesNotAbortTheNextWrite() {
         try (ShadowRig rig = new ShadowRig()) {
@@ -393,7 +393,7 @@ public class ShadowWriterTest {
             }
             assertEquals("left for the scan", ShadowEntry.State.COMPLETE,
                     rig.catalog().scan().entry(r.recordingId()).state());
-            // the normal clock: 50 writes, never STOP_MISMATCH (the FIX-4 regression)
+            // the normal clock: 50 writes, never STOP_MISMATCH (a regression check)
             final ShadowWriter normal = rig.writer(R3, w.nextProducerSeq(), 4096, ShadowWriter.Faults.NONE, Set.of(),
                     ShadowRig.CLOCK);
             for (int i = 1; i <= 50; i++) {
@@ -477,7 +477,7 @@ public class ShadowWriterTest {
             final ShadowWriter.WriteResult r = rig.writer(R3, 1, -1, refuse, Set.of(), ShadowRig.CLOCK)
                     .write(image(PAYLOAD, 12), ENGINE, ShadowKind.ALIGNED, cursor(4096), ID);
             assertRefused8(r);
-            nc("NC-14 ArchiveException relabelled", "ARCHIVE_REFUSED(8) expected, got UNEXPECTED",
+            nc("ArchiveException relabelled", "ARCHIVE_REFUSED(8) expected, got UNEXPECTED",
                     () -> assertRefused8(rig.writer(R3, 1, -1, refuse, Set.of(NegativeControl.ARCHIVE_EXCEPTION_RELABELLED),
                             ShadowRig.CLOCK).write(image(PAYLOAD, 12), ENGINE, ShadowKind.ALIGNED, cursor(4096), ID)));
         }

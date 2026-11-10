@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.cluster.shadow;
 
-/** Who wrote a shadow (RCS S3 3.1 {@code producerKind}); the alias letter is {@code R} or {@code F} (section 4). */
+/** Who wrote a shadow (header {@code producerKind}); the alias letter is {@code R} or {@code F}. */
 public enum ProducerKind {
     REPLICA(1, 'R'), FOLLOWER(2, 'F');
 

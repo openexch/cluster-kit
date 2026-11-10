@@ -2,7 +2,7 @@
 package com.openexchange.cluster.shadow;
 
 /**
- * One recording on the shadow stream and prefix, as one scan classified it (RCS S3 6.3). {@code header},
+ * One recording on the shadow stream and prefix, as one scan classified it. {@code header},
  * {@code headerBytes} and {@code trailer} are present from the point the scan read them; {@code code} is an archive
  * error code for SCAN_ERROR (or -1).
  */

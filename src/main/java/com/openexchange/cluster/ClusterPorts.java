@@ -7,7 +7,7 @@ package com.openexchange.cluster;
  *
  * <p>The engines build their member endpoint strings from this, and every client
  * that connects to them derives the same numbers on its own: the matching
- * engine, the assets engine, the settlement bridge, OMS, the load generators and
+ * engine, the core engine, the settlement bridge, OMS, the load generators and
  * the backup agent. Each used to carry its own copy of the arithmetic. Copies of
  * a wire contract do not drift loudly; they drift into a process dialling a port
  * nobody is listening on, and the first evidence is a timeout in production.</p>

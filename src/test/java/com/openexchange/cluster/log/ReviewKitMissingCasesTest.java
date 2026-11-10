@@ -33,7 +33,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * Review (RCS S2 review-kit): cases the S2 suite did not cover, each found by a surviving mutant. GREEN on the
+ * Found by review: cases the log suite did not cover, each found by a surviving mutant. GREEN on the
  * reviewed tree.
  */
 public class ReviewKitMissingCasesTest {

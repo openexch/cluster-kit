@@ -33,7 +33,7 @@ public final class AuthPolicy {
     }
 
     /**
-     * @param engine             a short name for messages, e.g. "assets" or "match"
+     * @param engine             a short name for messages, e.g. "core" or "match"
      * @param keysProperty       system property holding the key table (wins over the env variable)
      * @param keysEnv            environment variable holding the key table
      * @param credentialProperty system property holding a client credential (wins over the env variable)

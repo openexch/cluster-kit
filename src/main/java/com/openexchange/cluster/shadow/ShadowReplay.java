@@ -19,11 +19,11 @@ import java.util.Objects;
 import java.util.function.BooleanSupplier;
 
 /**
- * A bounded, session-scoped replay of part of a shadow recording (RCS S3 8.1). The replay stream
+ * A bounded, session-scoped replay of part of a shadow recording. The replay stream
  * ({@link ShadowAlias#REPLAY_STREAM_ID}) is shared by every replay the process opens, so the subscription carries the
- * replay's session id and only that image is ever polled (review FIX-2). Messages are reassembled
+ * replay's session id and only that image is ever polled. Messages are reassembled
  * ({@link FragmentAssembler}) and read to end of stream with {@link SnapshotImageReader#readFully} behind an idle
- * strategy that throws {@link ReplayTimeoutException} past the deadline (NOTE-4). {@code stopReplay} and the
+ * strategy that throws {@link ReplayTimeoutException} past the deadline. {@code stopReplay} and the
  * subscription close run in {@code finally}. The replay channel is {@link ShadowAlias#REPLAY_CHANNEL}
  * ({@code linger=0|sparse=true}, 6.6). One owner thread per instance; replays are serial per instance.
  *
@@ -64,12 +64,12 @@ public final class ShadowReplay {
         default void beforeSubscribe(long replaySessionId) {
         }
 
-        /** NC-21 only: true switches the join-position check off. */
+        /** Negative control only: true switches the join-position check off. */
         default boolean joinCheckOff() {
             return false;
         }
 
-        /** NC-22 only (review FIX-1): true switches the end-position check off. */
+        /** Negative control only: true switches the end-position check off. */
         default boolean endCheckOff() {
             return false;
         }
@@ -92,7 +92,7 @@ public final class ShadowReplay {
         this(aeron, archive, clock, true, Observer.NONE);
     }
 
-    /** {@code sessionScoped=false} only for the NC-18 negative control (8.1 step 2 switched off). */
+    /** {@code sessionScoped=false} only for the session-scope negative control (8.1 step 2 switched off). */
     ShadowReplay(final Aeron aeron, final AeronArchive archive, final NanoClock clock, final boolean sessionScoped,
                  final Observer observer) {
         this(aeron, archive, clock, sessionScoped, observer, ShadowAlias.REPLAY_CHANNEL);
@@ -179,7 +179,7 @@ public final class ShadowReplay {
             final SnapshotImageReader.Source source = sessionScoped
                     ? scoped(image, stopEarly) : unscoped(subscription, image);
             final SnapshotImageReader.Result r = SnapshotImageReader.readFully(source, assembler, idle);
-            // review FIX-1: a clean end of stream is not a complete replay. The archive closes or revokes the replay
+            // A clean end of stream is not a complete replay. The archive closes or revokes the replay
             // publication on every failure path (segment read error, stopReplay/stopAllReplays from any client), so
             // the reader also sees end of stream after a PARTIAL range; that is unknown, never CORRUPT or NO_TRAILER
             if (!stopEarly.getAsBoolean() && sessionScoped && !observer.endCheckOff()) {
@@ -222,7 +222,7 @@ public final class ShadowReplay {
         };
     }
 
-    /** NC-18: polls every image of a bare subscription; ends with the replay's own image. */
+    /** Negative control: polls every image of a bare subscription; ends with the replay's own image. */
     private static SnapshotImageReader.Source unscoped(final Subscription subscription, final Image own) {
         return new SnapshotImageReader.Source() {
             public int poll(final FragmentHandler handler, final int fragmentLimit) {

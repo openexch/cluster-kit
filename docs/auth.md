@@ -1,8 +1,8 @@
 # Session authentication (`com.openexchange.cluster.auth`)
 
-One authenticator for both engines. The assets engine's decisions are pinned by
+One authenticator for both engines. The core engine's decisions are pinned by
 the golden file `src/test/resources/auth-parity-v1.txt`
-(`AuthParityGoldenTest`), captured from the assets engine's earlier
+(`AuthParityGoldenTest`), captured from the core engine's earlier
 authenticator at assets commit 462b98d.
 
 ## Session classes
@@ -78,15 +78,15 @@ session timeout plus 1 s.
 Each setting is read from the system property when set and not blank, else
 from the environment variable (`AuthPolicy.read`).
 
-| | assets | match |
+| | core | match |
 |---|---|---|
-| Key table | `-Dassets.auth.keys` / `ASSETS_AUTH_KEYS` | `-Dmatch.auth.keys` / `ME_AUTH_KEYS` |
-| Client credential | `-Dassets.auth.credential` / `AE_AUTH_CREDENTIAL` | `-Dmatch.auth.credential` / `ME_AUTH_CREDENTIAL` |
+| Key table | `-Dcore.auth.keys` / `CORE_AUTH_KEYS` | `-Dmatch.auth.keys` / `ME_AUTH_KEYS` |
+| Client credential | `-Dcore.auth.credential` / `CORE_AUTH_CREDENTIAL` | `-Dmatch.auth.credential` / `ME_AUTH_CREDENTIAL` |
 | Classes | 1..7 | GATEWAY, FORWARDER, ADMIN, REPLICA |
 | User scope | `users=*` or an id list | `users=*` only |
 | Consensus-module authorisation | Aeron default | `ClassAuthorisationService`: REPLICA may send BackupQuery; every other class and action is denied |
 
-The policies are defined in `AssetsAuth` (assets-common) and `MatchAuth`
+The policies are defined in `CoreAuth` (core-common) and `MatchAuth`
 (match-cluster).
 
 ## Related helpers

@@ -10,7 +10,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
-/** RC1 S2: the fake must model what the cluster does, or the harness proves nothing about timers. */
+/** The fake must model what the cluster does, or the harness proves nothing about timers. */
 public class FakeTimerServiceTest {
 
     @Test

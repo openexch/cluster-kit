@@ -10,7 +10,7 @@ import java.util.Random;
 import static org.junit.Assert.assertEquals;
 
 /**
- * RCS S3: the envelope CRC over a VIEW at a non-zero offset (the shadow image buffer hands {@code serialize} the payload
+ * The envelope CRC over a VIEW at a non-zero offset (the shadow image buffer hands {@code serialize} the payload
  * view {@code new UnsafeBuffer(buffer, 128, capacity - 128)} of an off-heap buffer). A seal on the view must open from a
  * plain copy of the bytes, and a plain image must open from a view; before this fix the direct-buffer branch hashed
  * from the ByteBuffer's origin, so a seal on such a view stored a CRC of the wrong bytes.

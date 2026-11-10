@@ -8,14 +8,15 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 /**
- * RC2 S17 W12 (K1): R0 is one kit rule for both engines. A session whose replicated principal has no class (null,
- * empty, foreign or malformed bytes) can only be pre-S6 history or a session id Aeron does not know; the gate throws
+ * The principal rule is one kit rule for both engines. A session whose replicated principal has no class (null,
+ * empty, foreign or malformed bytes) can only be history from before session principals or a session id Aeron does
+ * not know; the gate throws
  * the one exception both engines handle, with the one CRITICAL text the T2 rows match.
  */
 public class PrincipalGateTest {
 
     private static final String PREFIX =
-            "CRITICAL: principal-less session in log: pre-S6 history, clean genesis required (";
+            "CRITICAL: principal-less session in log: history from before session principals, clean genesis required (";
 
     private static void assertRefused(final byte[] bytes) {
         final PrincipalLessSessionException e = assertThrows(PrincipalLessSessionException.class,

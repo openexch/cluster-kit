@@ -12,7 +12,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
-/** RC2 S6 9.1: the class-table authorisation service with the ME table (REPLICA -> BackupQuery only, A14). */
+/** The class-table authorisation service with the ME table (REPLICA -> BackupQuery only, A14). */
 public class ClassAuthorisationServiceTest {
 
     private static final ClassAuthorisationService ME_TABLE = ClassAuthorisationService.builder()

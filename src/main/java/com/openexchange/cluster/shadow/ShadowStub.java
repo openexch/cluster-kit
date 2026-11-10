@@ -8,8 +8,8 @@ import org.agrona.MutableDirectBuffer;
 import java.nio.ByteOrder;
 
 /**
- * The service snapshot a member writes in stub mode (RCS S4 3.2): {@value #LENGTH} bytes inside the kit
- * {@link SnapshotEnvelope}, so the envelope CRC covers it (RF-2). It names where the engine state lives (a local shadow
+ * The service snapshot a member writes in stub mode: {@value #LENGTH} bytes inside the kit
+ * {@link SnapshotEnvelope}, so the envelope CRC covers it. It names where the engine state lives (a local shadow
  * plus the log), never the state itself.
  *
  * <pre>
@@ -17,14 +17,14 @@ import java.nio.ByteOrder;
  *  24 genesisId long   32 leadershipTermId long   40 logPosition (P_cm) long   48 hintPs long   56 hintRecordingId long
  * </pre>
  *
- * <p>Little-endian, like {@link ShadowHeader}. The tag is distinct from every engine payload layout tag (assets
+ * <p>Little-endian, like {@link ShadowHeader}. The tag is distinct from every engine payload layout tag (core
  * {@code LAYOUT_V4_TAG -4}, {@code LAYOUT_V5_TAG -5}), so a host dispatches on {@link #peekTag} after the envelope
  * opened. One rule table, S0-S8, serves the writer ({@link #encode}, rules S5-S8 on the values it is about to write)
  * and the reader ({@link #decode}, every rule, in order); a refusal names its rule (C7).</p>
  *
  * <p>Every field is a log-derived value the service already held (hard rule 12.11): nothing from a clock or the
  * environment enters a stub. {@code hintPs} and {@code hintRecordingId} are diagnostic only and never a selection
- * input (S4 1.4).</p>
+ * input.</p>
  */
 public record ShadowStub(int engineId, int clusterId, long genesisId, long leadershipTermId, long logPosition,
                          long hintPs, long hintRecordingId) {
@@ -32,7 +32,7 @@ public record ShadowStub(int engineId, int clusterId, long genesisId, long leade
     /** The payload tag of a stub (distinct from -4 and -5). */
     public static final long STUB_TAG = -100L;
     public static final int VERSION = 1;
-    /** A format constant, not a setting (S4 3.2, review N8). */
+    /** A format constant, not a setting. */
     public static final int LENGTH = 64;
     /** {@link #LENGTH} inside the kit envelope. */
     public static final int ENVELOPED_LENGTH = SnapshotEnvelope.envelopedLength(LENGTH);
@@ -50,7 +50,7 @@ public record ShadowStub(int engineId, int clusterId, long genesisId, long leade
 
     private static final ByteOrder LE = ByteOrder.LITTLE_ENDIAN;
 
-    /** The decode rules of S4 3.2, in evaluation order. */
+    /** The decode rules, in evaluation order; each refusal names its rule id (S0-S8). */
     public enum Rule {
         /** S0: length == 64. */
         STUB_LENGTH("S0"),

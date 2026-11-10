@@ -14,7 +14,7 @@ import java.util.zip.CRC32C;
  * trailer is computed once over the finished payload, in place. A loader verifies magic, version,
  * length and CRC before decoding a byte and refuses to start on any mismatch: a truncated, foreign or
  * bit-flipped snapshot must never become a ledger. There is deliberately NO legacy pass-through for a
- * payload without the magic (RC1 S2, clean genesis): a bare payload is refused like any other
+ * payload without the magic (clean genesis): a bare payload is refused like any other
  * corruption, because "it looked like an old format" is exactly the silent restore path this class
  * exists to remove.</p>
  *
@@ -96,7 +96,7 @@ public final class SnapshotEnvelope {
         if (array != null) {
             crc.update(array, buf.wrapAdjustment() + offset, length);
         } else if (buf.byteBuffer() != null) {
-            // RCS S3: a view of a direct ByteBuffer at a non-zero offset (the shadow image buffer's payload view) has
+            // A view of a direct ByteBuffer at a non-zero offset (the shadow image buffer's payload view) has
             // its own origin at wrapAdjustment(); reading from the ByteBuffer's origin hashed the wrong bytes
             final int base = (int) buf.wrapAdjustment();
             crc.update(buf.byteBuffer().duplicate().limit(base + offset + length).position(base + offset));

@@ -18,7 +18,7 @@ import java.util.concurrent.TimeUnit;
  */
 public interface ShadowEngine {
 
-    /** 1 ASSETS, 2 MATCH; stable per class. */
+    /** 1 CORE, 2 MATCH; stable per class. */
     int engineId();
 
     /** Start from the genesis state; legal once, on a pristine instance. */

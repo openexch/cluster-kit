@@ -35,8 +35,8 @@ public class ReplicaContextsTest {
                 .portBase(9300)
                 .portStride(100)
                 .slot(3)
-                .baseDir(new File("/var/lib/ae-replica3"))
-                .aeronDir("/dev/shm/aeron-assets-replica3-driver")
+                .baseDir(new File("/var/lib/core-replica3"))
+                .aeronDir("/dev/shm/aeron-core-replica3-driver")
                 .engineId(1)
                 .nodePort(9703)
                 .credentials(new NullCredentialsSupplier());
@@ -94,7 +94,7 @@ public class ReplicaContextsTest {
         assertEquals(TimeUnit.SECONDS.toNanos(10), b.clusterBackupProgressTimeoutNs());
         assertFalse("the replica dir is state: never deleted on start", b.deleteDirOnStart());
         assertEquals(ClusterBackup.Configuration.ReplayStart.BEGINNING, b.initialReplayStart());
-        assertEquals(new File("/var/lib/ae-replica3/cluster"), b.clusterDir());
+        assertEquals(new File("/var/lib/core-replica3/cluster"), b.clusterDir());
         final AeronArchive.Context cluster = b.clusterArchiveContext();
         assertEquals("aeron:udp?endpoint=10.0.0.9:9605", cluster.controlResponseChannel());
         for (final String channel : List.of(ReplicaContexts.consensusChannel(c), ReplicaContexts.transferChannel(c),
@@ -185,11 +185,11 @@ public class ReplicaContextsTest {
         refused(base().shadowBufferMb(15), "REPLICA_SHADOW_BUFFER_MB=15 out of range");
         base().shadowBufferMb(2047).build();
         refused(base().replicaAddress(" "), "CLUSTER_REPLICA_ADDRESS is required");
-        refused(base().credentials(null), "AE_AUTH_CREDENTIAL is required");
+        refused(base().credentials(null), "CORE_AUTH_CREDENTIAL is required");
         refused(base().attachBackoffMs(5_001), "REPLICA_ATTACH_BACKOFF_MS out of range [1,5000]");
         refused(base().livenessStaleMs(1_000).readyStaleMs(5_000), "REPLICA_LIVENESS_STALE_MS must be >=");
         refused(base().backupCooldownMs(0), "REPLICA_BACKUP_COOLDOWN_MS must be > 0");
-        refused(base().nodePort(0), "ASSETS_NODE_PORT out of range");
+        refused(base().nodePort(0), "CORE_NODE_PORT out of range");
     }
 
     @Test

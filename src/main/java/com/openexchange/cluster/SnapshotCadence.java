@@ -46,6 +46,22 @@ import java.util.concurrent.TimeUnit;
  * can: the decision only flips a counter, and the resulting snapshot enters the
  * log as an ordered cluster action. Two members configured differently produce
  * a different snapshot RHYTHM after a leader change, never a different ledger.</p>
+ *
+ * <h2>The standby schedule</h2>
+ *
+ * <p>A second, independent rhythm for the shadow replica: every {@code SNAPSHOT_STANDBY_INTERVAL_MINUTES} the leader
+ * toggles {@code STANDBY_SNAPSHOT}. The consensus module appends one {@code SNAPSHOT} action with flags 1 and returns
+ * the toggle to NEUTRAL (CMA:2575-2581); members ignore flags 1 (CSA:1094-1097), so no member snapshots and the leader
+ * pays one action frame. Completion is the toggle reading NEUTRAL again, never {@code onTakeSnapshot} (members do not
+ * take one). A member snapshot does NOT reset the standby clock: the replica's STANDBY shadows come
+ * every interval whatever the member cadence does.</p>
+ *
+ * <p>Lost-request accounting: a request whose toggle reads INACTIVE (a demoted leader's toggle, CMA:1382), one still held
+ * after {@link #REQUEST_STALE_NS}, or one in flight when this node stops leading, can never be appended: counted
+ * {@code standby_toggle_lost_total} and cleared, so the schedule continues. A SNAPSHOT (or another operator action)
+ * seen while the standby was in flight means the CM reset it and someone toggled again within the evaluation: that is
+ * {@code standby_toggle_ambiguous_total}, not lost. A due standby that cannot take the toggle is
+ * {@code standby_toggle_deferred_total} (once per due standby) and is retried on the next evaluation.</p>
  */
 public final class SnapshotCadence {
 
@@ -54,6 +70,20 @@ public final class SnapshotCadence {
 
     /** Quiet-market floor. Same five minutes the gateway used. */
     public static final long DEFAULT_INTERVAL_MINUTES = 5;
+
+    /** One STANDBY action every 15 minutes; 0 disables. */
+    public static final long DEFAULT_STANDBY_INTERVAL_MINUTES = 15;
+
+    /** {@code SNAPSHOT_STANDBY_INTERVAL_MINUTES} upper bound: one day. */
+    public static final long MAX_STANDBY_INTERVAL_MINUTES = 1440;
+
+    /** Package seam for the standby schedule negative controls; production passes none. */
+    enum Control {
+        /** NC: lost-request counting off (a lost request is cleared but not counted). */
+        LOST_COUNTING_OFF,
+        /** NC: the standby schedule toggles SNAPSHOT (every member would snapshot). */
+        STANDBY_USES_SNAPSHOT
+    }
 
     /**
      * How often the trigger is evaluated. {@code doBackgroundWork} runs on every
@@ -70,6 +100,8 @@ public final class SnapshotCadence {
 
     private final long byteThreshold;
     private final long intervalNs;
+    private final long standbyIntervalNs;
+    private final java.util.Set<Control> off;
 
     private java.util.function.Supplier<AtomicCounter> toggleResolver = () -> null;
     private AtomicCounter controlToggle;
@@ -86,18 +118,45 @@ public final class SnapshotCadence {
     private boolean requestInFlight;
     private long staleWarnings;
 
+    // Standby schedule: single writer (the duty cycle), volatile for the /metrics scrape.
+    private long lastStandbyNs;
+    private long standbyRequestedAtNs;
+    private volatile boolean standbyInFlight;
+    private volatile long standbyRequests;
+    private volatile long standbyCompleted;
+    private volatile long standbyDeferred;
+    /** The current due standby was already counted deferred; cleared when it is toggled or dropped. */
+    private boolean standbyDeferPending;
+    private volatile long standbyLost;
+    private volatile long standbyAmbiguous;
+
     /**
      * @param byteThreshold cluster-log bytes since the last snapshot that force a new
      *                      one, or 0 to disable the byte trigger
      * @param intervalNs    quiet-market floor, or 0 to disable the timer
      */
     public SnapshotCadence(final long byteThreshold, final long intervalNs) {
-        if (byteThreshold < 0 || intervalNs < 0) {
+        this(byteThreshold, intervalNs, 0);
+    }
+
+    /**
+     * @param standbyIntervalNs the standby schedule, or 0 to disable it (the two-argument constructor)
+     */
+    public SnapshotCadence(final long byteThreshold, final long intervalNs, final long standbyIntervalNs) {
+        this(byteThreshold, intervalNs, standbyIntervalNs, java.util.EnumSet.noneOf(Control.class));
+    }
+
+    SnapshotCadence(final long byteThreshold, final long intervalNs, final long standbyIntervalNs,
+                    final java.util.Set<Control> off) {
+        if (byteThreshold < 0 || intervalNs < 0 || standbyIntervalNs < 0) {
             throw new IllegalArgumentException(
-                "negative snapshot cadence: byteThreshold=" + byteThreshold + " intervalNs=" + intervalNs);
+                "negative snapshot cadence: byteThreshold=" + byteThreshold + " intervalNs=" + intervalNs
+                    + " standbyIntervalNs=" + standbyIntervalNs);
         }
         this.byteThreshold = byteThreshold;
         this.intervalNs = intervalNs;
+        this.standbyIntervalNs = standbyIntervalNs;
+        this.off = off.isEmpty() ? java.util.EnumSet.noneOf(Control.class) : java.util.EnumSet.copyOf(off);
     }
 
     /**
@@ -116,13 +175,20 @@ public final class SnapshotCadence {
             DEFAULT_LOG_BYTE_THRESHOLD);
         final long minutes = longFromEnv("SNAPSHOT_INTERVAL_MINUTES", "snapshot.interval.minutes",
             DEFAULT_INTERVAL_MINUTES);
+        final long standbyMinutes = longFromEnv("SNAPSHOT_STANDBY_INTERVAL_MINUTES",
+            "snapshot.standby.interval.minutes", DEFAULT_STANDBY_INTERVAL_MINUTES);
+        if (standbyMinutes > MAX_STANDBY_INTERVAL_MINUTES) {
+            throw new IllegalArgumentException("SNAPSHOT_STANDBY_INTERVAL_MINUTES / snapshot.standby.interval.minutes="
+                + standbyMinutes + " out of range [0," + MAX_STANDBY_INTERVAL_MINUTES + "]");
+        }
         if (bytes == 0 && minutes == 0) {
             System.out.println("[CADENCE] WARNING: both SNAPSHOT_LOG_BYTES and "
                 + "SNAPSHOT_INTERVAL_MINUTES are 0 - this cluster will NEVER snapshot on its own. "
                 + "Its log grows without bound and the disk fills. Only do this when something "
                 + "else is taking snapshots.");
         }
-        return new SnapshotCadence(bytes, TimeUnit.MINUTES.toNanos(minutes));
+        return new SnapshotCadence(bytes, TimeUnit.MINUTES.toNanos(minutes),
+            TimeUnit.MINUTES.toNanos(standbyMinutes));
     }
 
     static long longFromEnv(final String envName, final String propName, final long fallback) {
@@ -208,8 +274,10 @@ public final class SnapshotCadence {
         // busy cluster still fires at once, on bytes, which is the case that matters.
         this.lastSnapshotNs = nowNs;
         this.lastEvaluatedNs = nowNs;
+        this.lastStandbyNs = nowNs;
         System.out.println("[CADENCE] armed: byteThreshold=" + byteThreshold
             + " intervalMinutes=" + TimeUnit.NANOSECONDS.toMinutes(intervalNs)
+            + " standbyIntervalMinutes=" + TimeUnit.NANOSECONDS.toMinutes(standbyIntervalNs)
             + " fromLogPosition=" + logPosition);
     }
 
@@ -244,8 +312,15 @@ public final class SnapshotCadence {
         lastEvaluatedNs = nowNs;
         observedLogPosition = logPosition;
 
+        if (standbyInFlight) {
+            checkStandbyInFlight(nowNs);
+        }
         if (requestInFlight) {
             checkInFlight(nowNs);
+            if (isLeader && standbyDue(nowNs) && !standbyInFlight) {
+                // the member snapshot holds the toggle: the standby waits for the next evaluation
+                deferStandby();
+            }
             return 0;
         }
         if (!isLeader || toggle() == null) {
@@ -253,10 +328,84 @@ public final class SnapshotCadence {
         }
 
         final String reason = dueReason(nowNs, logPosition);
-        if (reason == null) {
-            return 0;
+        if (reason != null) {
+            return request(nowNs, reason) ? 1 : 0;
         }
-        return request(nowNs, reason) ? 1 : 0;
+        if (!standbyInFlight && standbyDue(nowNs)) {
+            requestStandby(nowNs);
+        }
+        return 0;
+    }
+
+    private boolean standbyDue(final long nowNs) {
+        return standbyIntervalNs > 0 && nowNs - lastStandbyNs >= standbyIntervalNs;
+    }
+
+    /**
+     * Toggle STANDBY_SNAPSHOT (CAS from NEUTRAL, CCTL:125). A failed CAS means a SNAPSHOT or an operator holds the
+     * toggle: deferred, retried on the next evaluation. Not a duty-cycle work count: no member snapshot follows.
+     */
+    private void requestStandby(final long nowNs) {
+        final ClusterControl.ToggleState wanted = off.contains(Control.STANDBY_USES_SNAPSHOT)
+            ? ClusterControl.ToggleState.SNAPSHOT : ClusterControl.ToggleState.STANDBY_SNAPSHOT;
+        if (!wanted.toggle(controlToggle)) {
+            deferStandby();
+            return;
+        }
+        standbyDeferPending = false;
+        standbyInFlight = true;
+        standbyRequestedAtNs = nowNs;
+        standbyRequests++;
+        System.out.println("[CADENCE] standby snapshot requested #" + standbyRequests + " ("
+            + TimeUnit.NANOSECONDS.toSeconds(nowNs - lastStandbyNs) + "s since the last; interval "
+            + TimeUnit.NANOSECONDS.toMinutes(standbyIntervalNs) + "m)");
+    }
+
+    /** One count per due standby that found the toggle held, however many evaluations it waits. */
+    private void deferStandby() {
+        if (!standbyDeferPending) {
+            standbyDeferPending = true;
+            standbyDeferred++;
+        }
+    }
+
+    /** Standby completion and lost-request accounting: NEUTRAL completes; INACTIVE or stale is lost; any other action is ambiguous. */
+    private void checkStandbyInFlight(final long nowNs) {
+        final ClusterControl.ToggleState state = controlToggle == null
+            ? null : ClusterControl.ToggleState.get(controlToggle);
+        if (state == ClusterControl.ToggleState.NEUTRAL) {
+            standbyInFlight = false;
+            standbyCompleted++;
+            lastStandbyNs = nowNs;
+            return;
+        }
+        if (state == ClusterControl.ToggleState.STANDBY_SNAPSHOT) {
+            if (nowNs - standbyRequestedAtNs >= REQUEST_STALE_NS) {
+                lost(nowNs, "still STANDBY_SNAPSHOT after "
+                    + TimeUnit.NANOSECONDS.toSeconds(REQUEST_STALE_NS) + "s (stale)");
+            }
+            return;
+        }
+        if (state == null || state == ClusterControl.ToggleState.INACTIVE) {
+            lost(nowNs, "toggle " + state + " (the request can never be appended)");
+            return;
+        }
+        // The CM appended and reset, and an operator toggled again within the evaluation
+        standbyInFlight = false;
+        standbyAmbiguous++;
+        lastStandbyNs = nowNs;
+        System.out.println("[CADENCE] standby snapshot request ambiguous: toggle reads " + state
+            + " while the standby was in flight (completed, then another action was toggled)");
+    }
+
+    private void lost(final long nowNs, final String why) {
+        standbyInFlight = false;
+        lastStandbyNs = nowNs;
+        if (!off.contains(Control.LOST_COUNTING_OFF)) {
+            standbyLost++;
+        }
+        System.err.println("[CADENCE] CRITICAL: standby snapshot request lost: " + why
+            + " (standby_toggle_lost_total=" + standbyLost + "); the replica's LOCAL fallback covers the gap");
     }
 
     /**
@@ -333,7 +482,8 @@ public final class SnapshotCadence {
     /**
      * A snapshot was taken at {@code logPosition}. Called on EVERY member from
      * {@code onTakeSnapshot}, whatever asked for it, so the baseline follows the
-     * cluster rather than this node's own requests.
+     * cluster rather than this node's own requests. The standby clock is NOT reset: the
+     * replica's STANDBY shadows keep their own rhythm whatever the member cadence does.
      */
     public void snapshotTaken(final long logPosition, final long nowNs) {
         lastSnapshotPosition = logPosition;
@@ -349,6 +499,12 @@ public final class SnapshotCadence {
     public void roleChanged(final boolean isLeader) {
         if (!isLeader) {
             requestInFlight = false;
+            standbyDeferPending = false; // the due standby is the next leader's; a new leadership counts afresh
+            if (standbyInFlight) {
+                // Lost: a follower's toggle is deactivated (CMA:1382) and re-activated NEUTRAL on the next
+                // leadership (CMA:1913): this request can never be appended
+                lost(lastEvaluatedNs, "role changed to follower with the request in flight");
+            }
         }
     }
 
@@ -376,5 +532,40 @@ public final class SnapshotCadence {
     /** Whether a request is outstanding. */
     public boolean requestInFlight() {
         return requestInFlight;
+    }
+
+    /** The standby schedule, 0 when disabled. */
+    public long standbyIntervalNs() {
+        return standbyIntervalNs;
+    }
+
+    /** {@code standby_requests_total}: STANDBY_SNAPSHOT toggles this node made while leading. */
+    public long standbyRequestCount() {
+        return standbyRequests;
+    }
+
+    /** Standby requests the CM completed (the toggle read NEUTRAL again). */
+    public long standbyCompletedCount() {
+        return standbyCompleted;
+    }
+
+    /** {@code standby_toggle_deferred_total}: due standbys that could not take the toggle, each counted once. */
+    public long standbyDeferredCount() {
+        return standbyDeferred;
+    }
+
+    /** {@code standby_toggle_lost_total}. */
+    public long standbyLostCount() {
+        return standbyLost;
+    }
+
+    /** {@code standby_toggle_ambiguous_total}. */
+    public long standbyAmbiguousCount() {
+        return standbyAmbiguous;
+    }
+
+    /** Whether a standby request is outstanding. */
+    public boolean standbyInFlight() {
+        return standbyInFlight;
     }
 }

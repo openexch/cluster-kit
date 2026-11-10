@@ -51,6 +51,8 @@ public final class ShadowWriterThread implements AutoCloseable {
     private final AtomicReference<Request> slot = new AtomicReference<>();
     private final Thread thread;
     private volatile boolean running = true;
+    /** The host's fence latch, read before each write starts; never set: no latch. */
+    private volatile java.util.function.BooleanSupplier fenceLatch = () -> false;
 
     /**
      * @param errorHandler the host's: receives every {@code Throwable} from a write or the listener (review FIX-2);
@@ -99,6 +101,15 @@ public final class ShadowWriterThread implements AutoCloseable {
         return true;
     }
 
+    /**
+     * The host's fence latch. The thread reads it after it takes a request and before the
+     * write starts; a latched fence hands the request back {@code ABORTED(ABORT_REQUESTED)} unwritten, so a fence that
+     * lands between the host's own check and its {@link #offer} still stops that write.
+     */
+    public void fenceLatch(final java.util.function.BooleanSupplier latch) {
+        this.fenceLatch = Objects.requireNonNull(latch, "latch");
+    }
+
     /** No write in flight and the slot is free: the host's buffer is back. */
     public boolean isIdle() {
         return !busy.get();
@@ -127,6 +138,16 @@ public final class ShadowWriterThread implements AutoCloseable {
                 new ShadowWriter.Purge(ShadowWriter.Purge.Kind.NOT_ATTEMPTED, -1, null));
     }
 
+    /** The request handed back unwritten because the host's fence latched before the write started. */
+    static ShadowWriter.WriteResult fencedBeforeWrite() {
+        return new ShadowWriter.WriteResult(ShadowWriter.Reason.ABORTED, FENCED_BEFORE_WRITE,
+                ShadowWriter.AbortCause.ABORT_REQUESTED, -1, -1, null, 0, 0, 0,
+                new ShadowWriter.Purge(ShadowWriter.Purge.Kind.NOT_ATTEMPTED, -1, null));
+    }
+
+    /** The detail of {@link #fencedBeforeWrite}. */
+    public static final String FENCED_BEFORE_WRITE = "fenced before the write started";
+
     private void run() {
         if (guardOff) {
             runUnguarded();
@@ -142,7 +163,9 @@ public final class ShadowWriterThread implements AutoCloseable {
                 ShadowWriter.WriteResult result;
                 Error fatal = null;
                 try {
-                    result = writer.write(r.image(), r.engineId(), r.kind(), r.at(), r.identity());
+                    // A fence latched after the host's own check and before this write starts stops it here
+                    result = fenceLatch.getAsBoolean() ? fencedBeforeWrite()
+                            : writer.write(r.image(), r.engineId(), r.kind(), r.at(), r.identity());
                 } catch (final RuntimeException e) {
                     report(e);
                     result = unexpected(e);

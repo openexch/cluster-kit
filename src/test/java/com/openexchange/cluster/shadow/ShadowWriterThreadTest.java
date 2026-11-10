@@ -239,4 +239,72 @@ public class ShadowWriterThreadTest {
             assertEquals("no publication left behind", baselineLogs, rig.fixture.publicationLogFiles().size());
         }
     }
+    /**
+     * A fence from another thread lands between the follower's fence check and the offer (the
+     * seam: the writer port latches the fence right before it hands the request over). The writer thread reads the
+     * latch before it starts the write, so nothing is written: the request comes back ABORTED and the archive holds no
+     * shadow.
+     */
+    @Test
+    public void aFenceBetweenTheFollowersCheckAndTheOfferStopsTheWrite() throws Exception {
+        try (ShadowRig rig = new ShadowRig()) {
+            final java.util.concurrent.atomic.AtomicBoolean fenced = new java.util.concurrent.atomic.AtomicBoolean();
+            final BlockingQueue<Done> done = new ArrayBlockingQueue<>(4);
+            final java.util.List<String> fences = new java.util.concurrent.CopyOnWriteArrayList<>();
+            final ShadowWriterThread t = new ShadowWriterThread(rig.writer(R3),
+                    (req, res) -> done.add(new Done(req, res, Thread.currentThread())), errors::add, rig.counters);
+            t.fenceLatch(fenced::get); // the follower's wiring (fenced != null)
+            final ShadowImageBuffer image = new ShadowImageBuffer(new org.agrona.concurrent.UnsafeBuffer(
+                    java.nio.ByteBuffer.allocateDirect(ShadowHeader.LENGTH + 2 * ShadowRig.CHUNK)));
+            final ShadowImageBuffer source = image(ShadowRig.CHUNK, 1);
+            final com.openexchange.cluster.log.LogCursor[] at = {cursor(4096)};
+            final com.openexchange.cluster.replica.ShadowTriggerPolicy.WriterPort real =
+                    com.openexchange.cluster.replica.ShadowTriggerPolicy.port(t);
+            final com.openexchange.cluster.replica.ShadowTriggerPolicy policy =
+                    new com.openexchange.cluster.replica.ShadowTriggerPolicy(image, ENGINE, () -> at[0], ID, dst -> {
+                        dst.putBytes(0, source.payloadView(), 0, source.payloadLength());
+                        return source.payloadLength();
+                    }, CLOCK_FOR_POLICY, new org.agrona.concurrent.SleepingMillisIdleStrategy(1),
+                            TimeUnit.SECONDS.toNanos(10), 0, 16, fences::add,
+                            com.openexchange.cluster.replica.ReplicaFaults.NONE, Set.of());
+            policy.fencedProbe(fenced::get);
+            policy.attachWriter(new com.openexchange.cluster.replica.ShadowTriggerPolicy.WriterPort() {
+                @Override
+                public boolean isIdle() {
+                    return real.isIdle();
+                }
+
+                @Override
+                public boolean isRunning() {
+                    return real.isRunning();
+                }
+
+                @Override
+                public boolean offer(final ShadowWriterThread.Request request) {
+                    fenced.set(true); // seam: the fence lands after the follower's check, before the hand-off
+                    return real.offer(request);
+                }
+            });
+            try {
+                assertTrue(policy.onSnapshotAction(4096, 1, 1_000, 1));
+                final ShadowKind handed = policy.producePending();
+                final Done d = handed == null ? null : done.poll(20, TimeUnit.SECONDS);
+                if (d != null && d.result().ok()) {
+                    throw new AssertionError("the writer wrote after the fence latched between the follower's"
+                            + " check and the offer: " + d.result());
+                }
+                if (d != null) {
+                    assertEquals(ShadowWriter.Reason.ABORTED, d.result().reason());
+                }
+                assertTrue("the archive holds no shadow: " + rig.catalog().scan().all(),
+                        rig.catalog().scan().all().isEmpty());
+                System.out.println("GREEN fence before the write: handed=" + handed + " result="
+                        + (d == null ? "none" : d.result()));
+            } finally {
+                assertTrue(t.close(5_000));
+            }
+        }
+    }
+
+    static final org.agrona.concurrent.NanoClock CLOCK_FOR_POLICY = org.agrona.concurrent.SystemNanoClock.INSTANCE;
 }

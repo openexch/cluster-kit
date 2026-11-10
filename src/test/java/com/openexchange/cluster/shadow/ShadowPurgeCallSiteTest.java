@@ -18,8 +18,10 @@ import static org.junit.Assert.assertTrue;
  * under {@code com/openexchange/cluster/} is scanned for calls to {@code AeronArchive.purgeRecording} and
  * {@code ShadowCatalog.purge}; the only callers allowed are {@link ShadowRetention} (the owner),
  * {@link ShadowCatalog} itself (its {@code purge}, the archive call at the end), {@link ShadowWriter} (its own aborted
- * recording, by id) and {@code StagingArchive} (bundle staging, never a shadow). Anything else in {@code cluster} or
- * {@code cluster.shadow} fails.
+ * recording, by id) and {@code StagingArchive} (bundle staging, never a shadow), plus the replica's
+ * {@code replica.RetrievedSetTrim} (the retrieved member snapshot set trim, allow-listed by class name; it purges
+ * member CM/service snapshot recordings, never a shadow). Anything else in {@code cluster}, {@code cluster.shadow} or
+ * {@code cluster.replica} fails.
  */
 public class ShadowPurgeCallSiteTest {
 
@@ -28,7 +30,8 @@ public class ShadowPurgeCallSiteTest {
             PKG + "shadow/ShadowRetention",
             PKG + "shadow/ShadowCatalog",
             PKG + "shadow/ShadowWriter",
-            PKG + "StagingArchive");
+            PKG + "StagingArchive",
+            PKG + "replica/RetrievedSetTrim");
 
     static NeverSchedulesScan.Rules purgeRules() {
         return new NeverSchedulesScan.Rules(Set.of(), List.of(), Set.of(),
@@ -77,7 +80,9 @@ public class ShadowPurgeCallSiteTest {
                 + "io/aeron/archive/client/AeronArchive.purgeRecording"));
         assertTrue(callers.toString(), callers.contains(PKG + "StagingArchive -> "
                 + "io/aeron/archive/client/AeronArchive.purgeRecording"));
-        assertEquals(callers.toString(), 4, callers.size());
+        assertTrue(callers.toString(), callers.contains(PKG + "replica/RetrievedSetTrim -> "
+                + "io/aeron/archive/client/AeronArchive.purgeRecording"));
+        assertEquals(callers.toString(), 5, callers.size());
         ShadowRig.green("purge call sites: " + callers);
     }
 

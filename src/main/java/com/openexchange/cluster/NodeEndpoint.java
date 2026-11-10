@@ -25,7 +25,8 @@ import java.util.function.Supplier;
  */
 public final class NodeEndpoint {
 
-    private final NodeReadiness readiness;
+    private final Supplier<NodeReadiness.Probe> probe;
+    private final Runnable onStop;
     private final Supplier<String> metricsBody;
     private HttpServer server;
 
@@ -34,7 +35,22 @@ public final class NodeEndpoint {
      * @param metricsBody Prometheus exposition, or null to serve no metrics
      */
     public NodeEndpoint(final NodeReadiness readiness, final Supplier<String> metricsBody) {
-        this.readiness = readiness;
+        this.probe = readiness::probe;
+        this.onStop = readiness::stopping;
+        this.metricsBody = metricsBody;
+    }
+
+    /**
+     * A node whose evidence is not member-shaped (the shadow replica) supplies its own probe. One call per
+     * request yields both the status and the body, from the same evidence. {@link #stop} only stops the server; the
+     * supplier's owner marks itself stopping.
+     *
+     * @param probe       the node's own view of itself, read once per request
+     * @param metricsBody Prometheus exposition, or null to serve no metrics
+     */
+    public NodeEndpoint(final Supplier<NodeReadiness.Probe> probe, final Supplier<String> metricsBody) {
+        this.probe = java.util.Objects.requireNonNull(probe, "probe");
+        this.onStop = () -> { };
         this.metricsBody = metricsBody;
     }
 
@@ -44,15 +60,15 @@ public final class NodeEndpoint {
         // 200 while the duty cycle is advancing. A failure here is a restart
         // request: the process is up but no longer doing its job.
         server.createContext("/health", exchange -> {
-            final NodeReadiness.Probe probe = readiness.probe();
-            respond(exchange, probe.live() ? 200 : 503, probe.detail());
+            final NodeReadiness.Probe p = probe.get();
+            respond(exchange, p.live() ? 200 : 503, p.detail());
         });
 
         // 200 only when this member can be counted on. A rolling restart waits
         // on this, so a false 200 costs quorum.
         server.createContext("/ready", exchange -> {
-            final NodeReadiness.Probe probe = readiness.probe();
-            respond(exchange, probe.ready() ? 200 : 503, probe.detail());
+            final NodeReadiness.Probe p = probe.get();
+            respond(exchange, p.ready() ? 200 : 503, p.detail());
         });
 
         if (metricsBody != null) {
@@ -77,8 +93,13 @@ public final class NodeEndpoint {
             + " on port " + port);
     }
 
+    /** The bound port (the one {@link #start} was given, or the ephemeral one for 0); -1 before start. */
+    public int port() {
+        return server == null ? -1 : server.getAddress().getPort();
+    }
+
     public void stop() {
-        readiness.stopping();
+        onStop.run();
         if (server != null) {
             server.stop(0);
         }

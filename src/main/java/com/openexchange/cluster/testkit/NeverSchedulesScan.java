@@ -135,13 +135,79 @@ public final class NeverSchedulesScan {
                             "io/aeron/driver/MediaDriver",
                             "io/aeron/archive/ArchivingMediaDriver",
                             "io/aeron/cluster/ClusterBackupMediaDriver",
-                            "io/aeron/cluster/ClusteredMediaDriver"),
+                            "io/aeron/cluster/ClusteredMediaDriver",
+                            // the backup belongs to cluster.replica, never to cluster.shadow
+                            "io/aeron/cluster/ClusterBackup",
+                            "io/aeron/cluster/ClusterBackupEventsListener"),
                     List.of("com/openexchange/assets/", "com/match/"),
                     Set.of("scheduleTimer", "cancelTimer"),
                     Map.of("java/lang/System", Set.of("currentTimeMillis", "nanoTime", "getenv", "getProperty",
                             "getProperties", "setProperty")),
                     Map.of(),
                     Map.of());
+        }
+
+        /**
+         * The {@code cluster.replica} package: it may hold the backup, Aeron and archive
+         * clients and an injected clock, but never a {@code Cluster}, a {@code ClientSession}, a {@code TimerPort}, a
+         * cluster client ({@code AeronCluster}: no ingress, no session), a {@code ClusterClock}, a timer call or a
+         * scheduler, the wall or nano clock of {@code System}, the environment, a system property, or an
+         * engine-specific type. The one {@code System.getProperty} (the {@code oxs.replica.negative.controls} gate in
+         * {@code ReplicaFaults}) is scanned with {@link #replicaFaultsGate()}; the driver launch rule is
+         * {@link #replicaDriverLaunch()}.
+         */
+        public static Rules replica() {
+            return new Rules(
+                    Set.of("io/aeron/cluster/service/Cluster",
+                            "io/aeron/cluster/service/ClientSession",
+                            "com/openexchange/cluster/TimerPort",
+                            "io/aeron/cluster/client/AeronCluster",
+                            "io/aeron/cluster/service/ClusterClock",
+                            "java/util/Timer",
+                            "java/util/TimerTask",
+                            "java/util/concurrent/ScheduledExecutorService",
+                            "java/util/concurrent/ScheduledThreadPoolExecutor"),
+                    List.of("com/openexchange/assets/", "com/match/"),
+                    Set.of("scheduleTimer", "cancelTimer", "newScheduledThreadPool",
+                            "newSingleThreadScheduledExecutor"),
+                    Map.of("java/lang/System", Set.of("currentTimeMillis", "nanoTime", "getenv", "getProperty",
+                                    "getProperties", "setProperty"),
+                            "java/lang/Long", Set.of("getLong"),
+                            "java/lang/Integer", Set.of("getInteger"),
+                            "java/lang/Boolean", Set.of("getBoolean")),
+                    Map.of("java/time/", Set.of("now")),
+                    Map.of());
+        }
+
+        /** {@link #replica()} without the {@code getProperty} ban: for {@code ReplicaFaults} alone. */
+        public static Rules replicaFaultsGate() {
+            final Rules replica = replica();
+            return new Rules(replica.forbiddenTypes(), replica.forbiddenPrefixes(), replica.forbiddenAnyOwner(),
+                    Map.of("java/lang/System", Set.of("currentTimeMillis", "nanoTime", "getenv", "getProperties",
+                                    "setProperty"),
+                            "java/lang/Long", Set.of("getLong"),
+                            "java/lang/Integer", Set.of("getInteger"),
+                            "java/lang/Boolean", Set.of("getBoolean")),
+                    replica.forbiddenOwnerPrefixMembers(), replica.onlyAllowedMembers());
+        }
+
+        /**
+         * Only {@code ReplicaProcess} launches a driver, an archive or the backup. Matched on the
+         * {@code launch} members (a {@code Context} class constant names its outer class in the InnerClasses
+         * attribute, so a type rule would flag every context builder).
+         */
+        public static Rules replicaDriverLaunch() {
+            final Set<String> launch = Set.of("launch", "launchEmbedded");
+            return new Rules(Set.of(), List.of(), Set.of(),
+                    Map.of("io/aeron/driver/MediaDriver", launch,
+                            "io/aeron/archive/Archive", launch,
+                            "io/aeron/archive/ArchivingMediaDriver", launch,
+                            "io/aeron/cluster/ClusterBackup", launch,
+                            "io/aeron/cluster/ClusterBackupMediaDriver", launch,
+                            "io/aeron/cluster/ClusteredMediaDriver", launch,
+                            "io/aeron/cluster/ConsensusModule", launch,
+                            "io/aeron/cluster/service/ClusteredServiceContainer", launch),
+                    Map.of(), Map.of());
         }
 
         /** {@link #shadow()} without the {@code getProperty} ban: for {@code ShadowSelfCheck} alone. */

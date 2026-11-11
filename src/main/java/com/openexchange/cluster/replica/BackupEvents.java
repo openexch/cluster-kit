@@ -21,6 +21,8 @@ public final class BackupEvents implements ClusterBackupEventsListener {
 
     /** The text CBA:869 and CBA:911 start a supplier replay refusal with (MAX_REPLAYS, a pruned position, ...). */
     static final String LIVE_LOG_REPLAY_FAILED = "Live log replay failed";
+    /** The supplier archive's replay-before-start text (AC:2270-2275, ArchiveException:262-263). */
+    static final String REPLAY_BEFORE_START = "is less than recording start position";
 
     private final NanoClock clock;
     private final ClusterBackupEventsListener delegate;
@@ -30,6 +32,9 @@ public final class BackupEvents implements ClusterBackupEventsListener {
     private volatile long resets;
     private volatile long authRejected;
     private volatile long replayFailures;
+    /** Replay refusals because the supplier pruned below the requested position: total and in a row. */
+    private volatile long replayBelowStart;
+    private volatile long replayBelowStartConsecutive;
     private volatile long otherFailures;
     private volatile boolean authRejectedSinceResponse;
     private volatile String lastFailure;
@@ -78,6 +83,7 @@ public final class BackupEvents implements ClusterBackupEventsListener {
         lastFailureNs = clock.nanoTime();
         final String text = String.valueOf(ex.getMessage());
         if (text.contains("AUTHENTICATION_REJECTED")) {
+            replayBelowStartConsecutive = 0;
             authRejected++;
             authRejectedSinceResponse = true;
             System.err.println("[REPLICA-BACKUP] AUTHENTICATION_REJECTED by a member (#" + authRejected + "): " + text
@@ -87,8 +93,17 @@ public final class BackupEvents implements ClusterBackupEventsListener {
             // the supplier's archive refused or failed the bounded replay: Aeron 1.53.1 wraps that refusal in a
             // ClusterException "Live log replay failed ..." (CBA:869, CBA:909-913), not an ArchiveException
             replayFailures++;
-            System.err.println("[REPLICA-BACKUP] supplier archive failure (#" + replayFailures + "): " + ex);
+            if (isReplayBelowStart(text)) {
+                replayBelowStart++;
+                replayBelowStartConsecutive++;
+                System.err.println("[REPLICA-BACKUP] supplier pruned below the requested replay position (#"
+                        + replayBelowStart + ", " + replayBelowStartConsecutive + " in a row): " + ex);
+            } else {
+                replayBelowStartConsecutive = 0;
+                System.err.println("[REPLICA-BACKUP] supplier archive failure (#" + replayFailures + "): " + ex);
+            }
         } else {
+            replayBelowStartConsecutive = 0;
             otherFailures++;
             System.err.println("[REPLICA-BACKUP] backup reset: " + ex);
         }
@@ -159,6 +174,7 @@ public final class BackupEvents implements ClusterBackupEventsListener {
 
     @Override
     public void onLiveLogProgress(final long recordingId, final long recordingPosCounterId, final long logPosition) {
+        replayBelowStartConsecutive = 0; // the supplier replays again
         liveRecordingId = recordingId;
         liveCounterId = (int)recordingPosCounterId;
         liveLogPosition = logPosition;
@@ -209,6 +225,26 @@ public final class BackupEvents implements ClusterBackupEventsListener {
 
     public long replayFailures() {
         return replayFailures;
+    }
+
+    /**
+     * A supplier replay refusal because the supplier's log starts above the requested position: the wrapper text of
+     * CBA:909-914 ({@code Live log replay failed ... errorCode=INVALID_POSITION}) around the archive's replay-before-start
+     * message. A MAX_REPLAYS refusal or any other code never matches.
+     */
+    static boolean isReplayBelowStart(final String text) {
+        return text != null && text.contains(LIVE_LOG_REPLAY_FAILED) && text.contains("errorCode=INVALID_POSITION")
+                && text.contains(REPLAY_BEFORE_START);
+    }
+
+    /** {@code shadow_replica_backup_replay_below_start_total}. */
+    public long replayBelowStart() {
+        return replayBelowStart;
+    }
+
+    /** Replay-below-start refusals in a row (reset by any other failure and by live log progress). */
+    public long replayBelowStartConsecutive() {
+        return replayBelowStartConsecutive;
     }
 
     public long otherFailures() {

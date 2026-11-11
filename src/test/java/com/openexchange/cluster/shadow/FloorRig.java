@@ -240,6 +240,22 @@ final class FloorRig implements AutoCloseable {
         return floor(ShadowFloor.Margin.PREVIOUS_VERIFIED, Set.of());
     }
 
+    /** A floor with an explicit anchor rule. */
+    ShadowFloor floor(final ShadowFloor.Margin margin, final ShadowFloor.AnchorRule rule,
+                      final Set<NegativeControl> off) {
+        return new ShadowFloor(this::latestSnapshotPosition, this::newestImage, skipSafe(), margin, rule,
+                this::logStart, hk, off.isEmpty() ? EnumSet.noneOf(NegativeControl.class) : EnumSet.copyOf(off));
+    }
+
+    /** A complete raw shadow of {@code producer} and {@code kind}; returns its recording id. */
+    long shadow(final long p, final long journalSeq, final byte[] payload, final ShadowProducer producer,
+                final ShadowKind kind) {
+        final ShadowHeader h = new ShadowHeader(ENGINE, 0, kind.code(), producer.kind().code(),
+                producer.producerId(), seq++, GENESIS, p, 3, 0, 1_000 + p, 1, journalSeq, payload.length,
+                ShadowRig.digest(payload), CHUNK, 7);
+        return rig.raw(h, payload, ShadowRig.Raw.COMPLETE).recordingId();
+    }
+
     static byte[] payload(final long seed) {
         return ShadowRig.payload(ShadowRig.image(LEN, seed));
     }

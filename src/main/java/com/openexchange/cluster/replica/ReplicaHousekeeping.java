@@ -186,8 +186,9 @@ public final class ReplicaHousekeeping implements Runnable, AutoCloseable, Repli
                 ShadowCatalog.DEFAULT_LIST_BATCH, clock, timeoutNs, shadowCounters);
         final ShadowFloor[] holder = new ShadowFloor[1];
         final LongSupplier newestVerified = () -> newestVerified(holder[0] == null ? null : holder[0].scan());
+        // the replica's own floor: one producer by construction, so any VERIFIED shadow anchors here
         floor = new ShadowFloor(newestVerified, () -> ShadowFloor.NewestImage.STUB, header -> false,
-                cfg.floorMargin, this::logStart, counters);
+                cfg.floorMargin, ShadowFloor.AnchorRule.ANY_VERIFIED, this::logStart, counters);
         holder[0] = floor;
         try {
             retention = new ShadowRetention(catalog, floor, cfg.retainN, counters);

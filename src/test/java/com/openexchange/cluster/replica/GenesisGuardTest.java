@@ -154,4 +154,79 @@ public class GenesisGuardTest {
         assertTrue(g.detail(), g.detail().startsWith(expected));
         assertTrue(g.namedCopyUnusable());
     }
+
+    /**
+     * A genesis start: PASSED "nothing to protect" before the ADOPT; the argument turning from 0 to the adopted genesis
+     * re-arms the check at once ({@code checked()} false with nothing named, {@code comparedOnce()} kept); the first
+     * named snapshot of the same genesis checks; a later one of another genesis refuses with the cluster-genesis text.
+     */
+    @Test
+    public void aGenesisStartArmsTheCheckAtItsAdopt() {
+        final GenesisGuard g = guard();
+        assertEquals(GenesisGuard.Outcome.PASSED, g.check(0));
+        assertTrue(g.checked());
+        assertTrue(g.comparedOnce());
+        advanceMs(250);
+        g.check(G1); // the ADOPT was applied: the follower now passes the known genesis
+        if (g.checked()) {
+            throw new AssertionError("checked() == false after arming: the purge gate stayed open after the ADOPT");
+        }
+        assertTrue("readiness keeps the pre-ADOPT pass", g.comparedOnce());
+        named = new GenesisGuard.Named(4096, 0, 0);
+        copies.put(named, 7L);
+        genesis.put(7L, G1);
+        advanceMs(250);
+        assertEquals(GenesisGuard.Outcome.PASSED, g.check(G1));
+        assertTrue(g.checked());
+        named = new GenesisGuard.Named(8192, 1, 4096);
+        copies.put(named, 9L);
+        genesis.put(9L, G2);
+        advanceMs(250);
+        assertEquals(GenesisGuard.Outcome.REFUSED, g.check(G1));
+        assertEquals(clusterGenesisText(G2, G1), g.refusal());
+        System.out.println("GREEN genesis start: armed at ADOPT, compared, kept re-genesis refused: " + g.refusal());
+    }
+
+    /** The follower's argument: the local shadows' genesis, else the adopted one. Control: the local one only. */
+    void followerArgument(final java.util.Set<ReplicaNegativeControl> off) {
+        final GenesisGuard g = guard0();
+        long known = 0;
+        assertEquals(GenesisGuard.Outcome.PASSED, g.check(ReplicaFollower.clusterCheckGenesis(0, known, off)));
+        known = G1; // ADOPT applied
+        named = new GenesisGuard.Named(4096, 0, 0);
+        copies.put(named, 7L);
+        genesis.put(7L, G2);
+        for (int i = 0; i < 3; i++) {
+            now[0] += TimeUnit.MILLISECONDS.toNanos(250);
+            g.check(ReplicaFollower.clusterCheckGenesis(0, known, off));
+        }
+        if (decodes == 0) {
+            throw new AssertionError("a genesis-start replica never compared a named snapshot");
+        }
+        assertEquals(clusterGenesisText(G2, G1), g.refusal());
+    }
+
+    GenesisGuard guard0() {
+        decodes = 0;
+        named = null;
+        copies.clear();
+        genesis.clear();
+        return guard();
+    }
+
+    @Test
+    public void theFollowerPassesTheAdoptedGenesis() {
+        assertEquals(G1, ReplicaFollower.clusterCheckGenesis(G1, G2, java.util.Set.of()));
+        assertEquals(G2, ReplicaFollower.clusterCheckGenesis(0, G2, java.util.Set.of()));
+        followerArgument(java.util.Set.of());
+        try {
+            followerArgument(java.util.Set.of(ReplicaNegativeControl.GENESIS_CHECK_LOCAL_ONLY));
+            throw new AssertionError("negative control GENESIS_CHECK_LOCAL_ONLY did not fail");
+        } catch (final AssertionError e) {
+            if (!String.valueOf(e.getMessage()).contains("a genesis-start replica never compared a named snapshot")) {
+                throw e;
+            }
+            System.out.println("NC GENESIS_CHECK_LOCAL_ONLY -> " + e.getMessage());
+        }
+    }
 }

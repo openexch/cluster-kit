@@ -2,6 +2,7 @@
 package com.openexchange.cluster.replica;
 
 import com.openexchange.cluster.shadow.ShadowFloor;
+import com.openexchange.cluster.shadow.ShadowPullSettings;
 import io.aeron.cluster.ClusterBackup;
 import io.aeron.security.CredentialsSupplier;
 
@@ -89,6 +90,27 @@ public final class ReplicaConfig {
     public static final long DEFAULT_EXTERNAL_DRIVER_TIMEOUT_MS = 30_000;
     public static final int DEFAULT_SOCKET_BUFFER = 4 * 1024 * 1024;
     public static final int DEFAULT_ARCHIVE_SEGMENT_LENGTH = 64 * 1024 * 1024;
+    /** {@code SHADOW_REBOOTSTRAP_REPLAY_FAILURES}: replay-below-start refusals in a row before a re-bootstrap. */
+    public static final int DEFAULT_REBOOTSTRAP_REPLAY_FAILURES = 3;
+    public static final int MAX_REBOOTSTRAP_REPLAY_FAILURES = 1_000;
+    /** {@code SHADOW_REBOOTSTRAP_MAX_CONSECUTIVE}: re-bootstraps allowed inside the window. */
+    public static final int DEFAULT_REBOOTSTRAP_MAX_CONSECUTIVE = 3;
+    public static final int MAX_REBOOTSTRAP_MAX_CONSECUTIVE = 100;
+    /** {@code SHADOW_REBOOTSTRAP_WINDOW_MS}: the loop guard's window. */
+    public static final long DEFAULT_REBOOTSTRAP_WINDOW_MS = 3_600_000;
+    public static final long MIN_REBOOTSTRAP_WINDOW_MS = 60_000;
+    public static final long MAX_REBOOTSTRAP_WINDOW_MS = 604_800_000;
+    /** {@code SHADOW_REBOOTSTRAP_KEEP}: moved-aside {@code cluster.rebootstrap-*} dirs kept. */
+    public static final int DEFAULT_REBOOTSTRAP_KEEP = 2;
+    public static final int MAX_REBOOTSTRAP_KEEP = 100;
+    /**
+     * {@code SHADOW_REBOOTSTRAP_NOT_TAKEN_LOG_MS}: at most one {@code re-bootstrap not taken} line per interval (the
+     * detector keeps trying; the suppressed attempts are counted in the next line and in
+     * {@code shadow_replica_rebootstrap_not_taken_total}).
+     */
+    public static final long DEFAULT_REBOOTSTRAP_NOT_TAKEN_LOG_MS = 60_000;
+    public static final long MIN_REBOOTSTRAP_NOT_TAKEN_LOG_MS = 1_000;
+    public static final long MAX_REBOOTSTRAP_NOT_TAKEN_LOG_MS = 86_400_000;
 
     final List<String> memberHosts;
     final int portBase;
@@ -148,6 +170,12 @@ public final class ReplicaConfig {
     final long scanPeriodMs;
     final long loadTimeoutMs;
     final int nodePort;
+    final ShadowPullSettings pullSettings;
+    final int rebootstrapReplayFailures;
+    final int rebootstrapMaxConsecutive;
+    final long rebootstrapWindowMs;
+    final int rebootstrapKeep;
+    final long rebootstrapNotTakenLogMs;
     final ReplicaFaults faults;
     final Set<ReplicaNegativeControl> off;
 
@@ -210,6 +238,12 @@ public final class ReplicaConfig {
         this.scanPeriodMs = b.scanPeriodMs;
         this.loadTimeoutMs = b.loadTimeoutMs;
         this.nodePort = b.nodePort;
+        this.pullSettings = b.pullSettings;
+        this.rebootstrapReplayFailures = b.rebootstrapReplayFailures;
+        this.rebootstrapMaxConsecutive = b.rebootstrapMaxConsecutive;
+        this.rebootstrapWindowMs = b.rebootstrapWindowMs;
+        this.rebootstrapKeep = b.rebootstrapKeep;
+        this.rebootstrapNotTakenLogMs = b.rebootstrapNotTakenLogMs;
         this.faults = b.faults;
         this.off = b.off.isEmpty() ? EnumSet.noneOf(ReplicaNegativeControl.class) : EnumSet.copyOf(b.off);
     }
@@ -354,6 +388,41 @@ public final class ReplicaConfig {
         return memberCadenceMs;
     }
 
+    /** The shadow puller settings (the bootstrap pull, the re-bootstrap); disabled when no source is configured. */
+    public ShadowPullSettings pullSettings() {
+        return pullSettings;
+    }
+
+    /** {@code SHADOW_REBOOTSTRAP_REPLAY_FAILURES} (0: the detector counts and never acts). */
+    public int rebootstrapReplayFailures() {
+        return rebootstrapReplayFailures;
+    }
+
+    /** {@code SHADOW_REBOOTSTRAP_MAX_CONSECUTIVE}. */
+    public int rebootstrapMaxConsecutive() {
+        return rebootstrapMaxConsecutive;
+    }
+
+    /** {@code SHADOW_REBOOTSTRAP_WINDOW_MS}. */
+    public long rebootstrapWindowMs() {
+        return rebootstrapWindowMs;
+    }
+
+    /** {@code SHADOW_REBOOTSTRAP_KEEP}. */
+    public int rebootstrapKeep() {
+        return rebootstrapKeep;
+    }
+
+    /** {@code SHADOW_REBOOTSTRAP_NOT_TAKEN_LOG_MS}. */
+    public long rebootstrapNotTakenLogMs() {
+        return rebootstrapNotTakenLogMs;
+    }
+
+    /** This replica's archive control endpoint {@code host:port} (p1), the one a pull source list must not name. */
+    public String archiveControlEndpoint() {
+        return ReplicaContexts.replicaEndpoint(this, com.openexchange.cluster.ClusterPorts.ARCHIVE_CONTROL_OFFSET);
+    }
+
     /** {@code REPLICA_LOG_STREAM_ID}. */
     public int logStreamId() {
         return logStreamId;
@@ -383,6 +452,7 @@ public final class ReplicaConfig {
                 + driverMode + " aeronDir=" + aeronDir + " source=" + sourceType + " cooldownMs=" + backupCooldownMs
                 + " queryIntervalMs=" + backupQueryIntervalMs + " responseTimeoutMs=" + backupResponseTimeoutMs
                 + " progressTimeoutMs=" + backupProgressTimeoutMs + " bufferMb=" + shadowBufferMb
+                + " pullSources=" + pullSettings.sources()
                 + (off.isEmpty() ? "" : " NEGATIVE_CONTROLS=" + off) + "}";
     }
 
@@ -402,6 +472,37 @@ public final class ReplicaConfig {
     public static String fencePurgeWaitRefusal(final long v) {
         return v < MIN_FENCE_PURGE_WAIT_MS || v > MAX_FENCE_PURGE_WAIT_MS ? "REPLICA_FENCE_PURGE_WAIT_MS must be "
                 + MIN_FENCE_PURGE_WAIT_MS + ".." + MAX_FENCE_PURGE_WAIT_MS + " ms: " + v : null;
+    }
+
+    /** Null when valid, else the refusal text. */
+    public static String rebootstrapReplayFailuresRefusal(final long v) {
+        return v < 0 || v > MAX_REBOOTSTRAP_REPLAY_FAILURES ? "SHADOW_REBOOTSTRAP_REPLAY_FAILURES must be 0.."
+                + MAX_REBOOTSTRAP_REPLAY_FAILURES + ": " + v : null;
+    }
+
+    /** Null when valid, else the refusal text. */
+    public static String rebootstrapMaxConsecutiveRefusal(final long v) {
+        return v < 1 || v > MAX_REBOOTSTRAP_MAX_CONSECUTIVE ? "SHADOW_REBOOTSTRAP_MAX_CONSECUTIVE must be 1.."
+                + MAX_REBOOTSTRAP_MAX_CONSECUTIVE + ": " + v : null;
+    }
+
+    /** Null when valid, else the refusal text. */
+    public static String rebootstrapWindowRefusal(final long v) {
+        return v < MIN_REBOOTSTRAP_WINDOW_MS || v > MAX_REBOOTSTRAP_WINDOW_MS ? "SHADOW_REBOOTSTRAP_WINDOW_MS must be "
+                + MIN_REBOOTSTRAP_WINDOW_MS + ".." + MAX_REBOOTSTRAP_WINDOW_MS + " ms: " + v : null;
+    }
+
+    /** Null when valid, else the refusal text. */
+    public static String rebootstrapKeepRefusal(final long v) {
+        return v < 1 || v > MAX_REBOOTSTRAP_KEEP ? "SHADOW_REBOOTSTRAP_KEEP must be 1.." + MAX_REBOOTSTRAP_KEEP + ": "
+                + v : null;
+    }
+
+    /** Null when valid, else the refusal text. */
+    public static String rebootstrapNotTakenLogRefusal(final long v) {
+        return v < MIN_REBOOTSTRAP_NOT_TAKEN_LOG_MS || v > MAX_REBOOTSTRAP_NOT_TAKEN_LOG_MS
+                ? "SHADOW_REBOOTSTRAP_NOT_TAKEN_LOG_MS must be " + MIN_REBOOTSTRAP_NOT_TAKEN_LOG_MS + ".."
+                + MAX_REBOOTSTRAP_NOT_TAKEN_LOG_MS + " ms: " + v : null;
     }
 
     /** Null when valid, else the refusal text. */
@@ -470,6 +571,12 @@ public final class ReplicaConfig {
         private long scanPeriodMs = DEFAULT_SCAN_PERIOD_MS;
         private long loadTimeoutMs = DEFAULT_LOAD_TIMEOUT_MS;
         private int nodePort = -1;
+        private ShadowPullSettings pullSettings = ShadowPullSettings.disabled();
+        private int rebootstrapReplayFailures = DEFAULT_REBOOTSTRAP_REPLAY_FAILURES;
+        private int rebootstrapMaxConsecutive = DEFAULT_REBOOTSTRAP_MAX_CONSECUTIVE;
+        private long rebootstrapWindowMs = DEFAULT_REBOOTSTRAP_WINDOW_MS;
+        private int rebootstrapKeep = DEFAULT_REBOOTSTRAP_KEEP;
+        private long rebootstrapNotTakenLogMs = DEFAULT_REBOOTSTRAP_NOT_TAKEN_LOG_MS;
         private ReplicaFaults faults = ReplicaFaults.NONE;
         private Set<ReplicaNegativeControl> off = EnumSet.noneOf(ReplicaNegativeControl.class);
 
@@ -773,6 +880,37 @@ public final class ReplicaConfig {
             return this;
         }
 
+        /** The shadow puller settings ({@link ShadowPullSettings#parse}); default disabled. */
+        public Builder pullSettings(final ShadowPullSettings v) {
+            this.pullSettings = Objects.requireNonNull(v, "pullSettings");
+            return this;
+        }
+
+        public Builder rebootstrapReplayFailures(final int v) {
+            this.rebootstrapReplayFailures = v;
+            return this;
+        }
+
+        public Builder rebootstrapMaxConsecutive(final int v) {
+            this.rebootstrapMaxConsecutive = v;
+            return this;
+        }
+
+        public Builder rebootstrapWindowMs(final long v) {
+            this.rebootstrapWindowMs = v;
+            return this;
+        }
+
+        public Builder rebootstrapKeep(final int v) {
+            this.rebootstrapKeep = v;
+            return this;
+        }
+
+        public Builder rebootstrapNotTakenLogMs(final long v) {
+            this.rebootstrapNotTakenLogMs = v;
+            return this;
+        }
+
         /**
          * Test seams. Refused by {@link #build} unless {@value ReplicaFaults#PROPERTY} is
          * {@code true}: a production replica with a fault seam or a negative control is a configuration error.
@@ -862,6 +1000,22 @@ public final class ReplicaConfig {
             final String age = readyShadowAgeBelowCadence(readyShadowAgeMs, memberCadenceMs, verifyWaitMs);
             if (age != null) {
                 throw new IllegalArgumentException(age);
+            }
+            for (final String r : new String[] {rebootstrapReplayFailuresRefusal(rebootstrapReplayFailures),
+                rebootstrapMaxConsecutiveRefusal(rebootstrapMaxConsecutive), rebootstrapWindowRefusal(rebootstrapWindowMs),
+                rebootstrapKeepRefusal(rebootstrapKeep), rebootstrapNotTakenLogRefusal(rebootstrapNotTakenLogMs)}) {
+                if (r != null) {
+                    throw new IllegalArgumentException(r);
+                }
+            }
+            Objects.requireNonNull(pullSettings, "SHADOW_PULL_SOURCES");
+            final String own = replicaAddress + ":" + com.openexchange.cluster.ClusterPorts.port(slot, portBase,
+                    com.openexchange.cluster.ClusterPorts.ARCHIVE_CONTROL_OFFSET, portStride);
+            for (final ShadowPullSettings.Endpoint e : pullSettings.sources()) {
+                if (e.text().equals(own)) {
+                    throw new IllegalArgumentException(ShadowPullSettings.SOURCES
+                            + " lists this node's own archive endpoint " + own);
+                }
             }
             positive("REPLICA_LOG_STREAM_ID", logStreamId);
             if (snapshotStreamIds.isEmpty()) {

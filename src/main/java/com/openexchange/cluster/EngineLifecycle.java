@@ -84,9 +84,14 @@ public final class EngineLifecycle {
     public static final int EXIT_CLUSTER_TERMINATED = 0;
     /** Status the JVM gives a SIGTERM stop (128 + 15); used when driver loss halts a signal stop in progress. */
     public static final int EXIT_SIGNAL = 143;
+    /**
+     * Status of a decided restart (a replica re-bootstrap): not a fault, the supervisor restarts the process
+     * ({@code RestartForceExitStatus=3}).
+     */
+    public static final int EXIT_RESTART = 3;
 
     /** Why the node is stopping. */
-    public enum Cause { NONE, SIGNAL, CLUSTER_TERMINATED, FATAL }
+    public enum Cause { NONE, SIGNAL, CLUSTER_TERMINATED, FATAL, RESTART }
 
     private record Stop(Cause cause, int status, String reason) { }
 
@@ -268,6 +273,31 @@ public final class EngineLifecycle {
     }
 
     /**
+     * A decided restart: record it (unless a stop is already in progress), wake the main thread, which closes the
+     * components and exits with {@code status} ({@link #EXIT_RESTART}); the same backstop as {@link #fatal} bounds a
+     * hanging close. Returns true when this call recorded the restart.
+     */
+    public boolean restart(final int status, final String reason) {
+        if (status == 0 || status == EXIT_FATAL || status == EXIT_SIGNAL) {
+            throw new IllegalArgumentException("a restart exits with its own status, never 0, 1 or 143: " + status);
+        }
+        if (!record(new Stop(Cause.RESTART, status, reason))) {
+            return false;
+        }
+        log.accept(name + " RESTART (exit " + status + "): " + reason + " - node exiting for a supervised restart,"
+                + " backstop in " + fatalExitGraceMs + " ms");
+        final Thread backstop = new Thread(() -> {
+            if (!awaitQuietly(closedLatch, fatalExitGraceMs)) {
+                log.accept(name + " restart close exceeded " + fatalExitGraceMs + " ms - halting with " + status);
+            }
+            halt(status);
+        }, name + "-restart-exit");
+        backstop.setDaemon(true);
+        backstop.start();
+        return true;
+    }
+
+    /**
      * Classify an error the node's Aeron error handler saw. With an external driver, driver loss halts at once
      * ({@link #driverLost}) and any other FATAL Aeron error is a fatal fault (exit 1), as is an agent that
      * terminated unexpectedly; everything else is only logged by the caller. Call it on the thread that reported
@@ -295,7 +325,10 @@ public final class EngineLifecycle {
 
     /**
      * Driver loss (see the class rules): log, then halt on the calling thread before its Aeron client unmaps the
-     * CnC. A fault already recorded keeps its status; a signal stop in progress halts with {@link #EXIT_SIGNAL}.
+     * CnC. A fault already recorded keeps its status; a decided restart in progress keeps its status too
+     * ({@link #EXIT_RESTART}: the supervisor restarts the node either way, and the restart was decided before the loss;
+     * the components are not closed, so a host's close-time step, such as the replica's move of {@code cluster/}, does
+     * not run and the next start decides again); a signal stop in progress halts with {@link #EXIT_SIGNAL}.
      * Returns true when this call recorded the fault. With a halter that returns (tests) the lifecycle then
      * behaves as after {@link #fatal}: the main thread's finish is a no-op halt.
      */
@@ -303,7 +336,7 @@ public final class EngineLifecycle {
         final String reason = "media driver lost in EXTERNAL driver mode: " + t;
         final boolean recorded = record(new Stop(Cause.FATAL, EXIT_FATAL, reason));
         final Stop s = stop.get();
-        final int status = s.cause() == Cause.FATAL ? s.status() : EXIT_SIGNAL;
+        final int status = s.cause() == Cause.FATAL || s.cause() == Cause.RESTART ? s.status() : EXIT_SIGNAL;
         log.accept(name + " FATAL (exit " + status + "): " + reason + " - halting now, no component close: the "
                 + "client unmaps the CnC under running agents (SIGSEGV), and nothing is durable without a driver");
         halt(status);
@@ -345,6 +378,10 @@ public final class EngineLifecycle {
                 log.accept(name + " closed after " + s.reason() + " - exit " + s.status());
                 yield s.status();
             }
+            case RESTART -> {
+                log.accept(name + " closed for a restart: " + s.reason() + " - exit " + s.status());
+                yield s.status();
+            }
             case NONE -> {
                 // The main thread got here without a stop cause: the node is not running, so it must not look clean.
                 log.accept(name + " main thread finished without a stop cause - exit " + EXIT_FATAL);
@@ -369,7 +406,7 @@ public final class EngineLifecycle {
         // A fault recorded before the signal keeps its status: returning would let the JVM exit 143 before the
         // backstop halts with the fault's status.
         final Stop s = stop.get();
-        if (s.cause() == Cause.FATAL) {
+        if (s.cause() == Cause.FATAL || s.cause() == Cause.RESTART) {
             halt(s.status());
         }
     }

@@ -41,7 +41,7 @@ public final class ReplicaReadiness {
 
     /** {@code shadow_replica_restore_path}. */
     public enum RestorePath {
-        NONE(0), LOCAL_SHADOW(1), GENESIS(2), REFUSED(4);
+        NONE(0), LOCAL_SHADOW(1), GENESIS(2), PULLED_SHADOW(3), REFUSED(4);
 
         private final int code;
 
@@ -74,6 +74,9 @@ public final class ReplicaReadiness {
     private volatile String refused;
     private volatile String fenced;
     private volatile boolean stopping;
+    private volatile boolean rebootstrapping;
+    /** Non-null while a re-bootstrap is needed but no shadow above L.stop exists (the follower sets and clears it). */
+    private volatile String rebootstrapNotTaken;
     private volatile long followerTickNs;
     private volatile boolean followerTicked;
     private volatile long housekeepingTickNs;
@@ -123,7 +126,7 @@ public final class ReplicaReadiness {
     }
 
     public void restored(final RestorePath path) {
-        if (path != RestorePath.LOCAL_SHADOW && path != RestorePath.GENESIS) {
+        if (path != RestorePath.LOCAL_SHADOW && path != RestorePath.GENESIS && path != RestorePath.PULLED_SHADOW) {
             throw new IllegalArgumentException("restored with " + path);
         }
         restorePath = path;
@@ -144,6 +147,19 @@ public final class ReplicaReadiness {
 
     public void stopping() {
         stopping = true;
+    }
+
+    /** A re-bootstrap was decided: 503 {@code rebootstrap: restarting} until the process exits 3. */
+    public void rebootstrapping() {
+        rebootstrapping = true;
+    }
+
+    /**
+     * The members pruned past this replica and no shadow above L.stop exists yet: the plain reason reads before every
+     * reading but the gate (the replica cannot be ready: its live recording is not alive). Null clears it.
+     */
+    public void rebootstrapNotTaken(final String detail) {
+        rebootstrapNotTaken = detail;
     }
 
     public void followerTick() {
@@ -242,6 +258,10 @@ public final class ReplicaReadiness {
         if (early != null) {
             return early;
         }
+        final String notTaken = rebootstrapNotTaken;
+        if (notTaken != null) {
+            return notTaken;
+        }
         if (!verified) {
             return "unverified continuation"; // the detail names what the trust waits for
         }
@@ -275,6 +295,9 @@ public final class ReplicaReadiness {
 
     /** Stopping, fenced, refused, bootstrap not done: the inputs no other reading may override. */
     private String gate() {
+        if (rebootstrapping) {
+            return "rebootstrap: restarting";
+        }
         if (stopping) {
             return "stopping";
         }
@@ -287,7 +310,7 @@ public final class ReplicaReadiness {
             return "refused:" + rf;
         }
         final RestorePath p = restorePath;
-        if (p != RestorePath.LOCAL_SHADOW && p != RestorePath.GENESIS) {
+        if (p != RestorePath.LOCAL_SHADOW && p != RestorePath.GENESIS && p != RestorePath.PULLED_SHADOW) {
             return bootstrapDetail;
         }
         return null;

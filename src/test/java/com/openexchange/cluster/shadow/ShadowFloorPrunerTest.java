@@ -117,15 +117,15 @@ public class ShadowFloorPrunerTest {
         try (FloorRig r = new FloorRig(true)) {
             final ShadowFloor floor = new ShadowFloor(r::latestSnapshotPosition,
                     () -> { throw new IllegalStateException("no archive client yet"); }, FloorRig.skipSafe(),
-                    ShadowFloor.Margin.PREVIOUS_VERIFIED, r::logStart, r.hk);
+                    ShadowFloor.Margin.PREVIOUS_VERIFIED, ShadowFloor.AnchorRule.ANY_VERIFIED, r::logStart, r.hk);
             final ShadowFloor.Evaluation e = floor.evaluate();
             assertEquals(e.toString(), ShadowFloor.Evaluation.Kind.IMAGE_UNKNOWN, e.kind());
             r.purge(floor);
             assertEquals("unreadable: the log stays whole even though the group is a full image", 0, r.logStart());
             assertEquals(1, r.hk.get(ShadowHousekeeping.Counter.FLOOR_UNKNOWN));
             final ShadowFloor unknown = new ShadowFloor(r::latestSnapshotPosition,
-                    () -> ShadowFloor.NewestImage.UNKNOWN, FloorRig.skipSafe(), ShadowFloor.Margin.NONE, r::logStart,
-                    r.hk);
+                    () -> ShadowFloor.NewestImage.UNKNOWN, FloorRig.skipSafe(), ShadowFloor.Margin.NONE,
+                    ShadowFloor.AnchorRule.ANY_VERIFIED, r::logStart, r.hk);
             assertEquals(0, unknown.evaluate().floor());
             ShadowRig.green("D2 unreadable newest group -> 0 (" + e + ")");
         }

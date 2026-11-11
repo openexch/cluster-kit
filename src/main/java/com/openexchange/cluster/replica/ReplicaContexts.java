@@ -49,7 +49,7 @@ public final class ReplicaContexts {
         return ClusterPorts.port(memberOrSlot, c.portBase, offset, c.portStride);
     }
 
-    static String replicaEndpoint(final ReplicaConfig c, final int offset) {
+    public static String replicaEndpoint(final ReplicaConfig c, final int offset) {
         return c.replicaAddress + ":" + port(c, c.slot, offset);
     }
 

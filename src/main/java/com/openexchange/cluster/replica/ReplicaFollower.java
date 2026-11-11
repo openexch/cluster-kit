@@ -16,6 +16,7 @@ import com.openexchange.cluster.shadow.ShadowIdentity;
 import com.openexchange.cluster.shadow.ShadowImageBuffer;
 import com.openexchange.cluster.shadow.ShadowImageLoader;
 import com.openexchange.cluster.shadow.ShadowProducer;
+import com.openexchange.cluster.shadow.ShadowPuller;
 import com.openexchange.cluster.shadow.ShadowVerdicts;
 import com.openexchange.cluster.shadow.ShadowWriter;
 import com.openexchange.cluster.shadow.ShadowWriterThread;
@@ -60,7 +61,13 @@ import java.util.concurrent.TimeUnit;
  *                                                                 CORRUPT or refused candidate falls to the next;
  *                                                                 restore_path LOCAL_SHADOW
  * genesis  no usable local shadow and L.start == 0                genesis(); the writer is armed after the ADOPT frame
- * pruned   no usable local shadow and L.start > 0                 refuse with the runbook text, exit 1
+ * pull     no usable local shadow (or every one below L.start)    with SHADOW_PULL_SOURCES: pull the newest ALIGNED
+ *          and L.start > 0                                        with P_s >= L.start, re-scan, then the shadow branch
+ *                                                                 (restore_path PULLED_SHADOW); candidates of two or
+ *                                                                 more geneses across the sources refuse
+ * pruned   no usable local shadow and L.start > 0                 refuse with the runbook text and the pull outcome
+ *                                                                 ({@code pull: disabled} or {@code pull: tried ...}),
+ *                                                                 exit 1
  * refused  usable shadows, all refused or below L.start           refuse as pruned, with usable/refused counts
  * </pre>
  * <p>One {@code restore} or {@code genesis} per process; a failure after {@code restore} halts.</p>
@@ -80,6 +87,20 @@ import java.util.concurrent.TimeUnit;
  * retrieved member service snapshot must hold the local shadows' genesis and agree with the RecordingLog's term
  * entry; otherwise {@code FATAL replica: cluster genesis <g2> != local shadows <g1>; wipe BASE_DIR} before any frame
  * is applied. A dead counter with {@code stop > consumed} reads {@code catching up (backup reset)}.</p>
+ *
+ * <h2>Re-bootstrap</h2>
+ * <p>When the members pruned their logs past this replica's L, the supplier refuses every live log replay with the
+ * replay-before-start text. After {@code SHADOW_REBOOTSTRAP_REPLAY_FAILURES} such refusals in a row, with L's live
+ * recording not alive, a VERIFIED local shadow of this genesis with {@code P_s > L.stop} decides the re-bootstrap:
+ * one already held (a process that stopped between a decision and the move keeps the pulled shadow and
+ * {@code cluster/}), else one the follower pulls now. With none, {@code re-bootstrap not taken: ...} is the
+ * {@code /ready} reason and a log line at most once per {@code SHADOW_REBOOTSTRAP_NOT_TAKEN_LOG_MS}. A loop guard
+ * ({@code BASE_DIR/rebootstrap.count}, node-local restart policy) refuses more than
+ * {@code SHADOW_REBOOTSTRAP_MAX_CONSECUTIVE} inside {@code SHADOW_REBOOTSTRAP_WINDOW_MS} with
+ * {@code FATAL replica: re-bootstrap refused: ...}. The follower only marks the re-bootstrap
+ * ({@link #rebootstrapDir}), reads 503 {@code rebootstrap: restarting} and asks the host to restart;
+ * {@link ReplicaProcess#close} moves {@code cluster/} aside after the backup and the archive closed, and the process
+ * exits 3. Nothing deletes {@code cluster/} or edits the backup RecordingLog.</p>
  *
  * <h2>Alignment trust</h2>
  * <p>A GENESIS start is VERIFIED; a LOCAL_SHADOW start is UNVERIFIED ({@code /ready} 503 {@code unverified
@@ -109,11 +130,29 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
          */
         default void hold(final String reason) {
         }
+
+        /**
+         * A decided restart (a re-bootstrap): the host stops the process, which exits 3 after its close. A host that
+         * cannot restart exits 1 with the reason.
+         */
+        default void restart(final String reason) {
+            fatal(reason + " (this host has no restart path: exit 1)");
+        }
     }
 
     static final String REPLAY_CHANNEL = "aeron:ipc?linger=0|sparse=true";
     /** The reason prefix {@code ShadowCatalog} gives copies of several geneses on a bootstrap catalog. */
     static final String AMBIGUOUS_GENESIS = "ambiguous genesis on a bootstrap catalog";
+
+    /** The prefix of every re-bootstrap refusal (a replica that holds a shadow, unlike the bootstrap runbook). */
+    static final String REBOOTSTRAP_REFUSED = "FATAL replica: re-bootstrap refused: ";
+
+    static final String RUNBOOK_LOOP = "Runbook: keep the members' logs longer (SHADOW_FLOOR_MARGIN, the snapshot"
+            + " cadence) or give the replica more capacity, then restart it; the guard counts the entries of"
+            + " BASE_DIR/rebootstrap.count inside SHADOW_REBOOTSTRAP_WINDOW_MS.";
+
+    static final String RUNBOOK_NO_SOURCES = "Runbook: set SHADOW_PULL_SOURCES to the members' archive endpoints, or"
+            + " copy a VERIFIED shadow of this genesis above L.stop into BASE_DIR/archive, then restart the replica.";
     private static final long STATUS_PERIOD_NS = TimeUnit.MILLISECONDS.toNanos(100);
 
     private final ReplicaConfig cfg;
@@ -154,6 +193,19 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
     private volatile long firstProducerSeq = -1;
     /** The genesis of the local usable shadows at bootstrap (the geneses rule leaves at most one), 0 when there are none. */
     private volatile long localShadowGenesis;
+    /** The moved-aside dir name a decided re-bootstrap asks the process close for, null when none. */
+    private volatile String rebootstrapDir;
+    private volatile long rebootstrapTotal;
+    /** The replay-below-start count in a row at which the next re-bootstrap attempt is due. */
+    private long nextRebootstrapAt;
+    /** The last {@code re-bootstrap not taken} reason, on {@code /ready} until the refusal streak ends; else null. */
+    private volatile String rebootstrapNotTaken;
+    private volatile long rebootstrapNotTakenTotal;
+    private boolean notTakenLogged;
+    private long nextNotTakenLogNs;
+    private long notTakenSuppressed;
+    /** The puller of the bootstrap pull or the last re-bootstrap attempt (its counters stay exported). */
+    private volatile ShadowPuller lastPuller;
     /**
      * The genesis compare against the member snapshot the live
      * member's backup response named; paced, never latched for good.
@@ -384,6 +436,7 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
                 shadowCounters);
         int usable = 0;
         int refusedCount = 0;
+        int belowStart = 0;
         for (final LogicalShadow s : candidates) {
             usable++;
             if (s.conflict()) {
@@ -394,11 +447,12 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
             }
             if (s.logPosition() < l.startPosition()) {
                 refusedCount++;
+                belowStart++;
                 System.out.println("[REPLICA] bootstrap: shadow at " + s.logPosition() + " is below L.start="
                         + l.startPosition() + " (the log it needs is gone), skipped");
                 continue;
             }
-            final Boolean restored = tryRestore(s, loader);
+            final Boolean restored = tryRestore(s, loader, ReplicaReadiness.RestorePath.LOCAL_SHADOW);
             if (restored == null) {
                 return false; // halted
             }
@@ -409,6 +463,45 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
             refusedCount++;
         }
         shadowsRefused = refusedCount;
+
+        // pull: the log is pruned and no local shadow reaches L.start
+        String pullText = "";
+        if (l.startPosition() > 0 && (usable == 0 || belowStart == usable)) {
+            if (!cfg.pullSettings.enabled()) {
+                pullText = " pull: disabled";
+            } else {
+                final long start = l.startPosition();
+                readiness.bootstrapping("bootstrap: pulling shadow from " + cfg.pullSettings.sources());
+                final ShadowPuller.Report r = pull(alias -> alias.logPosition() >= start ? 0 : -1);
+                if (!running) {
+                    return false; // stopped during the pull: a stop is not a refusal
+                }
+                if (r.kind() == ShadowPuller.Report.Kind.GENESES) {
+                    return refuse("FATAL replica: the pull sources list shadows of " + r.geneses().size()
+                            + " geneses " + r.geneses() + "; wipe BASE_DIR or pin the genesis");
+                }
+                pullText = " pull: " + r.text();
+                if (r.kind() == ShadowPuller.Report.Kind.VERIFIED) {
+                    final ShadowCatalog.Scan again = bootCatalog.verifyAllComplete();
+                    final List<LogicalShadow> pulled = new ArrayList<>(again.usable());
+                    pulled.sort(Comparator.comparingLong(LogicalShadow::logPosition).reversed());
+                    for (final LogicalShadow s : pulled) {
+                        if (s.conflict() || s.logPosition() < start) {
+                            continue;
+                        }
+                        final Boolean restored = tryRestore(s, loader, ReplicaReadiness.RestorePath.PULLED_SHADOW);
+                        if (restored == null) {
+                            return false; // halted
+                        }
+                        if (restored) {
+                            shadowsRefused = refusedCount;
+                            return armAfterBootstrap(again, ReplicaReadiness.RestorePath.PULLED_SHADOW);
+                        }
+                    }
+                    pullText = " pull: " + r.text() + " (the pulled shadow was refused at restore)";
+                }
+            }
+        }
 
         // genesis, or refuse: the log is pruned, or every usable shadow was refused
         if (usable == 0) {
@@ -422,7 +515,7 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
                 restoredPosition = 0;
                 return armAfterBootstrap(scan, ReplicaReadiness.RestorePath.GENESIS);
             }
-            return refuse(runbook(l.startPosition(), ""));
+            return refuse(runbook(l.startPosition(), "") + pullText);
         }
         if (l.startPosition() == 0) {
             return refuse("FATAL replica: no usable local shadow (shadows usable=" + usable + " refused="
@@ -430,7 +523,35 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
                     + " refusals above; wipe BASE_DIR to start from genesis while a member still holds the log"
                     + " from 0.");
         }
-        return refuse(runbook(l.startPosition(), " shadows usable=" + usable + " refused=" + refusedCount));
+        return refuse(runbook(l.startPosition(), " shadows usable=" + usable + " refused=" + refusedCount)
+                + pullText);
+    }
+
+    /**
+     * One pull on this thread with its own clients (closed after), bounded by {@code SHADOW_PULL_STARTUP_WAIT_MS};
+     * the liveness tick keeps running. A stop ends it before its next pass (an in-flight copy is stopped and purged
+     * by the puller on this thread), so {@link #close} never waits for the pull deadline.
+     */
+    private ShadowPuller.Report pull(final ShadowPuller.Target target) {
+        final boolean stopIgnored = cfg.off.contains(ReplicaNegativeControl.STOP_WAITS_FOR_PULL);
+        if (stopIgnored) {
+            System.err.println("[REPLICA] NC STOP_WAITS_FOR_PULL: the pull runs to its deadline whatever a stop says");
+        }
+        final ShadowPuller puller = new ShadowPuller(aeron, writerArchiveContext, cfg.engineId, cfg.clusterId,
+                () -> knownGenesis, () -> false, cfg.replicaAddress, cfg.pullSettings, verdicts, shadowCounters,
+                clock, TimeUnit.MILLISECONDS.toNanos(cfg.loadTimeoutMs), "shadow-puller-R" + cfg.slot);
+        lastPuller = puller;
+        try {
+            final ShadowPuller.Report r = puller.pullOnce(target, clock.nanoTime()
+                    + TimeUnit.MILLISECONDS.toNanos(cfg.pullSettings.startupWaitMs()), readiness::followerTick,
+                    () -> running || stopIgnored);
+            System.out.println("[REPLICA] pull: " + r.text() + (r.pulled() == null ? "" : " pulled rec="
+                    + r.pulled().recordingId() + " P=" + r.pulled().header().logPosition() + " from "
+                    + r.pulledFrom()));
+            return r;
+        } finally {
+            puller.close();
+        }
     }
 
     private static String runbook(final long start, final String counts) {
@@ -444,7 +565,8 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
      * One candidate's copies, verified first. True when restored, false when every copy was refused before any
      * restore, null when halted (a failure after restore).
      */
-    private Boolean tryRestore(final LogicalShadow s, final ShadowImageLoader loader) {
+    private Boolean tryRestore(final LogicalShadow s, final ShadowImageLoader loader,
+                               final ReplicaReadiness.RestorePath path) {
         final List<ShadowEntry> copies = new ArrayList<>(s.copies());
         copies.sort(Comparator.comparingInt(e -> e.state() == ShadowEntry.State.VERIFIED ? 0 : 1));
         for (final ShadowEntry e : copies) {
@@ -514,7 +636,7 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
             termIndex.seed(h.leadershipTermId(), h.termBaseLogPosition());
             knownGenesis = h.genesisId();
             restoredPosition = h.logPosition();
-            System.out.println("[REPLICA] restore_path=LOCAL_SHADOW from rec=" + e.recordingId() + " P_s="
+            System.out.println("[REPLICA] restore_path=" + path + " from rec=" + e.recordingId() + " P_s="
                     + h.logPosition() + " kind=" + h.kindEnum() + " producer=" + e.producer() + " genesisId="
                     + h.genesisId());
             return Boolean.TRUE;
@@ -679,7 +801,11 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
             logView.beginPass();
             readiness.followerTick();
             int work = 0;
+            clearNotTakenWhenTheStreakEnded();
             if (image == null) {
+                if (maybeRebootstrap()) {
+                    return;
+                }
                 work += tryAttach();
             } else if (!checkCluster()) {
                 // every named snapshot is compared, paced; a refusal fences, an unreadable copy is retried
@@ -741,6 +867,194 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
             status();
             idle.idle(work);
         }
+    }
+
+    /**
+     * The re-bootstrap detector: the preconditions (replay-below-start refusals in a row, L not alive), the loop guard,
+     * then the shadow precondition: a VERIFIED local shadow of this genesis above L.stop, either already held (a
+     * process that stopped between an earlier decision and the move, or an operator copy) or pulled now. The local
+     * archive decides, so a restart that lost the move decides again from the same state; a shadow at or below L.stop
+     * never qualifies, and the loop guard bounds the cycles. True when the follower stops for the restart (or refused).
+     */
+    private boolean maybeRebootstrap() {
+        final int needed = cfg.rebootstrapReplayFailures;
+        if (needed <= 0) {
+            return false; // detector only
+        }
+        final long inARow = refusalsInARow();
+        if (inARow < needed || inARow < nextRebootstrapAt) {
+            if (inARow < needed) {
+                nextRebootstrapAt = 0;
+            }
+            return false;
+        }
+        if (liveCounterId(logRecordingId) != Aeron.NULL_VALUE) {
+            return false;
+        }
+        nextRebootstrapAt = inARow + needed;
+        final long lStop;
+        try {
+            lStop = archive.getStopPosition(logRecordingId);
+        } catch (final RuntimeException unreadable) {
+            return false;
+        }
+        final long nowMs = org.agrona.concurrent.SystemEpochClock.INSTANCE.time();
+        final String loop = cfg.off.contains(ReplicaNegativeControl.REBOOTSTRAP_LOOP_GUARD_OFF) ? null
+                : RebootstrapGuard.check(cfg.baseDir, nowMs, cfg.rebootstrapMaxConsecutive, cfg.rebootstrapWindowMs);
+        if (loop != null) {
+            refuse(rebootstrapRefusal(loop, RUNBOOK_LOOP));
+            return true;
+        }
+        final String shadow;
+        if (cfg.off.contains(ReplicaNegativeControl.REBOOTSTRAP_WITHOUT_PULL)) {
+            System.err.println("[REPLICA] NC REBOOTSTRAP_WITHOUT_PULL: re-bootstrap decided without a shadow above"
+                    + " L.stop");
+            shadow = "pulled ALIGNED at none from none";
+        } else {
+            final LogicalShadow held = cfg.off.contains(ReplicaNegativeControl.REBOOTSTRAP_LOCAL_SHADOW_OFF) ? null
+                    : localShadowAbove(lStop);
+            if (held != null) {
+                shadow = "local VERIFIED " + kindOf(held) + " at " + held.logPosition() + " already held";
+            } else if (!cfg.pullSettings.enabled()) {
+                refuse(rebootstrapRefusal("re-bootstrap needs SHADOW_PULL_SOURCES (" + inARow
+                        + " replay refusals below the supplier's log start, L.stop=" + lStop
+                        + ", no local VERIFIED shadow above it)", RUNBOOK_NO_SOURCES));
+                return true;
+            } else {
+                readiness.live(false, "rebootstrap: pulling shadow from " + cfg.pullSettings.sources());
+                final ShadowPuller.Report r = pull(alias -> alias.logPosition() > lStop ? 0 : -1);
+                if (!running) {
+                    return true; // stopped during the pull: neither taken nor not taken
+                }
+                if (r.kind() != ShadowPuller.Report.Kind.VERIFIED) {
+                    notTaken(lStop, r);
+                    return false;
+                }
+                shadow = "pulled " + r.pulled().header().kindEnum() + " at " + r.pulled().header().logPosition()
+                        + " from " + r.pulledFrom();
+            }
+        }
+        RebootstrapGuard.record(cfg.baseDir, nowMs, cfg.rebootstrapWindowMs);
+        final String dir = RebootstrapGuard.dirName(nowMs);
+        rebootstrapDir = dir;
+        rebootstrapTotal++;
+        rebootstrapNotTaken = null;
+        readiness.rebootstrapNotTaken(null);
+        final String reason = "replica re-bootstrap: members pruned past L.stop=" + lStop + " (" + inARow
+                + " replay refusals); " + shadow + "; backup state will move to " + dir + "; restarting";
+        System.err.println("[REPLICA] CRITICAL: " + reason);
+        readiness.rebootstrapping();
+        running = false;
+        halt.restart(reason);
+        return true;
+    }
+
+    private long refusalsInARow() {
+        return cfg.off.contains(ReplicaNegativeControl.REBOOTSTRAP_ON_ANY_REPLAY_FAILURE)
+                ? events.replayFailures() : events.replayBelowStartConsecutive();
+    }
+
+    /** The not-taken reason leaves {@code /ready} once the replay-below-start streak ended (every follower pass). */
+    private void clearNotTakenWhenTheStreakEnded() {
+        if (rebootstrapNotTaken != null && refusalsInARow() < cfg.rebootstrapReplayFailures) {
+            rebootstrapNotTaken = null;
+            readiness.rebootstrapNotTaken(null);
+        }
+    }
+
+    /**
+     * The newest VERIFIED local shadow of this replica's genesis above {@code lStop} whose kind the pull settings
+     * accept, or null (also when the genesis is unknown or the scan had errors). Deep-verifies the COMPLETE copies
+     * without a verdict first, as the bootstrap scan does.
+     */
+    private LogicalShadow localShadowAbove(final long lStop) {
+        final long genesis = localShadowGenesis != 0 ? localShadowGenesis : knownGenesis;
+        if (genesis == 0) {
+            return null;
+        }
+        final ShadowCatalog.Scan scan;
+        try {
+            scan = new ShadowCatalog(aeron, archive, cfg.engineId, cfg.clusterId, genesis, verdicts,
+                    ShadowCatalog.DEFAULT_LIST_BATCH, clock, TimeUnit.MILLISECONDS.toNanos(cfg.loadTimeoutMs),
+                    shadowCounters).verifyAllComplete();
+        } catch (final RuntimeException unreadable) {
+            System.err.println("[REPLICA] re-bootstrap: the local shadow scan failed: " + unreadable);
+            return null;
+        }
+        if (!scan.known()) {
+            System.err.println("[REPLICA] re-bootstrap: the local shadow scan had " + scan.errors()
+                    + " archive errors; no local shadow qualifies on a partial view");
+            return null;
+        }
+        return newestQualifying(scan.verified(), genesis, lStop, cfg.pullSettings.kinds());
+    }
+
+    /**
+     * Pure: the newest shadow of {@code verified} (newest first) of {@code genesis} strictly above {@code lStop}, not
+     * in conflict, with a VERIFIED copy of a kind in {@code kinds}; null when none.
+     */
+    static LogicalShadow newestQualifying(final List<LogicalShadow> verified, final long genesis, final long lStop,
+                                          final Set<com.openexchange.cluster.shadow.ShadowKind> kinds) {
+        LogicalShadow best = null;
+        for (final LogicalShadow s : verified) {
+            if (s.conflict() || s.genesisId() != genesis || s.logPosition() <= lStop) {
+                continue;
+            }
+            final boolean ok = s.copies().stream().anyMatch(e -> e.state() == ShadowEntry.State.VERIFIED
+                    && e.header() != null && kinds.contains(e.header().kindEnum()));
+            if (ok && (best == null || s.logPosition() > best.logPosition())) {
+                best = s;
+            }
+        }
+        return best;
+    }
+
+    private static String kindOf(final LogicalShadow s) {
+        for (final ShadowEntry e : s.copies()) {
+            if (e.state() == ShadowEntry.State.VERIFIED && e.header() != null) {
+                return String.valueOf(e.header().kindEnum());
+            }
+        }
+        return "?";
+    }
+
+    /**
+     * A re-bootstrap attempt found no shadow above L.stop: the plain reason on {@code /ready} (until the refusal streak
+     * ends or a re-bootstrap is decided) and one log line per {@code SHADOW_REBOOTSTRAP_NOT_TAKEN_LOG_MS}.
+     */
+    private void notTaken(final long lStop, final ShadowPuller.Report r) {
+        rebootstrapNotTakenTotal++;
+        final String text = notTakenText(lStop, cfg.pullSettings.kinds(), r);
+        rebootstrapNotTaken = text;
+        readiness.rebootstrapNotTaken(text);
+        final long now = clock.nanoTime();
+        if (notTakenLogged && now - nextNotTakenLogNs < 0) {
+            notTakenSuppressed++;
+            return;
+        }
+        notTakenLogged = true;
+        nextNotTakenLogNs = now + TimeUnit.MILLISECONDS.toNanos(cfg.rebootstrapNotTakenLogMs);
+        System.err.println("[REPLICA] " + text + " (pull: " + r.text() + "; not taken total "
+                + rebootstrapNotTakenTotal + ", lines suppressed since the last " + notTakenSuppressed
+                + "); following continues");
+        notTakenSuppressed = 0;
+    }
+
+    /** Pure: the {@code re-bootstrap not taken} reason, plain about which case it is. */
+    static String notTakenText(final long lStop, final Set<com.openexchange.cluster.shadow.ShadowKind> kinds,
+                               final ShadowPuller.Report r) {
+        final String k = kinds.size() == 1 ? String.valueOf(kinds.iterator().next())
+                : new java.util.TreeSet<>(kinds.stream().map(String::valueOf).toList()).toString();
+        if (r.candidates() == 0) {
+            return "re-bootstrap not taken: no source lists a shadow of kind " + k + " above L.stop=" + lStop;
+        }
+        return "re-bootstrap not taken: " + r.candidates() + " candidates of kind " + k + " above L.stop=" + lStop
+                + ", none pulled and VERIFIED";
+    }
+
+    /** {@code FATAL replica: re-bootstrap refused: <reason>. Runbook: ...}. */
+    static String rebootstrapRefusal(final String reason, final String runbook) {
+        return REBOOTSTRAP_REFUSED + reason + ". " + runbook;
     }
 
     /** Open a replay only when it can carry bytes. */
@@ -854,7 +1168,8 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
      *         not decode, or after a refusal
      */
     private boolean checkCluster() {
-        final GenesisGuard.Outcome o = genesisGuard.check(localShadowGenesis);
+        final GenesisGuard.Outcome o = genesisGuard.check(clusterCheckGenesis(localShadowGenesis, knownGenesis,
+                cfg.off));
         switch (o) {
             case REFUSED:
                 refuseCluster(genesisGuard.refusal());
@@ -865,6 +1180,18 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
             default:
                 return true;
         }
+    }
+
+    /**
+     * The genesis the cluster check compares against: the local shadows' genesis, else (a genesis start) the genesis
+     * the engine adopted, 0 before the ADOPT.
+     */
+    static long clusterCheckGenesis(final long localShadowGenesis, final long knownGenesis,
+                                    final Set<ReplicaNegativeControl> off) {
+        if (off.contains(ReplicaNegativeControl.GENESIS_CHECK_LOCAL_ONLY)) {
+            return localShadowGenesis;
+        }
+        return localShadowGenesis != 0 ? localShadowGenesis : knownGenesis;
     }
 
     /**
@@ -1019,6 +1346,26 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
 
     public boolean bootstrapDone() {
         return bootstrapDone;
+    }
+
+    /** The {@code cluster.rebootstrap-<utc>} dir a decided re-bootstrap moves {@code cluster/} to, null when none. */
+    public String rebootstrapDir() {
+        return rebootstrapDir;
+    }
+
+    /** {@code shadow_replica_rebootstrap_total}. */
+    public long rebootstrapTotal() {
+        return rebootstrapTotal;
+    }
+
+    /** {@code shadow_replica_rebootstrap_not_taken_total}: attempts that found no shadow above L.stop. */
+    public long rebootstrapNotTakenTotal() {
+        return rebootstrapNotTakenTotal;
+    }
+
+    /** The puller of the bootstrap pull or of the last re-bootstrap attempt, null when none ran. */
+    public ShadowPuller lastPuller() {
+        return lastPuller;
     }
 
     /**

@@ -48,6 +48,10 @@ public final class ShadowHousekeeping implements Runnable {
         FLOOR_REGRESSED_TOTAL("shadow_floor_regressed_total"),
         ANCHOR_POSITION("shadow_anchor_position"),
         MARGIN_POSITION("shadow_margin_position"),
+        /** The most distinct producers at any covering position of the last evaluation. */
+        ANCHOR_WITNESSES("shadow_anchor_witnesses"),
+        /** Purge passes that found covering shadows but no two-producer witness (purged nothing). */
+        FLOOR_NO_WITNESS_TOTAL("shadow_floor_no_witness_total"),
         RETENTION_PURGED_TOTAL("shadow_retention_purged_total"),
         PINNED_COUNT("shadow_pinned_count"),
         PURGE_REFUSED_PINNED_TOTAL("shadow_purge_refused_pinned_total"),

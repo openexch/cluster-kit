@@ -10,6 +10,7 @@ import java.io.InputStream;
 import java.net.URISyntaxException;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -71,5 +72,39 @@ public class ShadowPackageScanTest {
         assertTrue(clock.toString(), clock.stream()
                 .anyMatch(f -> f.reference().equals("java/lang/System.currentTimeMillis")));
         System.out.println("NC SCAN_POSITIVE_CONTROLS -> " + driver.get(0) + " | " + log.get(0) + " | " + clock.get(0));
+    }
+
+    static final String PULLER = PKG + "ShadowPuller";
+
+    /** The puller never replays a remote recording: no replay call of the archive client, no {@code ShadowReplay}. */
+    static NeverSchedulesScan.Rules remoteReplayRules() {
+        return new NeverSchedulesScan.Rules(Set.of(PKG + "ShadowReplay"), List.of(), Set.of(),
+                java.util.Map.of("io/aeron/archive/client/AeronArchive",
+                        Set.of("startReplay", "startBoundedReplay", "replay", "boundedReplay")),
+                java.util.Map.of(), java.util.Map.of());
+    }
+
+    static void assertNoRemoteReplay(final List<NeverSchedulesScan.Finding> findings) {
+        if (!findings.isEmpty()) {
+            throw new AssertionError("remote replay in the puller: " + findings);
+        }
+    }
+
+    @Test
+    public void thePullerReadsSourcesThroughTheirControlChannelOnly() {
+        final Path main = classesOf(ShadowPuller.class);
+        final NeverSchedulesScan.Report puller = NeverSchedulesScan.scanDirectory(main,
+                n -> n.startsWith(PULLER), remoteReplayRules());
+        assertTrue("scanned " + puller.classesScanned(), puller.classesScanned() >= 1);
+        assertNoRemoteReplay(puller.findings());
+        // the package rule (no RecordingLog, no driver, no getProperty, no clock) covers the puller too
+        final NeverSchedulesScan.Report strict = NeverSchedulesScan.scanDirectory(main, n -> n.startsWith(PULLER)
+                || n.startsWith(PKG + "ShadowPullSettings"), NeverSchedulesScan.Rules.shadow());
+        assertTrue(strict.findings().toString(), strict.clean());
+        assertTrue("every local replay is IPC", ShadowAlias.REPLAY_CHANNEL.startsWith("aeron:ipc"));
+        final List<NeverSchedulesScan.Finding> probe = NeverSchedulesScan.scanClass(PKG + "ForbiddenRemoteReplayProbe",
+                bytes(ForbiddenRemoteReplayProbe.class), remoteReplayRules());
+        ShadowRig.nc("remote replay probe", "remote replay in the puller", () -> assertNoRemoteReplay(probe));
+        ShadowRig.green("puller scan: " + puller.classesScanned() + " class(es), no replay call, no ShadowReplay");
     }
 }

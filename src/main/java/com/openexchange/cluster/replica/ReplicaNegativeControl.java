@@ -54,5 +54,28 @@ public enum ReplicaNegativeControl {
     /** History fence: own shadows above the purge bound are kept (no suspect purge before the exit). */
     SUSPECT_PURGE_OFF,
     /** History fence: the suspect purge is requested but not awaited (the exit races it). */
-    SUSPECT_PURGE_NOT_AWAITED
+    SUSPECT_PURGE_NOT_AWAITED,
+    /** Genesis: the cluster check is passed the local shadows' genesis only (0 after a genesis start, for good). */
+    GENESIS_CHECK_LOCAL_ONLY,
+    /** Re-bootstrap: any supplier replay refusal counts, not only the replay-below-start one. */
+    REBOOTSTRAP_ON_ANY_REPLAY_FAILURE,
+    /**
+     * Re-bootstrap: decided without a VERIFIED shadow above L.stop (neither one pulled in this attempt nor one already
+     * held locally).
+     */
+    REBOOTSTRAP_WITHOUT_PULL,
+    /**
+     * Re-bootstrap: only a shadow pulled in this attempt decides; a VERIFIED local shadow above L.stop held from before
+     * (a process that stopped between the decision and the move) is ignored, and the replica idles.
+     */
+    REBOOTSTRAP_LOCAL_SHADOW_OFF,
+    /** Re-bootstrap: {@code cluster/} is moved aside before the backup and the archive are closed. */
+    RENAME_BEFORE_BACKUP_CLOSE,
+    /** Re-bootstrap: the loop guard never refuses. */
+    REBOOTSTRAP_LOOP_GUARD_OFF,
+    /**
+     * Stop: a pull on the reader thread ignores the follower's stop and runs to its deadline
+     * ({@code SHADOW_PULL_STARTUP_WAIT_MS}); the close waits for it (the rule before the pull took the host's stop).
+     */
+    STOP_WAITS_FOR_PULL
 }

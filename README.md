@@ -84,7 +84,8 @@ Other settings are read by the engines and validated by the kit: the auth key
 table and client credential (names per engine, see [docs/auth.md](docs/auth.md)),
 the snapshot cadence thresholds (`SnapshotCadence`, defaults 1 GiB of log or
 5 minutes), and the shadow settings `SHADOW_TERM_LENGTH`, `SHADOW_SCAN_PERIOD_MS`,
-`SHADOW_DEEP_READ_PACE_MS`, `SHADOW_RETAIN_N`, `SHADOW_FLOOR_MARGIN` (ranges in
+`SHADOW_DEEP_READ_PACE_MS`, `SHADOW_RETAIN_N`, `SHADOW_FLOOR_MARGIN`,
+`SHADOW_ANCHOR_RULE` and the `SHADOW_PULL_*` puller settings (ranges in
 [docs/shadow.md](docs/shadow.md)). The engine READMEs list the names they read.
 
 ## License

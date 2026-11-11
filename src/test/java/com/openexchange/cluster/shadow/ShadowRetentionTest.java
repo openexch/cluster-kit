@@ -252,4 +252,47 @@ public class ShadowRetentionTest {
             }
         }
     }
+
+    /**
+     * Under the two-producer anchor rule the pins are the witnessed anchor (every copy of it), the margin and the
+     * newest VERIFIED; a single-producer newest VERIFIED stays pinned as the newest. Control: the anchor pin off,
+     * retention purges the only witness pair.
+     */
+    static void witnessPairPinned(final Set<NegativeControl> off) {
+        try (FloorRig r = new FloorRig()) {
+            r.shadow(P_1, SAFE_SEQ);
+            final byte[] image = FloorRig.payload(P_CM);
+            r.shadow(P_CM, SAFE_SEQ, image, ShadowRig.R3, ShadowKind.ALIGNED);
+            r.shadow(P_CM, SAFE_SEQ, image, ShadowRig.F1, ShadowKind.ALIGNED);
+            r.shadow(FloorRig.P_A, SAFE_SEQ);
+            final ShadowCatalog c = r.rig.catalog();
+            c.verifyAllComplete();
+            final ShadowFloor floor = r.floor(ShadowFloor.Margin.PREVIOUS_VERIFIED,
+                    ShadowFloor.AnchorRule.TWO_PRODUCERS, Set.of());
+            final ShadowRetention retention = new ShadowRetention(c, floor, 1, r.hk,
+                    off.isEmpty() ? java.util.EnumSet.noneOf(NegativeControl.class) : java.util.EnumSet.copyOf(off));
+            try {
+                final ShadowRetention.Pass pass = retention.apply(c.scan());
+                final Scan after = c.scan();
+                final ShadowCatalog.Answer anchor = after.equalAt(P_CM);
+                if (anchor.kind() != ShadowCatalog.Answer.Kind.FOUND || anchor.shadow().producers().size() != 2) {
+                    throw new AssertionError("the only witness pair was purged by retention: " + pass.purged());
+                }
+                assertTrue(pass.pinnedPositions().toString(), pass.pinnedPositions().containsAll(
+                        Set.of(P_1, P_CM, FloorRig.P_A)));
+                assertEquals("the single-producer newest stays", ShadowCatalog.Answer.Kind.FOUND,
+                        after.equalAt(FloorRig.P_A).kind());
+                ShadowRig.green("retention under two-producers: pins " + pass.pinnedPositions());
+            } finally {
+                retention.close();
+            }
+        }
+    }
+
+    @Test
+    public void theWitnessPairIsPinnedUnderTwoProducers() {
+        witnessPairPinned(Set.of());
+        nc("RETENTION_ANCHOR_PIN_OFF", "the only witness pair was purged by retention",
+                () -> witnessPairPinned(Set.of(NegativeControl.RETENTION_ANCHOR_PIN_OFF)));
+    }
 }

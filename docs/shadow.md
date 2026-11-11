@@ -120,6 +120,12 @@ service message of a snapshot recording and answers FULL, STUB or UNKNOWN.
   can restore from covers it. `SHADOW_FLOOR_MARGIN` is `previous-verified`
   (keep the log from the newest restorable shadow below the anchor) or `none`
   (prune to `P_cm` once a covering shadow exists).
+- `SHADOW_ANCHOR_RULE` `two-producers` (default) or `any-verified` (CRITICAL
+  at boot): under `two-producers` only an ALIGNED shadow whose payload digest
+  two distinct producers wrote anchors a purge below `P_cm`. Two copies of one
+  producer are one witness. One producer's shadow still restores and can be the
+  margin. Covering shadows without a witness evaluate `NO_WITNESS` (purge
+  nothing, `shadow_floor_no_witness_total`, `shadow_anchor_witnesses`).
 
 A floor lower than the log's current start is counted
 `shadow_floor_regressed_total` and changes nothing on disk.
@@ -138,6 +144,61 @@ never purges CONFLICT, FOREIGN, CORRUPT, HEADER_INVALID, TRAILER_MISMATCH,
 TRAILER_VERSION_UNSUPPORTED, ALIAS_*, SCAN_ERROR, ACTIVE, TOO_SHORT or
 NO_TRAILER copies; those are counted `shadow_retention_skipped_non_usable` and
 removing them is an operator action (`force` plus a reason).
+
+## Pulling shadows
+
+`ShadowPuller` copies shadows from the archives in `SHADOW_PULL_SOURCES` (an
+ordered allowlist of `host:port` archive control endpoints, never derived;
+empty = disabled with the CRITICAL line `shadow puller disabled:
+SHADOW_PULL_SOURCES is empty`; this node's own endpoint is refused). It talks
+to a source only through its archive control channel: a listing, then
+`replicate`. It never replays a remote recording and never reads another
+process's endpoint, disk or environment.
+
+A candidate is stopped, long enough for a header and a trailer, of this engine,
+cluster and (when known) genesis, of a kind in `SHADOW_PULL_KINDS` (default
+ALIGNED; widening logs CRITICAL), and not held by a usable local copy with the
+same full alias. In steady state a candidate is above the newest VERIFIED
+local position, with one exception: an ALIGNED at a position this node already
+holds usable ALIGNED copies of, all from one producer, is pulled when another
+producer wrote it. That copy is the second witness the two-producer anchor
+needs. Once two producers are held at a position, nothing more is pulled there.
+Positions below the newest VERIFIED one that the node never held are not
+pulled.
+
+A copy is complete only after SYNC, or after it ended with the source's
+length. Only then does the local catalog classify it, and the deep read verify
+it.
+
+| Class | Action |
+|---|---|
+| archive refusal (GENERIC with the source's text, MAX_RECORDINGS, REPLICATION_CONNECTION_FAILURE, STORAGE_SPACE) | partial purged, retried with backoff |
+| INCOMPLETE (ended short, no error: the source died) | partial purged, retried |
+| TIMEOUT (`SHADOW_PULL_TIMEOUT_MS`, or the startup deadline) | stopped, purged, retried |
+| content (a complete copy that is not COMPLETE locally or reads CORRUPT) | purged; the source recording is refused for the life of the process; CRITICAL |
+| CONFLICT with a local copy | kept; never anchors |
+
+When a source archive stops mid-copy, Aeron ends the replication one of two
+ways, depending on timing: the copy ends short without SYNC and without an
+error (INCOMPLETE), or the source connection reports an error such as `not
+connected` (an archive refusal). Both are retried with backoff. Neither is a
+content refusal. A corrupt source copy can be listed for a moment by a peer
+that has just pulled it (the same alias in another archive, until that peer
+purges it). A puller that lists that peer may refuse it a second time, as a
+second source recording. Each source recording is refused once and never
+pulled again.
+
+Settings: `SHADOW_PULL_PERIOD_MS` 5000 (500..3 600 000),
+`SHADOW_PULL_STARTUP_WAIT_MS` 60 000 (1000..86 400 000, the one bound of a
+startup pull), `SHADOW_PULL_TIMEOUT_MS` 120 000 (1000..86 400 000),
+`SHADOW_PULL_RETRY_BACKOFF_MS` 5000 (100..3 600 000, doubling to 8x, reset on
+success), `SHADOW_PULL_MAX_INFLIGHT` 1 (1..3; sources per node x inflight <= 3
+per source), `SHADOW_PULL_REPLICATION_ENDPOINT` and
+`SHADOW_PULL_RESPONSE_ENDPOINT` (empty = `<host>:0`; set both on an isolated
+host, and keep the retry backoff at or above 5 s, the source's replay linger).
+
+A LEADER never pulls: while the role is LEADER a pass lists and starts nothing,
+and every in-flight pull is stopped and its partial copy purged.
 
 ## Writer edge cases
 

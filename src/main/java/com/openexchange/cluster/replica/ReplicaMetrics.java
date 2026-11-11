@@ -65,6 +65,18 @@ public final class ReplicaMetrics {
         line(sb, "shadow_replica_backup_resets_total", events.resets());
         line(sb, "shadow_replica_backup_auth_rejected_total", events.authRejected());
         line(sb, "shadow_replica_backup_replay_failures_total", events.replayFailures());
+        line(sb, "shadow_replica_backup_replay_below_start_total", events.replayBelowStart());
+        line(sb, "shadow_replica_rebootstrap_total", follower.rebootstrapTotal());
+        line(sb, "shadow_replica_rebootstrap_not_taken_total", follower.rebootstrapNotTakenTotal());
+        final com.openexchange.cluster.shadow.ShadowPuller puller = follower.lastPuller();
+        if (puller != null) {
+            for (final com.openexchange.cluster.shadow.ShadowPuller.Counter c
+                    : com.openexchange.cluster.shadow.ShadowPuller.Counter.values()) {
+                line(sb, c.metricName(), puller.counters().get(c));
+            }
+            puller.counters().refusedByReason().forEach((reason, n) ->
+                    line(sb, "shadow_pull_refused_total{reason=\"" + reason + "\"}", n));
+        }
         line(sb, "shadow_replica_live_recording_alive", follower.liveRecordingAlive() ? 1 : 0);
         line(sb, "shadow_replica_reader_reattach_total", follower.reattachTotal());
         line(sb, "replica_attach_attempts_total", follower.attachAttemptsTotal());

@@ -38,4 +38,31 @@ public class BackupEventsTest {
         assertEquals(1, e.replayFailures());
         assertEquals(1, e.otherFailures());
     }
+
+    static final String BELOW_START = "Live log replay failed (replaySessionId=-1): errorMessage=requested replay start"
+            + " position=1024 is less than recording start position=65536 for recording 0, errorCode=INVALID_POSITION";
+
+    /**
+     * A supplier that pruned below the requested position is its own class, counted in a row; a MAX_REPLAYS storm
+     * never qualifies and resets the run, as does live log progress.
+     */
+    @Test
+    public void aReplayBelowTheSuppliersStartIsCountedInARow() {
+        final BackupEvents e = new BackupEvents(SystemNanoClock.INSTANCE);
+        for (int i = 0; i < 3; i++) {
+            e.onPossibleFailure(new ClusterException(BELOW_START));
+        }
+        assertEquals(3, e.replayBelowStart());
+        assertEquals(3, e.replayBelowStartConsecutive());
+        assertEquals(3, e.replayFailures());
+        e.onPossibleFailure(new ClusterException("Live log replay failed (replaySessionId=-1): errorMessage=max"
+                + " concurrent replays reached 10, errorCode=MAX_REPLAYS"));
+        assertEquals("a MAX_REPLAYS refusal resets the run", 0, e.replayBelowStartConsecutive());
+        assertEquals(3, e.replayBelowStart());
+        e.onPossibleFailure(new ClusterException(BELOW_START));
+        e.onLiveLogProgress(0, 1, 2048);
+        assertEquals("live progress resets the run", 0, e.replayBelowStartConsecutive());
+        assertEquals(4, e.replayBelowStart());
+        assertEquals(false, BackupEvents.isReplayBelowStart("Live log replay failed: ERROR"));
+    }
 }

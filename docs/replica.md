@@ -24,8 +24,10 @@ an environment variable; the engine README lists the setting names (in core:
 
 Media driver: embedded (dev, demo, tests) or an external `aeronmd`
 (production). Close order: endpoint, follower (reader, then writer, so an
-in-flight write aborts), housekeeping, clients, backup, archive, driver. Exit
-code 1 on any fault, 143 on a signal, never 0 on a fault.
+in-flight write aborts), housekeeping, clients, backup, archive, driver, then
+(a decided re-bootstrap only) `cluster/` moved aside. Exit code 1 on any fault,
+3 on a decided re-bootstrap (the unit restarts it: `RestartForceExitStatus=3`),
+143 on a signal, never 0 on a fault.
 
 ## Bootstrap
 
@@ -37,10 +39,81 @@ that matches:
 | Shadows of two or more geneses | Refuse, exit 1. |
 | A usable shadow at or above the start of L | Restore from it. The replica starts UNVERIFIED (below). |
 | No shadow, L starts at 0 | Replay from genesis. Verified from the start. |
-| No shadow, L starts above 0 | Refuse with a runbook: copy a VERIFIED shadow of this genesis from a member into `BASE_DIR/archive`, or wipe `BASE_DIR` while a member still holds the log from 0. |
+| No shadow (or every one below the start of L), L starts above 0, `SHADOW_PULL_SOURCES` set | Pull the newest ALIGNED with `P_s >= L.start` from the sources, verify it locally, restore from it (`restore_path` PULLED_SHADOW, code 3). Candidates of two or more geneses across the sources refuse, exit 1. |
+| No shadow, L starts above 0, nothing pulled | Refuse with a runbook: copy a VERIFIED shadow of this genesis from a member into `BASE_DIR/archive`, or wipe `BASE_DIR` while a member still holds the log from 0. The text ends with ` pull: disabled` or ` pull: tried <n> sources, <c> candidates, refused <r>, last: <reason>`. |
 | Shadows exist, all refused or below the start of L | Refuse as above, with usable and refused counts. |
 
 One restore or genesis per process. A failure after the restore halts.
+
+## Re-bootstrap
+
+When the members pruned their logs past this replica's L, the supplier refuses
+every live log replay below its start (`Live log replay failed ...
+errorCode=INVALID_POSITION`, counted
+`shadow_replica_backup_replay_below_start_total`). After
+`SHADOW_REBOOTSTRAP_REPLAY_FAILURES` (3, 0..1000; 0 counts and never acts) such
+refusals in a row, with L's live recording not alive, and the loop guard
+passed, the follower looks for a VERIFIED shadow of this genesis above
+`L.stop`, of a kind `SHADOW_PULL_KINDS` accepts. It checks its own archive
+first; only when none is held does it pull an ALIGNED with `P_s > L.stop` from
+the sources and verify it. A shadow at or below `L.stop` never qualifies. A
+MAX_REPLAYS refusal or live log progress resets the run.
+
+The follower logs `CRITICAL replica re-bootstrap: members pruned past
+L.stop=<s> (<n> replay refusals); pulled ALIGNED at <P> from <source>; backup
+state will move to <dir>; restarting` (or `local VERIFIED ALIGNED at <P>
+already held`), counts `shadow_replica_rebootstrap_total`, and reads 503
+`rebootstrap: restarting`. The process close moves `BASE_DIR/cluster` to
+`BASE_DIR/cluster.rebootstrap-<utc>` after the backup and the archive closed,
+keeps the newest `SHADOW_REBOOTSTRAP_KEEP` (2, 1..100) moved dirs, and exits 3.
+The restart records a new L from the supplier's start and restores from the
+shadow. The old recordings are orphans that housekeeping purges.
+
+A process that stopped between the decision and the move (kill -9, or a media
+driver loss, which exits 3 without the close) keeps the shadow and `cluster/`.
+The next start restores from that shadow, sees the same refusals and decides
+again from the local shadow, without a pull. The rule reads only the archive
+and `rebootstrap.count`; the backup's mark files are recovered by Aeron's
+liveness timeout. A replica without `SHADOW_PULL_SOURCES` re-bootstraps when
+the operator copied such a shadow into `BASE_DIR/archive`.
+
+Loop guard: `BASE_DIR/rebootstrap.count` holds one epoch ms per decision. More
+than `SHADOW_REBOOTSTRAP_MAX_CONSECUTIVE` (3, 1..100) inside
+`SHADOW_REBOOTSTRAP_WINDOW_MS` (3 600 000, 60 000..604 800 000) refuses, exit 1.
+Nothing deletes `cluster/` or edits the backup RecordingLog. The replica slot is
+stable for the life of `BASE_DIR`: one slot per replica.
+
+Refusals start with `FATAL replica: re-bootstrap refused: ` followed by the
+reason and a runbook: `re-bootstrap loop: <n> in <w> ms; members prune faster
+than this replica catches up`, or `re-bootstrap needs SHADOW_PULL_SOURCES (...
+L.stop=<s>, no local VERIFIED shadow above it)`. The text `no local shadow and
+the cluster log starts at` belongs to bootstrap only.
+
+When no qualifying shadow is held and no source lists one above `L.stop`, the
+replica does not exit. `/ready` reads 503 `re-bootstrap not taken: no source
+lists a shadow of kind ALIGNED above L.stop=<s>`, or `<c> candidates of kind
+ALIGNED above L.stop=<s>, none pulled and VERIFIED`. The line is logged at most
+once per `SHADOW_REBOOTSTRAP_NOT_TAKEN_LOG_MS` (60 000, 1000..86 400 000), and
+`shadow_replica_rebootstrap_not_taken_total` counts every attempt. While this
+lasts, every attempt lists each source once per `SHADOW_PULL_PERIOD_MS` for
+`SHADOW_PULL_STARTUP_WAIT_MS`, and the next attempt follows as soon as the next
+`SHADOW_REBOOTSTRAP_REPLAY_FAILURES` refusals arrived. A single replica stays
+here until a second producer writes an ALIGNED above its `L.stop`; until then,
+copy a VERIFIED shadow into `BASE_DIR/archive` or wipe `BASE_DIR`.
+
+A stop (SIGTERM or close) during a bootstrap or re-bootstrap pull ends the pull
+before its next pass instead of waiting for `SHADOW_PULL_STARTUP_WAIT_MS`: an
+in-flight copy is stopped and its partial recording purged by the puller's own
+thread, the stop is neither a refusal nor a "re-bootstrap not taken", and the
+process exits 143 within the usual close time.
+
+If the media driver is lost after a re-bootstrap was decided, the process still
+exits 3, because the restart was already decided. The components are not
+closed, so `cluster/` is not moved and the next start decides again.
+
+A genesis start compares every member snapshot named after its ADOPT against
+the adopted genesis. The housekeeping purge gate holds from the ADOPT until the
+first compare passes (`genesis check armed at ADOPT: genesisId <g>`).
 
 ## Trust after a restore
 
@@ -186,3 +259,9 @@ alert on: `shadow_replica_fenced`, `shadow_replica_verified`,
 `shadow_align_verify_timeouts_total`, `shadow_replica_internal_lag_bytes`,
 `shadow_replica_time_lag_ms`, `shadow_replica_backup_auth_rejected_total`.
 `shadow_oracle_match_total` equals `shadow_align_equal_total` by definition.
+Pull and re-bootstrap: `shadow_replica_backup_replay_below_start_total`,
+`shadow_replica_rebootstrap_total`, `shadow_replica_rebootstrap_not_taken_total`,
+and the puller's `shadow_pull_*` (`shadow_pull_total`,
+`shadow_pull_bytes_total`, `shadow_pull_retries_total`,
+`shadow_pull_refused_total{reason}`, `shadow_pull_source_unreachable_total`,
+`shadow_pull_aborted_leader_total`, `shadow_pull_skipped_leader_total`).

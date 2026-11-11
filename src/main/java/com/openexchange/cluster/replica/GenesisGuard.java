@@ -27,6 +27,11 @@ import java.util.Objects;
  *
  * <p>{@link #check} evaluates at most once per {@link AlignmentTrust#CHECK_PACE_NS}, like the attach path; between
  * evaluations it returns the last outcome.</p>
+ *
+ * <p>A genesis start calls it with 0 until its ADOPT frame is applied, then with the adopted genesis. That transition
+ * re-arms the check: {@link #checked} turns false at once (the purge gate holds), {@link #comparedOnce} stays true
+ * (readiness is unaffected), and every member snapshot named from then on is compared, so a kept re-genesis naming
+ * another genesis refuses instead of waiting.</p>
  */
 final class GenesisGuard {
 
@@ -68,6 +73,8 @@ final class GenesisGuard {
     private String refusal;
     private Named lastCompared;
     private long preAdoptRecording = Long.MIN_VALUE;
+    /** The genesis argument of the previous call, -1 before the first. */
+    private long lastArgument = -1;
     private String lastLogged;
     private volatile long evaluationsTotal;
     private volatile long comparesTotal;
@@ -88,6 +95,16 @@ final class GenesisGuard {
      * paced.
      */
     Outcome check(final long localGenesis) {
+        if (lastArgument == 0 && localGenesis > 0 && !off) {
+            // a genesis start reached its ADOPT: from now on every newly named member snapshot is compared against
+            // the adopted genesis, and the housekeeping gate holds until the first compare passes
+            checked = false;
+            lastCompared = null;
+            preAdoptRecording = Long.MIN_VALUE;
+            nextCheckNs = clock.nanoTime();
+            System.out.println("[REPLICA] genesis check armed at ADOPT: genesisId " + localGenesis);
+        }
+        lastArgument = localGenesis;
         final long now = clock.nanoTime();
         if (now - nextCheckNs < 0) {
             return last;

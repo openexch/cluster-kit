@@ -19,6 +19,7 @@ import org.agrona.concurrent.SystemEpochClock;
 import org.agrona.concurrent.SystemNanoClock;
 import org.agrona.concurrent.status.CountersReader;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Objects;
@@ -33,8 +34,14 @@ import java.util.concurrent.atomic.AtomicLong;
  * embedded (dev, demo, tests)  ClusterBackupMediaDriver.launch(driver, archive, backup)   (CBMD:84-115)
  * external (production)        host.awaitExternalDriver, Archive.launch, ClusterBackup.launch (AC:157-188)
  * close order                  endpoint, follower (reader, then writer: an in-flight write aborts), housekeeping,
- *                              clients, backup, archive, driver
+ *                              clients, backup, archive, driver, then (a decided re-bootstrap only) cluster/ moved
+ *                              to cluster.rebootstrap-&lt;utc&gt;
  * </pre>
+ *
+ * <p>A re-bootstrap: the follower marks it and asks {@code host.restart(3, reason)}; this close moves
+ * {@code BASE_DIR/cluster} aside after the backup and the archive closed (the backup's mark file and RecordingLog go
+ * with it), keeps the newest {@code SHADOW_REBOOTSTRAP_KEEP} moved dirs, and the lifecycle exits 3. Nothing deletes
+ * {@code cluster/} or edits the backup RecordingLog.</p>
  *
  * <p>Errors: the one AC:109-124 shape (count, log, {@code host.onError(t, external)}: driver loss halts at once with
  * exit 1). The backup's termination hook (an {@code AgentTerminationException} in the agent, e.g. STORAGE_SPACE,
@@ -66,6 +73,14 @@ public final class ReplicaProcess implements AutoCloseable {
         default void hold(final String reason) {
             System.err.println("[REPLICA] HOLD: " + reason + " (the process stays up until it is stopped)");
         }
+
+        /**
+         * A decided restart: stop the process, which exits {@code code} ({@link EngineLifecycle#EXIT_RESTART}) after
+         * the close. A host without a restart path exits 1 with the reason.
+         */
+        default void restart(final int code, final String reason) {
+            fatal(reason + " (this host has no restart path: exit 1)");
+        }
     }
 
     public static Host of(final EngineLifecycle lifecycle) {
@@ -85,6 +100,11 @@ public final class ReplicaProcess implements AutoCloseable {
             public void awaitExternalDriver(final String aeronDir, final long timeoutMs) {
                 lifecycle.awaitExternalDriver(aeronDir, timeoutMs);
             }
+
+            @Override
+            public void restart(final int code, final String reason) {
+                lifecycle.restart(code, reason);
+            }
         };
     }
 
@@ -94,6 +114,9 @@ public final class ReplicaProcess implements AutoCloseable {
     private final NanoClock clock = SystemNanoClock.INSTANCE;
     private final EpochClock wall = SystemEpochClock.INSTANCE;
     private volatile boolean closing;
+    /** Where a re-bootstrap moved cluster/, null when it did not; and whether the backup was closed by then. */
+    private volatile File movedClusterDir;
+    private volatile boolean movedAfterBackupClosed;
 
     private ClusterBackupMediaDriver embedded;
     private Archive archiveProcess;
@@ -196,6 +219,11 @@ public final class ReplicaProcess implements AutoCloseable {
             public void hold(final String reason) {
                 host.hold(reason);
             }
+
+            @Override
+            public void restart(final String reason) {
+                host.restart(EngineLifecycle.EXIT_RESTART, reason);
+            }
         };
         follower = new ReplicaFollower(cfg, engine, aeron, followerArchive, ReplicaContexts.localArchiveClient(cfg),
                 events, readiness, shadowCounters, verdicts, clock, ReplicaContexts.idle(cfg), halt);
@@ -292,12 +320,55 @@ public final class ReplicaProcess implements AutoCloseable {
         CloseHelper.quietClose(housekeeping);
         CloseHelper.quietClose(followerArchive);
         CloseHelper.quietClose(aeron);
+        final String rebootstrap = follower == null ? null : follower.rebootstrapDir();
+        final boolean early = rebootstrap != null
+                && cfg.off.contains(ReplicaNegativeControl.RENAME_BEFORE_BACKUP_CLOSE);
+        if (early) {
+            System.err.println("[REPLICA] NC RENAME_BEFORE_BACKUP_CLOSE: cluster/ moved before the backup closed");
+            moveClusterAside(rebootstrap, false);
+        }
         if (embedded != null) {
             CloseHelper.quietClose(embedded);
         } else {
             CloseHelper.quietClose(backup);
             CloseHelper.quietClose(archiveProcess);
         }
+        if (rebootstrap != null && !early) {
+            moveClusterAside(rebootstrap, true);
+        }
         System.out.println("[REPLICA] closed");
+    }
+
+    /** The re-bootstrap's move: {@code BASE_DIR/cluster} to {@code BASE_DIR/<dir>}, then the keep bound. */
+    private void moveClusterAside(final String dir, final boolean backupClosed) {
+        final File cluster = cfg.clusterDir();
+        try {
+            if (RebootstrapGuard.moveAside(cluster, dir)) {
+                movedClusterDir = new File(cluster.getParentFile(), dir);
+                movedAfterBackupClosed = backupClosed;
+                System.err.println("[REPLICA] re-bootstrap: moved " + cluster + " to " + movedClusterDir
+                        + (backupClosed ? " after the backup and the archive closed" : ""));
+            } else {
+                System.err.println("[REPLICA] re-bootstrap: no " + cluster + " to move");
+            }
+            final java.util.List<String> deleted = RebootstrapGuard.pruneMoved(cfg.baseDir, cfg.rebootstrapKeep);
+            if (!deleted.isEmpty()) {
+                System.out.println("[REPLICA] re-bootstrap: deleted the oldest moved dirs " + deleted
+                        + " (SHADOW_REBOOTSTRAP_KEEP=" + cfg.rebootstrapKeep + ")");
+            }
+        } catch (final RuntimeException failed) {
+            System.err.println("[REPLICA] CRITICAL: re-bootstrap move of " + cluster + " failed: " + failed
+                    + "; the restart keeps the old backup state");
+        }
+    }
+
+    /** Where a re-bootstrap moved {@code cluster/} in this close, null when none. */
+    public File movedClusterDir() {
+        return movedClusterDir;
+    }
+
+    /** Whether the re-bootstrap move ran after the backup and the archive were closed. */
+    public boolean movedAfterBackupClosed() {
+        return movedAfterBackupClosed;
     }
 }

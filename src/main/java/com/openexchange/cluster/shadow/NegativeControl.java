@@ -51,5 +51,36 @@ enum NegativeControl {
      */
     FLOOR_SKIP_ANY_ABOVE,
     /** Retention purges CONFLICT copies like usable ones (deletion picks a winner). */
-    RETENTION_PURGES_CONFLICT
+    RETENTION_PURGES_CONFLICT,
+    /** Retention does not pin the floor's anchor position (the witnessed pair is purged like any other). */
+    RETENTION_ANCHOR_PIN_OFF,
+    /** The floor's anchor rule is read as any-verified whatever the setting says. */
+    ANCHOR_RULE_IGNORED,
+    /** Witnesses are counted per recording instead of per distinct producer. */
+    WITNESS_BY_RECORDING,
+    /** Copies of any kind witness an anchor, not only ALIGNED ones. */
+    ANCHOR_ANY_KIND,
+    /** Puller: a copy that ended without SYNC and short of the source is judged for content. */
+    INCOMPLETE_AS_CONTENT,
+    /** Puller: an ACTIVE source recording (stop position NULL) is a candidate. */
+    PULL_ACTIVE_ALLOWED,
+    /** Puller: an archive refusal is counted as a corrupt copy and the source refused for the process. */
+    PULL_RETRY_AS_CONTENT,
+    /** Puller: a content refusal is retried with backoff instead of refusing the source recording. */
+    PULL_CONTENT_AS_RETRY,
+    /** Puller: the leader gate is off (the leader lists and pulls). */
+    LEADER_GATE_OFF,
+    /** Puller: the leader gate skips new pulls but lets in-flight ones finish. */
+    LEADER_FINISHES_INFLIGHT,
+    /** Puller: discovery dedupes by producer and seq instead of the full alias. */
+    DEDUPE_BY_SEQ,
+    /** Puller: discovery dedupes against every local copy, evidence states included. */
+    DEDUPE_AGAINST_EVIDENCE,
+    /** Puller: every kind is a candidate whatever {@code SHADOW_PULL_KINDS} says. */
+    PULL_KINDS_ANY,
+    /**
+     * Puller: steady-state discovery skips every position at or below the newest VERIFIED one, a second producer's
+     * ALIGNED at a held position included (the second witness is never pulled).
+     */
+    WITNESS_PULL_OFF
 }

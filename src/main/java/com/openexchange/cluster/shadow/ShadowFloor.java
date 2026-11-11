@@ -32,9 +32,16 @@ import java.util.function.Supplier;
  * R        = VERIFIED v with v.P_s <= P_cm, or v == skip (FOUND) and skipSafe(v)   (restorable by THIS node)
  * covering = { v in R : v.P_s >= P_cm }; empty -> 0 (no purge below P_cm without a covering local shadow)
  * anchor   = the OLDEST covering shadow
+ * rule two-producers       -> covering restricted to ALIGNED groups whose VERIFIED copies come from two or more
+ *                             distinct producers; covering but none witnessed -> NO_WITNESS, 0
  * margin none              -> P_cm
  * margin previous-verified -> prev = newest v in R below anchor; none -> 0; else min(P_cm, prev.P_s)
  * </pre>
+ *
+ * <p>The anchor rule ({@code SHADOW_ANCHOR_RULE}): below P_cm a member purges only behind an ALIGNED shadow whose
+ * payload digest two distinct producers wrote (two copies of one producer are one witness; a STANDBY agreed by two is
+ * no anchor). One producer's shadow still restores and still counts as the margin; it never anchors. A producer is a
+ * configured slot ({@code R<slot>}, {@code F<memberId>}), not a proof of independence.</p>
  *
  * <p>{@code restorable} mirrors the restore order exactly: SKIP tries only the newest usable position
  * above P_cm and abandons SKIP for the boot when it is CONFLICT, not skip-safe or refused, so an older VERIFIED shadow
@@ -81,6 +88,41 @@ public final class ShadowFloor implements LongSupplier {
         }
     }
 
+    /** {@code SHADOW_ANCHOR_RULE}. */
+    public enum AnchorRule {
+        /** Any covering restorable VERIFIED shadow anchors (one producer is enough; the replica's own floor). */
+        ANY_VERIFIED("any-verified"),
+        /** Only an ALIGNED shadow two distinct producers wrote with one digest anchors (the member default). */
+        TWO_PRODUCERS("two-producers");
+
+        private final String text;
+
+        AnchorRule(final String text) {
+            this.text = text;
+        }
+
+        public String text() {
+            return text;
+        }
+
+        /** @throws IllegalArgumentException with the anchor rule refusal text */
+        public static AnchorRule parse(final String value) {
+            for (final AnchorRule r : values()) {
+                if (r.text.equals(value)) {
+                    return r;
+                }
+            }
+            throw new IllegalArgumentException("SHADOW_ANCHOR_RULE '" + value
+                    + "' (expected two-producers|any-verified)");
+        }
+
+        /** The CRITICAL boot line a member prints for this rule, or null. */
+        public String criticalLine() {
+            return this == ANY_VERIFIED ? "SHADOW_ANCHOR_RULE=any-verified: one producer's shadow anchors a log purge"
+                    + " below P_cm (a poisoned shadow can then be the only way back)" : null;
+        }
+    }
+
     /** The newest snapshot group's service payload, as the host reads it ({@link StubPeek}). */
     public enum NewestImage {
         /** A full service image: the floor answers P_cm (today's pruning). */
@@ -93,7 +135,7 @@ public final class ShadowFloor implements LongSupplier {
 
     /** One evaluation of the table above. Positions are -1 where absent. */
     public record Evaluation(Kind kind, long latestSnapshotPosition, long floor, LogicalShadow anchor,
-                             LogicalShadow margin, List<LogicalShadow> restorable) {
+                             LogicalShadow margin, List<LogicalShadow> restorable, int witnesses) {
 
         public enum Kind {
             /** The scan cannot answer: errors, or the startup pass is not done. Purge nothing. */
@@ -108,12 +150,24 @@ public final class ShadowFloor implements LongSupplier {
             NO_COVERING,
             /** A covering anchor but no restorable shadow below it while the margin is on: purge nothing. */
             NO_MARGIN,
+            /**
+             * Covering shadows exist but none is witnessed by two distinct producers under
+             * {@link AnchorRule#TWO_PRODUCERS}: purge nothing.
+             */
+            NO_WITNESS,
             /** A floor above zero may apply. */
             FLOOR
         }
 
         public Evaluation {
             restorable = List.copyOf(restorable);
+        }
+
+        /** The shape without a witness count (-1: not evaluated). */
+        public Evaluation(final Kind kind, final long latestSnapshotPosition, final long floor,
+                          final LogicalShadow anchor, final LogicalShadow margin,
+                          final List<LogicalShadow> restorable) {
+            this(kind, latestSnapshotPosition, floor, anchor, margin, restorable, -1);
         }
 
         public long anchorPosition() {
@@ -128,7 +182,7 @@ public final class ShadowFloor implements LongSupplier {
         public String toString() {
             return "Floor{" + kind + " floor=" + floor + " P_cm=" + latestSnapshotPosition + " anchor="
                     + anchorPosition() + " margin=" + marginPosition() + " restorable="
-                    + restorable.stream().map(LogicalShadow::logPosition).toList() + "}";
+                    + restorable.stream().map(LogicalShadow::logPosition).toList() + " witnesses=" + witnesses + "}";
         }
     }
 
@@ -136,6 +190,7 @@ public final class ShadowFloor implements LongSupplier {
     private final Supplier<NewestImage> newestImage;
     private final Predicate<ShadowHeader> skipSafe;
     private final Margin margin;
+    private final AnchorRule rule;
     private final LongSupplier logStartPosition;
     private final ShadowHousekeeping.Counters counters;
     private final Set<NegativeControl> off;
@@ -151,22 +206,32 @@ public final class ShadowFloor implements LongSupplier {
      * @param newestImage            the newest group's service payload kind (the precondition of the table)
      * @param skipSafe               the skip rule over this node's journal tail: may a shadow above P_cm be SKIP-restored here
      * @param margin                 {@code SHADOW_FLOOR_MARGIN}
+     * @param rule                   {@code SHADOW_ANCHOR_RULE}
      * @param logStartPosition       the local log recording's start position, read from the archive on each call
      */
     public ShadowFloor(final LongSupplier latestSnapshotPosition, final Supplier<NewestImage> newestImage,
-                       final Predicate<ShadowHeader> skipSafe, final Margin margin,
+                       final Predicate<ShadowHeader> skipSafe, final Margin margin, final AnchorRule rule,
                        final LongSupplier logStartPosition, final ShadowHousekeeping.Counters counters) {
-        this(latestSnapshotPosition, newestImage, skipSafe, margin, logStartPosition, counters,
+        this(latestSnapshotPosition, newestImage, skipSafe, margin, rule, logStartPosition, counters,
                 EnumSet.noneOf(NegativeControl.class));
     }
 
     ShadowFloor(final LongSupplier latestSnapshotPosition, final Supplier<NewestImage> newestImage,
                 final Predicate<ShadowHeader> skipSafe, final Margin margin, final LongSupplier logStartPosition,
                 final ShadowHousekeeping.Counters counters, final Set<NegativeControl> off) {
+        this(latestSnapshotPosition, newestImage, skipSafe, margin, AnchorRule.ANY_VERIFIED, logStartPosition,
+                counters, off);
+    }
+
+    ShadowFloor(final LongSupplier latestSnapshotPosition, final Supplier<NewestImage> newestImage,
+                final Predicate<ShadowHeader> skipSafe, final Margin margin, final AnchorRule rule,
+                final LongSupplier logStartPosition, final ShadowHousekeeping.Counters counters,
+                final Set<NegativeControl> off) {
         this.latestSnapshotPosition = Objects.requireNonNull(latestSnapshotPosition, "latestSnapshotPosition");
         this.newestImage = Objects.requireNonNull(newestImage, "newestImage");
         this.skipSafe = Objects.requireNonNull(skipSafe, "skipSafe");
         this.margin = Objects.requireNonNull(margin, "margin");
+        this.rule = Objects.requireNonNull(rule, "rule");
         this.logStartPosition = Objects.requireNonNull(logStartPosition, "logStartPosition");
         this.counters = Objects.requireNonNull(counters, "counters");
         this.off = off.isEmpty() ? EnumSet.noneOf(NegativeControl.class) : EnumSet.copyOf(off);
@@ -175,6 +240,30 @@ public final class ShadowFloor implements LongSupplier {
 
     public Margin margin() {
         return margin;
+    }
+
+    public AnchorRule rule() {
+        return rule;
+    }
+
+    /**
+     * The witnesses of one position group: the distinct producers among its VERIFIED ALIGNED copies (two copies of one
+     * producer are one witness).
+     */
+    int witnesses(final LogicalShadow v) {
+        final Set<String> producers = new java.util.HashSet<>();
+        int recordings = 0;
+        for (final ShadowEntry e : v.copies()) {
+            if (e.state() != ShadowEntry.State.VERIFIED || e.header() == null) {
+                continue;
+            }
+            if (e.header().kind() != ShadowKind.ALIGNED.code() && !off.contains(NegativeControl.ANCHOR_ANY_KIND)) {
+                continue;
+            }
+            producers.add(e.producer());
+            recordings++;
+        }
+        return off.contains(NegativeControl.WITNESS_BY_RECORDING) ? recordings : producers.size();
     }
 
     /** The scan the next evaluation reads (the housekeeping hook's latest). */
@@ -242,25 +331,42 @@ public final class ShadowFloor implements LongSupplier {
         if (pCm < 0) {
             return new Evaluation(Evaluation.Kind.NO_SNAPSHOT, pCm, 0, null, null, restorable);
         }
+        final boolean twoProducers = rule == AnchorRule.TWO_PRODUCERS
+                && !off.contains(NegativeControl.ANCHOR_RULE_IGNORED);
+        int witnesses = 0;
+        boolean covering = false;
         LogicalShadow anchor = null;
         if (off.contains(NegativeControl.FLOOR_NEWEST_COVERING_ONLY)) {
             // the pre-B1 reading: verifiedAtOrAbove answers the NEWEST verified >= P_cm, restorable or not
             if (!source.isEmpty() && source.get(0).logPosition() >= pCm
                     && restorable(source.get(0), pCm, skipTarget)) {
-                anchor = source.get(0);
+                covering = true;
+                witnesses = witnesses(source.get(0));
+                if (!twoProducers || witnesses >= 2) {
+                    anchor = source.get(0);
+                }
             }
         } else {
             for (final LogicalShadow v : restorable) {
-                if (v.logPosition() >= pCm && (anchor == null || v.logPosition() < anchor.logPosition())) {
+                if (v.logPosition() < pCm) {
+                    continue;
+                }
+                covering = true;
+                final int w = witnesses(v);
+                witnesses = Math.max(witnesses, w);
+                if ((!twoProducers || w >= 2) && (anchor == null || v.logPosition() < anchor.logPosition())) {
                     anchor = v;
                 }
             }
         }
+        if (!covering) {
+            return new Evaluation(Evaluation.Kind.NO_COVERING, pCm, 0, null, null, restorable, witnesses);
+        }
         if (anchor == null) {
-            return new Evaluation(Evaluation.Kind.NO_COVERING, pCm, 0, null, null, restorable);
+            return new Evaluation(Evaluation.Kind.NO_WITNESS, pCm, 0, null, null, restorable, witnesses);
         }
         if (margin == Margin.NONE || off.contains(NegativeControl.FLOOR_MARGIN_IGNORED)) {
-            return new Evaluation(Evaluation.Kind.FLOOR, pCm, pCm, anchor, null, restorable);
+            return new Evaluation(Evaluation.Kind.FLOOR, pCm, pCm, anchor, null, restorable, witnesses);
         }
         final List<LogicalShadow> marginSource =
                 off.contains(NegativeControl.FLOOR_MARGIN_OVER_ALL_VERIFIED) ? source : restorable;
@@ -271,10 +377,10 @@ public final class ShadowFloor implements LongSupplier {
             }
         }
         if (prev == null) {
-            return new Evaluation(Evaluation.Kind.NO_MARGIN, pCm, 0, anchor, null, restorable);
+            return new Evaluation(Evaluation.Kind.NO_MARGIN, pCm, 0, anchor, null, restorable, witnesses);
         }
         return new Evaluation(Evaluation.Kind.FLOOR, pCm, Math.min(pCm, prev.logPosition()), anchor, prev,
-                restorable);
+                restorable, witnesses);
     }
 
     /**
@@ -312,6 +418,9 @@ public final class ShadowFloor implements LongSupplier {
         lastEvaluation = e;
         lastApplied = e.floor();
         publish(e);
+        if (e.kind() == Evaluation.Kind.NO_WITNESS) {
+            counters.increment(ShadowHousekeeping.Counter.FLOOR_NO_WITNESS_TOTAL);
+        }
         long logStart;
         try {
             logStart = logStartPosition.getAsLong();
@@ -354,5 +463,6 @@ public final class ShadowFloor implements LongSupplier {
                 e.latestSnapshotPosition() < 0 ? 0 : Math.max(0, e.latestSnapshotPosition() - e.floor()));
         counters.set(ShadowHousekeeping.Counter.ANCHOR_POSITION, e.anchorPosition());
         counters.set(ShadowHousekeeping.Counter.MARGIN_POSITION, e.marginPosition());
+        counters.set(ShadowHousekeeping.Counter.ANCHOR_WITNESSES, Math.max(0, e.witnesses()));
     }
 }

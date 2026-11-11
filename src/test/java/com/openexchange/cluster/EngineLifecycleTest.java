@@ -353,4 +353,23 @@ public class EngineLifecycleTest {
         main.join(5_000);
         assertEquals("one halt per process, the backstop's", List.of(1), halts);
     }
+
+    /** A decided restart exits 3 after the close, and a fault recorded first keeps its own status. */
+    @Test
+    public void aRestartExitsThreeAfterTheClose() {
+        final EngineLifecycle lf = lifecycle(1_000, 5_000);
+        assertTrue(lf.restart(EngineLifecycle.EXIT_RESTART, "replica re-bootstrap: test"));
+        assertTrue(lf.stopRequested());
+        assertEquals(EngineLifecycle.Cause.RESTART, lf.cause());
+        assertFalse("one stop cause", lf.fatal(EngineLifecycle.EXIT_FATAL, "later"));
+        lf.finish();
+        assertEquals(List.of(3), halts);
+        assertTrue(logs.toString(), logs.stream().anyMatch(l -> l.contains("closed for a restart")));
+        try {
+            lifecycle(1_000, 5_000).restart(1, "a fault is not a restart");
+            throw new AssertionError("restart(1) accepted");
+        } catch (final IllegalArgumentException expected) {
+            assertTrue(expected.getMessage().contains("never 0, 1 or 143"));
+        }
+    }
 }

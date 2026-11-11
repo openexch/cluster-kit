@@ -23,7 +23,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * <ul>
  *   <li><b>Pinned</b> (never purged by retention; {@link #purge} refuses them with {@link #PURGE_CODE_PINNED} unless
  *       {@code force}): the floor's anchor and margin shadow (9.1), every restorable VERIFIED shadow between them,
- *       and the newest VERIFIED shadow (the anchor rule, which {@link ShadowCatalog#purge} also enforces).
+ *       and the newest VERIFIED shadow (the anchor rule, which {@link ShadowCatalog#purge} also enforces). Under the
+ *       two-producer anchor rule the anchor is the witnessed position (every copy of it is kept), while a
+ *       single-producer newest VERIFIED stays pinned as the newest.
  *       Pins are recomputed from each scan (C4).</li>
  *   <li><b>Retention N</b>: keep the {@code SHADOW_RETAIN_N} newest usable POSITIONS plus the pins; purge the
  *       COMPLETE or VERIFIED copies of older positions.</li>
@@ -102,7 +104,7 @@ public final class ShadowRetention implements AutoCloseable {
         if (!scan.verified().isEmpty()) {
             pins.add(scan.verified().get(0).logPosition());
         }
-        if (e.anchor() != null) {
+        if (e.anchor() != null && !off.contains(NegativeControl.RETENTION_ANCHOR_PIN_OFF)) {
             pins.add(e.anchor().logPosition());
         }
         if (e.margin() != null) {

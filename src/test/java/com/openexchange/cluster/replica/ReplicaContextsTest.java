@@ -124,6 +124,22 @@ public class ReplicaContextsTest {
         }
     }
 
+    /** {@code REPLICA_DRIVER_DIR_ACTIVE_MS}: default, both ends of the range, one step outside, and the context. */
+    @Test
+    public void driverDirActiveIsASettingWithARange() {
+        final ReplicaConfig d = base().build();
+        assertEquals(10_000, d.driverDirActiveMs());
+        assertEquals(10_000, ReplicaContexts.driver(d).driverTimeoutMs());
+        assertEquals(2_000, ReplicaContexts.driver(base().driverDirActiveMs(2_000).build()).driverTimeoutMs());
+        assertEquals(600_000, ReplicaContexts.driver(base().driverDirActiveMs(600_000).build()).driverTimeoutMs());
+        ReplicaOracleSettingsTest.refused(base().driverDirActiveMs(1_999),
+                "REPLICA_DRIVER_DIR_ACTIVE_MS must be 2000..600000 ms: 1999");
+        ReplicaOracleSettingsTest.refused(base().driverDirActiveMs(600_001),
+                "REPLICA_DRIVER_DIR_ACTIVE_MS must be 2000..600000 ms: 600001");
+        assertEquals("REPLICA_DRIVER_DIR_ACTIVE_MS must be 2000..600000 ms: 0",
+                ReplicaConfig.driverDirActiveRefusal(0));
+    }
+
     /**
      * The local control channel's term length follows {@code REPLICA_DRIVER_TERM_LENGTH} (no
      * 16m literal), and the backup records L on {@code REPLICA_LOG_STREAM_ID}.

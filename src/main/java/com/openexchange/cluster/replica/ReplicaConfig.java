@@ -38,6 +38,14 @@ public final class ReplicaConfig {
     public static final int DEFAULT_DRIVER_MTU = 8192;
     /** The embedded driver's IPC and publication term buffer length; a setting. */
     public static final int DEFAULT_DRIVER_TERM_LENGTH = 16 * 1024 * 1024;
+    /**
+     * {@code REPLICA_DRIVER_DIR_ACTIVE_MS}: an existing driver directory whose driver heartbeat is at most this old is
+     * a live driver's, and the embedded launch refuses it. Aeron's default driver timeout; a setting.
+     */
+    public static final long DEFAULT_DRIVER_DIR_ACTIVE_MS = 10_000;
+    /** A live driver heartbeats once per timer tick (Aeron's default 1 s); a shorter bound reads it as stale. */
+    public static final long MIN_DRIVER_DIR_ACTIVE_MS = 2_000;
+    public static final long MAX_DRIVER_DIR_ACTIVE_MS = 600_000;
     public static final int DEFAULT_SHADOW_BUFFER_MB = 512;
     /** H14: a shadow payload plus its header fits an int-sized buffer, so one image buffer holds at most this. */
     public static final int MAX_SHADOW_BUFFER_MB = 2047;
@@ -137,6 +145,7 @@ public final class ReplicaConfig {
     final String catchupSndbuf;
     final int driverMtu;
     final int driverTermLength;
+    final long driverDirActiveMs;
     final int socketBufferLength;
     final int archiveSegmentLength;
     final int shadowBufferMb;
@@ -205,6 +214,7 @@ public final class ReplicaConfig {
         this.catchupSndbuf = b.catchupSndbuf;
         this.driverMtu = b.driverMtu;
         this.driverTermLength = b.driverTermLength;
+        this.driverDirActiveMs = b.driverDirActiveMs;
         this.socketBufferLength = b.socketBufferLength;
         this.archiveSegmentLength = b.archiveSegmentLength;
         this.shadowBufferMb = b.shadowBufferMb;
@@ -358,6 +368,11 @@ public final class ReplicaConfig {
         return driverTermLength;
     }
 
+    /** {@code REPLICA_DRIVER_DIR_ACTIVE_MS} (embedded driver only). */
+    public long driverDirActiveMs() {
+        return driverDirActiveMs;
+    }
+
     /** {@code REPLICA_VERIFY_WAIT_MS}. */
     public long verifyWaitMs() {
         return verifyWaitMs;
@@ -506,6 +521,12 @@ public final class ReplicaConfig {
     }
 
     /** Null when valid, else the refusal text. */
+    public static String driverDirActiveRefusal(final long v) {
+        return v < MIN_DRIVER_DIR_ACTIVE_MS || v > MAX_DRIVER_DIR_ACTIVE_MS ? "REPLICA_DRIVER_DIR_ACTIVE_MS must be "
+                + MIN_DRIVER_DIR_ACTIVE_MS + ".." + MAX_DRIVER_DIR_ACTIVE_MS + " ms: " + v : null;
+    }
+
+    /** Null when valid, else the refusal text. */
     public static String memberCadenceRefusal(final long v) {
         return v < 0 || v > MAX_MEMBER_CADENCE_MS ? "REPLICA_MEMBER_CADENCE_MS must be 0 (not checked) or 1.."
                 + MAX_MEMBER_CADENCE_MS + " ms: " + v : null;
@@ -538,6 +559,7 @@ public final class ReplicaConfig {
         private String catchupSndbuf = DEFAULT_CATCHUP_SNDBUF;
         private int driverMtu = DEFAULT_DRIVER_MTU;
         private int driverTermLength = DEFAULT_DRIVER_TERM_LENGTH;
+        private long driverDirActiveMs = DEFAULT_DRIVER_DIR_ACTIVE_MS;
         private int socketBufferLength = DEFAULT_SOCKET_BUFFER;
         private int archiveSegmentLength = DEFAULT_ARCHIVE_SEGMENT_LENGTH;
         private int shadowBufferMb = DEFAULT_SHADOW_BUFFER_MB;
@@ -708,6 +730,12 @@ public final class ReplicaConfig {
         /** {@code REPLICA_DRIVER_TERM_LENGTH} (embedded driver IPC and publication terms). */
         public Builder driverTermLength(final int v) {
             this.driverTermLength = v;
+            return this;
+        }
+
+        /** {@code REPLICA_DRIVER_DIR_ACTIVE_MS} (embedded driver only). */
+        public Builder driverDirActiveMs(final long v) {
+            this.driverDirActiveMs = v;
             return this;
         }
 
@@ -1041,6 +1069,10 @@ public final class ReplicaConfig {
             positive("socketBufferLength", socketBufferLength);
             positive("REPLICA_DRIVER_MTU", driverMtu);
             positive("REPLICA_DRIVER_TERM_LENGTH", driverTermLength);
+            final String dirActive = driverDirActiveRefusal(driverDirActiveMs);
+            if (dirActive != null) {
+                throw new IllegalArgumentException(dirActive);
+            }
             Objects.requireNonNull(catchupSndbuf, "REPLICA_CATCHUP_SNDBUF");
             positive("archiveSegmentLength", archiveSegmentLength);
             nonNegative("SHADOW_STANDBY_FALLBACK_MINUTES", standbyFallbackMs);

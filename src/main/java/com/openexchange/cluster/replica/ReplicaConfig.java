@@ -63,6 +63,19 @@ public final class ReplicaConfig {
     public static final Set<Integer> DEFAULT_SNAPSHOT_STREAM_IDS = Set.of(
             io.aeron.cluster.service.ClusteredServiceContainer.Configuration.SNAPSHOT_STREAM_ID_DEFAULT,
             io.aeron.cluster.ConsensusModule.Configuration.SNAPSHOT_STREAM_ID_DEFAULT);
+    /** {@code REPLICA_MISMATCH_HOLD_MS}: 0 holds an oracle mismatch until the operator stops the process. */
+    public static final long DEFAULT_MISMATCH_HOLD_MS = 0;
+    public static final long MAX_MISMATCH_HOLD_MS = 604_800_000L;
+    /** {@code REPLICA_MISMATCH_DUMP_MAX_MB}: the cap per dumped image file; 0 writes the report only. */
+    public static final int DEFAULT_MISMATCH_DUMP_MAX_MB = 2048;
+    public static final int MAX_MISMATCH_DUMP_MAX_MB = 16_384;
+    /** {@code REPLICA_FENCE_PURGE_WAIT_MS}: how long a history fence waits for the suspect shadow purge. */
+    public static final long DEFAULT_FENCE_PURGE_WAIT_MS = 30_000;
+    public static final long MIN_FENCE_PURGE_WAIT_MS = 1_000;
+    public static final long MAX_FENCE_PURGE_WAIT_MS = 600_000;
+    /** {@code REPLICA_MEMBER_CADENCE_MS}: the members' snapshot cadence for the readiness cross-check, 0 unchecked. */
+    public static final long DEFAULT_MEMBER_CADENCE_MS = 0;
+    public static final long MAX_MEMBER_CADENCE_MS = 86_400_000L;
     public static final int DEFAULT_REPLAY_STREAM_ID = 4303;
     public static final int DEFAULT_FRAGMENT_LIMIT = 64;
     public static final String DEFAULT_SHADOW_TERM_LENGTH = "4m";
@@ -116,6 +129,11 @@ public final class ReplicaConfig {
     final long attachBackoffMs;
     final long bootstrapWaitMs;
     final long verifyWaitMs;
+    final long mismatchHoldMs;
+    final File mismatchDir;
+    final int mismatchDumpMaxMb;
+    final long fencePurgeWaitMs;
+    final long memberCadenceMs;
     final int logStreamId;
     final Set<Integer> snapshotStreamIds;
     final int replayStreamId;
@@ -173,6 +191,11 @@ public final class ReplicaConfig {
         this.attachBackoffMs = b.attachBackoffMs;
         this.bootstrapWaitMs = b.bootstrapWaitMs;
         this.verifyWaitMs = b.verifyWaitMs;
+        this.mismatchHoldMs = b.mismatchHoldMs;
+        this.mismatchDir = b.mismatchDir;
+        this.mismatchDumpMaxMb = b.mismatchDumpMaxMb;
+        this.fencePurgeWaitMs = b.fencePurgeWaitMs;
+        this.memberCadenceMs = b.memberCadenceMs;
         this.logStreamId = b.logStreamId;
         this.snapshotStreamIds = Set.copyOf(b.snapshotStreamIds);
         this.replayStreamId = b.replayStreamId;
@@ -204,6 +227,21 @@ public final class ReplicaConfig {
         return "REPLICA_VERIFY_WAIT_MS=" + verifyWaitMs + " must be >= 2 x REPLICA_BACKUP_QUERY_INTERVAL_MS="
                 + queryIntervalMs + " + REPLICA_BACKUP_COOLDOWN_MS=" + cooldownMs + " = " + cycle + " (the stall bound"
                 + " cannot be shorter than one backup cycle)";
+    }
+
+    /**
+     * Null when the readiness shadow age covers a dropped ALIGNED, else the refusal text: with STANDBY suspended
+     * until the next EQUAL, the oldest shadow a VERIFIED replica can show is one member cadence plus the verify wait
+     * behind. Unchecked when the member cadence is unknown (0) or the age input is off (0).
+     */
+    public static String readyShadowAgeBelowCadence(final long readyShadowAgeMs, final long memberCadenceMs,
+                                                    final long verifyWaitMs) {
+        if (memberCadenceMs <= 0 || readyShadowAgeMs <= 0 || readyShadowAgeMs >= memberCadenceMs + verifyWaitMs) {
+            return null;
+        }
+        return "REPLICA_READY_SHADOW_AGE_MS " + readyShadowAgeMs + " is below the member cadence plus"
+                + " REPLICA_VERIFY_WAIT_MS (" + (memberCadenceMs + verifyWaitMs) + "): a dropped ALIGNED would flap"
+                + " readiness";
     }
 
     public static Builder builder() {
@@ -291,6 +329,31 @@ public final class ReplicaConfig {
         return verifyWaitMs;
     }
 
+    /** {@code REPLICA_MISMATCH_HOLD_MS}. */
+    public long mismatchHoldMs() {
+        return mismatchHoldMs;
+    }
+
+    /** {@code REPLICA_MISMATCH_DIR}: default {@code BASE_DIR/mismatch}. */
+    public File mismatchDir() {
+        return mismatchDir != null ? mismatchDir : new File(baseDir, "mismatch");
+    }
+
+    /** {@code REPLICA_MISMATCH_DUMP_MAX_MB}. */
+    public int mismatchDumpMaxMb() {
+        return mismatchDumpMaxMb;
+    }
+
+    /** {@code REPLICA_FENCE_PURGE_WAIT_MS}. */
+    public long fencePurgeWaitMs() {
+        return fencePurgeWaitMs;
+    }
+
+    /** {@code REPLICA_MEMBER_CADENCE_MS}. */
+    public long memberCadenceMs() {
+        return memberCadenceMs;
+    }
+
     /** {@code REPLICA_LOG_STREAM_ID}. */
     public int logStreamId() {
         return logStreamId;
@@ -321,6 +384,30 @@ public final class ReplicaConfig {
                 + " queryIntervalMs=" + backupQueryIntervalMs + " responseTimeoutMs=" + backupResponseTimeoutMs
                 + " progressTimeoutMs=" + backupProgressTimeoutMs + " bufferMb=" + shadowBufferMb
                 + (off.isEmpty() ? "" : " NEGATIVE_CONTROLS=" + off) + "}";
+    }
+
+    /** Null when valid, else the refusal text (the host's settings layer uses the same text). */
+    public static String mismatchHoldRefusal(final long v) {
+        return v < 0 || v > MAX_MISMATCH_HOLD_MS ? "REPLICA_MISMATCH_HOLD_MS must be 0 (hold until stopped) or 1.."
+                + MAX_MISMATCH_HOLD_MS + " ms: " + v : null;
+    }
+
+    /** Null when valid, else the refusal text. */
+    public static String mismatchDumpMaxMbRefusal(final long v) {
+        return v < 0 || v > MAX_MISMATCH_DUMP_MAX_MB ? "REPLICA_MISMATCH_DUMP_MAX_MB must be 0.."
+                + MAX_MISMATCH_DUMP_MAX_MB + ": " + v : null;
+    }
+
+    /** Null when valid, else the refusal text. */
+    public static String fencePurgeWaitRefusal(final long v) {
+        return v < MIN_FENCE_PURGE_WAIT_MS || v > MAX_FENCE_PURGE_WAIT_MS ? "REPLICA_FENCE_PURGE_WAIT_MS must be "
+                + MIN_FENCE_PURGE_WAIT_MS + ".." + MAX_FENCE_PURGE_WAIT_MS + " ms: " + v : null;
+    }
+
+    /** Null when valid, else the refusal text. */
+    public static String memberCadenceRefusal(final long v) {
+        return v < 0 || v > MAX_MEMBER_CADENCE_MS ? "REPLICA_MEMBER_CADENCE_MS must be 0 (not checked) or 1.."
+                + MAX_MEMBER_CADENCE_MS + " ms: " + v : null;
     }
 
     /** Defaults are the setting defaults; every value the host does not set keeps them. */
@@ -364,6 +451,11 @@ public final class ReplicaConfig {
         private long attachBackoffMs = DEFAULT_ATTACH_BACKOFF_MS;
         private long bootstrapWaitMs = DEFAULT_BOOTSTRAP_WAIT_MS;
         private long verifyWaitMs = DEFAULT_VERIFY_WAIT_MS;
+        private long mismatchHoldMs = DEFAULT_MISMATCH_HOLD_MS;
+        private File mismatchDir;
+        private int mismatchDumpMaxMb = DEFAULT_MISMATCH_DUMP_MAX_MB;
+        private long fencePurgeWaitMs = DEFAULT_FENCE_PURGE_WAIT_MS;
+        private long memberCadenceMs = DEFAULT_MEMBER_CADENCE_MS;
         private int logStreamId = DEFAULT_LOG_STREAM_ID;
         private Set<Integer> snapshotStreamIds = DEFAULT_SNAPSHOT_STREAM_IDS;
         private int replayStreamId = DEFAULT_REPLAY_STREAM_ID;
@@ -585,6 +677,32 @@ public final class ReplicaConfig {
             return this;
         }
 
+        public Builder mismatchHoldMs(final long v) {
+            this.mismatchHoldMs = v;
+            return this;
+        }
+
+        /** Null keeps the default {@code BASE_DIR/mismatch}. */
+        public Builder mismatchDir(final File v) {
+            this.mismatchDir = v;
+            return this;
+        }
+
+        public Builder mismatchDumpMaxMb(final int v) {
+            this.mismatchDumpMaxMb = v;
+            return this;
+        }
+
+        public Builder fencePurgeWaitMs(final long v) {
+            this.fencePurgeWaitMs = v;
+            return this;
+        }
+
+        public Builder memberCadenceMs(final long v) {
+            this.memberCadenceMs = v;
+            return this;
+        }
+
         public Builder logStreamId(final int v) {
             this.logStreamId = v;
             return this;
@@ -724,6 +842,26 @@ public final class ReplicaConfig {
                     backupCooldownMs);
             if (cycle != null) {
                 throw new IllegalArgumentException(cycle);
+            }
+            final String hold = mismatchHoldRefusal(mismatchHoldMs);
+            if (hold != null) {
+                throw new IllegalArgumentException(hold);
+            }
+            final String dump = mismatchDumpMaxMbRefusal(mismatchDumpMaxMb);
+            if (dump != null) {
+                throw new IllegalArgumentException(dump);
+            }
+            final String purgeWait = fencePurgeWaitRefusal(fencePurgeWaitMs);
+            if (purgeWait != null) {
+                throw new IllegalArgumentException(purgeWait);
+            }
+            final String cadence = memberCadenceRefusal(memberCadenceMs);
+            if (cadence != null) {
+                throw new IllegalArgumentException(cadence);
+            }
+            final String age = readyShadowAgeBelowCadence(readyShadowAgeMs, memberCadenceMs, verifyWaitMs);
+            if (age != null) {
+                throw new IllegalArgumentException(age);
             }
             positive("REPLICA_LOG_STREAM_ID", logStreamId);
             if (snapshotStreamIds.isEmpty()) {

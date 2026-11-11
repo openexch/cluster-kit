@@ -47,8 +47,15 @@ import java.util.function.Supplier;
  * <p>With an {@link AlignmentTrust}: an ALIGNED image is held in the buffer until the member
  * snapshot at the same position compares byte-equal ({@link #pollHeld}); only then is it offered. While the replica
  * is UNVERIFIED (a continuation that is not a full replay from genesis) STANDBY and LOCAL are not written
- * ({@code shadow_trigger_untrusted_total}); while an image is held they skip as busy. The test seam
- * {@code beforeOffer} runs after the compare, right before the hand-off.</p>
+ * ({@code shadow_trigger_untrusted_total}); while an image is held they skip as busy; while the backup named a member
+ * snapshot above the last EQUAL position they are not written either ({@code shadow_oracle_stale_named_total},
+ * {@link AlignmentTrust#fresh}). The test seam {@code beforeOffer} runs after the compare, right before the
+ * hand-off.</p>
+ *
+ * <p>Every flags-0 SNAPSHOT action is handed to the trust's action ring first, before any early return here
+ * (pre-ADOPT, fenced, compare off, writer not running). Fences carry their {@link FenceFamily}: a byte mismatch is
+ * MISMATCH (the replica holds), another genesis at the compare and an applied-past member snapshot are HISTORY (purge,
+ * exit 1), everything else FAULT.</p>
  *
  * <p>Clocks: the injected {@link NanoClock} decides the ALIGNED wait deadline and the verify wait only. LOCAL is
  * decided on cluster time from the frames; the {@code LOCAL_ON_WALL_CLOCK} negative control is the one path that reads the clock for it.</p>
@@ -73,7 +80,13 @@ public final class ShadowTriggerPolicy implements ShadowTriggerListener, ShadowW
     /** Latches the replica's fence; must be safe from any thread. */
     @FunctionalInterface
     public interface Fence {
+        /** A FAULT fence. */
         void fence(String reason);
+
+        /** A fence of {@code family}; the default treats every family as a FAULT (hosts without a hold). */
+        default void fence(final FenceFamily family, final String reason) {
+            fence(reason);
+        }
     }
 
     public static WriterPort port(final ShadowWriterThread thread) {
@@ -127,6 +140,8 @@ public final class ShadowTriggerPolicy implements ShadowTriggerListener, ShadowW
     private long pendingAt = -1;
     private long lastActionClusterTime = -1;
     private long lastWallActionMs = -1;
+    /** Test seam: the STANDBY/LOCAL freshness predicate; null is {@link AlignmentTrust#fresh}. */
+    volatile BooleanSupplier freshnessRule;
 
     private final AtomicLongArray triggers = new AtomicLongArray(KINDS);
     private final AtomicLongArray skippedBusy = new AtomicLongArray(KINDS);
@@ -200,6 +215,10 @@ public final class ShadowTriggerPolicy implements ShadowTriggerListener, ShadowW
     public boolean onSnapshotAction(final long logPosition, final long leadershipTermId, final long timestamp,
                                     final int flags) {
         final ShadowKind kind = flags == 0 ? ShadowKind.ALIGNED : ShadowKind.STANDBY;
+        final AlignmentTrust t = trust;
+        if (kind == ShadowKind.ALIGNED && t != null) {
+            t.action(logPosition); // the ring is recorded at the action, before any early return
+        }
         lastActionClusterTime = timestamp;
         lastWallActionMs = TimeUnit.NANOSECONDS.toMillis(clock.nanoTime());
         triggers.incrementAndGet(kind.ordinal());
@@ -284,7 +303,7 @@ public final class ShadowTriggerPolicy implements ShadowTriggerListener, ShadowW
         if (held == null) {
             final String text = t.tick(appliedPosition);
             if (text != null) {
-                fenceNow(text);
+                fenceNow(FenceFamily.HISTORY, text);
                 return;
             }
         } else {
@@ -335,15 +354,20 @@ public final class ShadowTriggerPolicy implements ShadowTriggerListener, ShadowW
                 return true;
             }
             case DIFFERENT -> {
+                held = null; // the buffer keeps the image for the mismatch dump: nothing serializes after a fence
+                fenceNow(FenceFamily.MISMATCH, t.mismatchText());
+                return true;
+            }
+            case OTHER_GENESIS -> {
                 held = null;
-                fenceNow(AlignmentTrust.differsText(p));
+                fenceNow(FenceFamily.HISTORY, t.otherGenesisText());
                 return true;
             }
             case UNVERIFIABLE -> {
                 held = null;
                 return true;
             }
-            default -> { // PENDING, and AMBIGUOUS (never compared, not ready)
+            default -> { // PENDING, UNREADABLE (a torn copy), and AMBIGUOUS (never compared, not ready)
                 return pendingDeadline(t, req, appliedPosition);
             }
         }
@@ -439,6 +463,13 @@ public final class ShadowTriggerPolicy implements ShadowTriggerListener, ShadowW
                 System.out.println("[REPLICA] " + kind + " trigger at " + at.logPosition() + " while UNVERIFIED: not"
                         + " written (waiting for the first ALIGNED compare)");
                 return null;
+            }
+            if (!off.contains(ReplicaNegativeControl.STANDBY_FRESHNESS_OFF)) {
+                final BooleanSupplier rule = freshnessRule;
+                if (rule == null ? !t.fresh() : !rule.getAsBoolean()) {
+                    t.staleSkipped(kind, at.logPosition(), t.newestNamed());
+                    return null;
+                }
             }
         }
         if (comparing && held != null) {
@@ -548,8 +579,12 @@ public final class ShadowTriggerPolicy implements ShadowTriggerListener, ShadowW
     }
 
     private void fenceNow(final String text) {
+        fenceNow(FenceFamily.FAULT, text);
+    }
+
+    private void fenceNow(final FenceFamily family, final String text) {
         fencedFlag = true;
-        fence.fence(text);
+        fence.fence(family, text);
     }
 
     /** The buffer overflow in {@code t}'s cause chain (bounded: a cycle cannot loop), or null. */

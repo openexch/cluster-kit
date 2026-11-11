@@ -113,7 +113,17 @@ final class ClusterIdentityCheck {
                           final long recordingId, final long deadlineNs, final ReplicaEngine binding,
                           final int clusterId) {
         final UnsafeBuffer image = servicePayload(aeron, archive, clock, recordingId, deadlineNs);
-        final int length = image.capacity();
+        return genesisOfPayload(image, image.capacity(), binding, clusterId, recordingId);
+    }
+
+    /**
+     * The one genesis decoder of a member copy, shared by the genesis check and the alignment compare: a stub
+     * carries its own genesis; a full image is decoded by the binding through a scratch engine.
+     *
+     * @throws CopyRefused when the payload is refused (stub, envelope or image decode)
+     */
+    static long genesisOfPayload(final org.agrona.DirectBuffer image, final int length, final ReplicaEngine binding,
+                                 final int clusterId, final long recordingId) {
         if (length == ShadowStub.ENVELOPED_LENGTH && SnapshotEnvelope.isEnveloped(image, length)
                 && ShadowStub.peekTag(image, SnapshotEnvelope.payloadOffset()) == ShadowStub.STUB_TAG) {
             final ShadowStub.Decoded d = ShadowStub.openEnveloped(new SnapshotEnvelope(), image, length,
@@ -348,8 +358,19 @@ final class ClusterIdentityCheck {
                                                     final NanoClock clock, final RecordingLogView view,
                                                     final long loadTimeoutNs,
                                                     final java.util.function.LongSupplier newestReported,
-                                                    final java.util.function.LongSupplier retrievalProgress) {
+                                                    final java.util.function.LongSupplier retrievalProgress,
+                                                    final ReplicaEngine binding, final int clusterId) {
         return new AlignmentTrust.MemberSnapshots() {
+            @Override
+            public long recordingId(final long position, final long leadershipTermId) {
+                return entryRecording(view.get(), position, leadershipTermId);
+            }
+
+            @Override
+            public long genesisOf(final org.agrona.DirectBuffer copy, final int length) {
+                return genesisOfPayload(copy, length, binding, clusterId, -1);
+            }
+
             @Override
             public long newestReported() {
                 return newestReported.getAsLong();
@@ -398,23 +419,28 @@ final class ClusterIdentityCheck {
             /** By position AND term ({@code -1}: any); the last matching valid entry. */
             @Override
             public org.agrona.DirectBuffer payload(final long position, final long leadershipTermId) {
-                long recordingId = -1;
-                final RecordingLog log = view.get();
-                if (log != null) {
-                    for (final RecordingLog.Entry e : log.entries()) {
-                        if (e.type == RecordingLog.ENTRY_TYPE_SNAPSHOT && e.isValid && e.serviceId == SERVICE_ID
-                                && e.logPosition == position
-                                && (leadershipTermId < 0 || e.leadershipTermId == leadershipTermId)) {
-                            recordingId = e.recordingId;
-                        }
-                    }
-                }
+                final long recordingId = entryRecording(view.get(), position, leadershipTermId);
                 if (recordingId < 0 || archive.getStopPosition(recordingId) < 0) {
                     return null;
                 }
                 return servicePayload(aeron, archive, clock, recordingId, clock.nanoTime() + loadTimeoutNs);
             }
         };
+    }
+
+    /** The recording of the last valid service-0 SNAPSHOT entry at {@code position} and term ({@code -1}: any). */
+    static long entryRecording(final RecordingLog log, final long position, final long leadershipTermId) {
+        long recordingId = -1;
+        if (log != null) {
+            for (final RecordingLog.Entry e : log.entries()) {
+                if (e.type == RecordingLog.ENTRY_TYPE_SNAPSHOT && e.isValid && e.serviceId == SERVICE_ID
+                        && e.logPosition == position
+                        && (leadershipTermId < 0 || e.leadershipTermId == leadershipTermId)) {
+                    recordingId = e.recordingId;
+                }
+            }
+        }
+        return recordingId;
     }
 
     /**

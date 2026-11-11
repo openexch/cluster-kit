@@ -51,7 +51,13 @@ public class GenesisGuardTest {
         public String termContradiction(final long recordingId) {
             return null;
         }
+
+        @Override
+        public String refusalOf(final GenesisGuard.Named n) {
+            return refusal;
+        }
     };
+    String refusal;
 
     GenesisGuard guard() {
         return new GenesisGuard(source, () -> now[0], AlignmentTrust.CHECK_PACE_NS, false);
@@ -135,5 +141,17 @@ public class GenesisGuardTest {
                     + decodes + " decodes in 2 000 passes over 2 000 ms (bound " + bound + ")");
         }
         System.out.println("GREEN paced: " + g.evaluationsTotal() + " evaluations in 2 000 ms");
+    }
+
+    /** A named copy refused by its content says why in the waiting detail, not "not retrieved yet". */
+    @Test
+    public void aRefusedNamedCopyCarriesItsReasonIntoTheDetail() {
+        final GenesisGuard g = guard();
+        named = new GenesisGuard.Named(4096, 0, 0);
+        refusal = "rec 9: snapshot CRC32C mismatch";
+        assertEquals(GenesisGuard.Outcome.WAITING, g.check(G1));
+        final String expected = "genesis check: named member snapshot at 4096 refused: rec 9: snapshot CRC32C mismatch";
+        assertTrue(g.detail(), g.detail().startsWith(expected));
+        assertTrue(g.namedCopyUnusable());
     }
 }

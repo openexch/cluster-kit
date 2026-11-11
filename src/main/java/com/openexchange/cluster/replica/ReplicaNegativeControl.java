@@ -26,11 +26,33 @@ public enum ReplicaNegativeControl {
     SET_TRIM_OFF,
     /** Readiness: the dropped idle branch is back; a caught-up replica of a frozen log stays ready. */
     TIME_LAG_IDLE_ALLOWED,
-    /** Bootstrap: the cluster genesis and term checks before the first attach are skipped. */
+    /**
+     * Genesis: the cluster genesis and term checks before the first attach are skipped, and the alignment compare
+     * calls a differing member copy DIFFERENT without decoding its genesis (another history reads as a byte mismatch).
+     */
     GENESIS_CHECK_OFF,
     /**
      * The byte-equal alignment trust is off. A start that is not a full replay from genesis is trusted at once, and
      * an ALIGNED shadow is written without comparing it with the member snapshot (the rule before the alignment trust).
      */
-    ALIGN_COMPARE_OFF
+    ALIGN_COMPARE_OFF,
+    /** Apply: the follower drops every session open frame before the engine sees it (a replica-side divergence). */
+    SKIP_SESSION_OPEN,
+    /**
+     * Freshness: STANDBY and LOCAL are written while a named member snapshot above the last EQUAL position is still
+     * uncompared (only {@code trusted} is required, the rule before the freshness check).
+     */
+    STANDBY_FRESHNESS_OFF,
+    /** Compare: a member copy is compared without opening its envelope first (a torn copy reads as a mismatch). */
+    ENVELOPE_CHECK_OFF,
+    /** Mismatch: a byte mismatch exits 1 at once instead of holding (the rule before the hold). */
+    HOLD_OFF,
+    /** History: the applied-past check runs only while UNVERIFIED (the rule before it ran in both trust states). */
+    TICK_UNVERIFIED_ONLY,
+    /** Housekeeping: the retrieved member set the oracle disagreed with is not pinned (trimmed as any other set). */
+    MISMATCH_PIN_OFF,
+    /** History fence: own shadows above the purge bound are kept (no suspect purge before the exit). */
+    SUSPECT_PURGE_OFF,
+    /** History fence: the suspect purge is requested but not awaited (the exit races it). */
+    SUSPECT_PURGE_NOT_AWAITED
 }

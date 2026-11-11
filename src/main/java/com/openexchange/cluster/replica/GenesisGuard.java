@@ -48,6 +48,11 @@ final class GenesisGuard {
 
         /** Null when consistent, else the refusal text (the copy's RecordingLog entry against its TERM entry). */
         String termContradiction(long recordingId);
+
+        /** Why the local copy of {@code n} was refused by its content (never read again), null when it was not. */
+        default String refusalOf(final Named n) {
+            return null;
+        }
     }
 
     private final Source source;
@@ -130,6 +135,11 @@ final class GenesisGuard {
         final long rec = source.localCopy(n);
         if (rec < 0) {
             namedCopyUnusable = true; // named, no usable copy (a partial one is never resolved, ClusterIdentityCheck.pick)
+            final String refused = source.refusalOf(n);
+            if (refused != null) {
+                return waiting("genesis check: named member snapshot at " + n.position() + " refused: " + refused
+                        + "; local shadows genesis " + localGenesis);
+            }
             return waiting("genesis check: the member snapshot at " + n.position() + " (term " + n.leadershipTermId()
                     + ") named by the backup is not retrieved yet; local shadows genesis " + localGenesis);
         }

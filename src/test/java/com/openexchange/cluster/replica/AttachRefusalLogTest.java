@@ -59,4 +59,71 @@ public class AttachRefusalLogTest {
         System.out.println("GREEN " + REFUSALS + " refusals over " + seconds + " s: " + reasonLines
                 + " reason lines, " + counts.size() + " count lines");
     }
+
+    static List<String> lines(final ByteArrayOutputStream bytes) {
+        return Arrays.stream(bytes.toString(StandardCharsets.UTF_8).split("\n")).filter(s -> !s.isEmpty())
+                .collect(Collectors.toList());
+    }
+
+    /** The two lines a replica logged for one cause: the correlation id AND the replay limit differ. */
+    @Test
+    public void refusalsThatDifferOnlyInNumbersAreOneReason() {
+        final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        final long[] now = {1};
+        final AttachRefusalLog log = new AttachRefusalLog(new PrintStream(bytes, true, StandardCharsets.UTF_8),
+                () -> now[0]);
+        log.refused(4, 4202144, refusal(6527, "requested replay start position=4202144 must be less than the limit"
+                + " position=800704 for recording 4"));
+        now[0] += TimeUnit.MILLISECONDS.toNanos(BACKOFF_MS);
+        log.refused(4, 4202144, refusal(6645, "requested replay start position=4202144 must be less than the limit"
+                + " position=802304 for recording 4"));
+        final long first = lines(bytes).stream().filter(s -> s.contains(" refused: ")).count();
+        if (first != 1) {
+            throw new AssertionError("refusal line repeated " + first + " times: " + lines(bytes));
+        }
+    }
+
+    /** Numeric codes are masked by design; a code spelled as a name still separates two reasons. */
+    @Test
+    public void refusalsThatDifferInANonNumericTokenAreTwoReasons() {
+        final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        final AttachRefusalLog log = new AttachRefusalLog(new PrintStream(bytes, true, StandardCharsets.UTF_8),
+                () -> 1);
+        log.refused(4, 0, refusal(1, "replay refused code=GENERIC"));
+        log.refused(4, 0, refusal(2, "replay refused code=STORAGE_SPACE"));
+        final long first = lines(bytes).stream().filter(s -> s.contains(" refused: ")).count();
+        if (first != 2) {
+            throw new AssertionError("two different refusal reasons collapsed into one: " + lines(bytes));
+        }
+    }
+
+    void windowFlush(final boolean tick) {
+        final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        final long[] now = {1};
+        final AttachRefusalLog log = new AttachRefusalLog(new PrintStream(bytes, true, StandardCharsets.UTF_8),
+                () -> now[0]);
+        log.refused(4, 0, refusal(1, "max concurrent replays reached: 1"));
+        log.refused(4, 0, refusal(2, "max concurrent replays reached: 1"));
+        now[0] += TimeUnit.MILLISECONDS.toNanos(AttachRefusalLog.COUNT_PERIOD_MS + 1);
+        if (tick) {
+            log.tick();
+            log.tick(); // flushed once
+        }
+        final List<String> counts = lines(bytes).stream().filter(s -> s.startsWith("[REPLICA] replay refusals: "))
+                .collect(Collectors.toList());
+        if (counts.size() != 1) {
+            throw new AssertionError("last refusal window never counted: " + lines(bytes));
+        }
+        assertTrue(counts.get(0), counts.get(0).contains(" 2 refused attaches"));
+    }
+
+    @Test
+    public void theLastWindowIsCountedWithoutAnotherAttach() {
+        windowFlush(true);
+    }
+
+    @Test
+    public void controlNoTickNeverCountsTheLastWindow() {
+        OracleVerdictTest.expectControl("no tick", () -> windowFlush(false), "last refusal window never counted");
+    }
 }

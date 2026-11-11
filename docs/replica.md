@@ -60,9 +60,8 @@ Two checks decide:
 2. **Byte alignment.** At every ALIGNED trigger the serialized image is held
    and compared with the member snapshot the backup retrieved at the same log
    position. Equal: the replica becomes (or stays) VERIFIED and the held shadow
-   is written. Different: `FATAL replica: state at <P> differs from member snapshot (history mismatch or divergence); wipe BASE_DIR`.
-   The compare runs at every ALIGNED, so a verified replica that later diverges
-   also fences.
+   is written. Different: see "Live oracle" below. The compare runs at every ALIGNED, so a
+   verified replica that later diverges is caught at its next ALIGNED.
 
 **Stall bound.** `REPLICA_VERIFY_WAIT_MS` (default 180 000) bounds a stall, not
 the elapsed time. The clock runs only while the replica makes no progress
@@ -90,10 +89,73 @@ raised it returned normally, so nothing is written after a failed apply.
 ## Fences
 
 Any throwable out of an apply, a self-check failure, a writer failure, a change
-of L or an identity mismatch latches the fence, aborts the in-flight write and
-exits 1 through the host's fatal hook. After a fence nothing is written, from
-any thread. Every fence line starts `FATAL replica:` and names the position and
-the reason. Recovery is the action the line names, usually wiping `BASE_DIR`.
+of L or an identity mismatch latches the fence and aborts the in-flight write.
+After a fence nothing is written, from any thread. Every fence line names the
+position and the reason. A fence has one of three families:
+
+| Family | Cause | Then |
+|---|---|---|
+| Mismatch | the member copy at P opened, holds this replica's genesis, and its bytes differ | hold (see "Live oracle"); exit only on stop (143), driver loss (1) or `REPLICA_MISMATCH_HOLD_MS` (1) |
+| History | a member copy of another genesis (at the compare or at the genesis check), or a member snapshot at a position this replica applied past without a SNAPSHOT action there | own shadows above the last EQUAL position or the restore point, whichever is higher, are purged and the ones at or below it kept (`poisoned shadows purged: [...] (above <P>, the last EQUAL position or the restore point; kept at or below <P>; <n> refused)`), awaited for at most `REPLICA_FENCE_PURGE_WAIT_MS`, then exit 1; runbook: wipe `BASE_DIR` |
+| Fault | everything else | exit 1 |
+
+## Live oracle
+
+At every ALIGNED the held image is compared with the member service snapshot
+the backup retrieved at the same position, in this order:
+
+1. The copy's envelope must open (length and CRC32C). A copy that does not open
+   is UNREADABLE: torn or incomplete, never a divergence. It is counted
+   (`shadow_oracle_unreadable_total`), logged once per recording, and the held
+   image keeps waiting. An UNVERIFIED replica whose stall bound runs out on such a
+   copy names it: `...; wipe BASE_DIR; the last member copy at <P> (rec <id>) was unreadable: <reason>`.
+2. A stub (members in `SNAPSHOT_MODE=shadow`) is compared by identity; a full
+   copy byte for byte.
+3. When the bytes differ, the copy's genesis decides: genesis 0 (taken before
+   the ADOPT) is ignored; another genesis is a history fence; the same genesis is
+   a byte mismatch.
+
+A byte mismatch is never adjudicated by the replica. It latches
+(`shadow_oracle_mismatch_total`, `shadow_oracle_mismatch_position`), stops
+applying and writing, reads 503 with the readiness field `recovery=fenced:oracle mismatch at <P>: <detail>`, and
+keeps `/metrics`, the housekeeping thread and the evidence:
+
+- `REPLICA_MISMATCH_DIR/<P>/` (default `BASE_DIR/mismatch`): `replica.image`,
+  `member.image`, `report.txt` (positions, term, both geneses, lengths, first
+  differing byte, both SHA-256 digests, the member copy's recording id). Plain
+  files, never recordings. A dump I/O failure sets
+  `shadow_oracle_dump_incomplete 1` and never changes the hold.
+- The retrieved set at P is pinned (never trimmed; `shadow_retrieved_sets` may
+  read K+1) and the log purge of L is frozen, so an offline replay from the
+  previous VERIFIED shadow to P stays possible.
+
+Runbook: read `/metrics`, copy the dump, adjudicate offline (replay the captured
+log with `LogSpliceRunner`), then stop and wipe or keep. A restart re-latches at
+the same P (the report gains a `re-latched at` line); it is harmless and useless.
+
+Freshness: STANDBY and LOCAL are written only while the newest member snapshot
+the backup named or retrieved is at or below the last EQUAL position; otherwise
+they are skipped (`shadow_oracle_stale_named_total`) until the next EQUAL at or
+above it. ALIGNED needs nothing but its own compare.
+
+### Rollout gate for `SNAPSHOT_MODE=shadow` on members
+
+Switch a member only when, over the agreed window, read twice from the same
+replica `/metrics` and subtracted:
+
+- `shadow_oracle_mismatch_total` delta == 0
+- `shadow_oracle_other_genesis_total` delta == 0
+- `shadow_oracle_match_total` delta == `shadow_trigger_total{kind="ALIGNED"}` delta
+- `shadow_oracle_unreadable_total` and `shadow_align_unverifiable_total` deltas explained
+- `shadow_replica_verified == 1`
+
+| Setting | Default | Range |
+|---|---|---|
+| `REPLICA_MISMATCH_HOLD_MS` | 0 (hold until stopped) | 0..604800000 |
+| `REPLICA_MISMATCH_DIR` | `BASE_DIR/mismatch` | a writable path, checked at boot |
+| `REPLICA_MISMATCH_DUMP_MAX_MB` | 2048 (per image file; 0 writes the report only) | 0..16384 |
+| `REPLICA_FENCE_PURGE_WAIT_MS` | 30000 | 1000..600000 |
+| `REPLICA_MEMBER_CADENCE_MS` | 0 (not checked) | 0..86400000; when set, `REPLICA_READY_SHADOW_AGE_MS` must cover it plus `REPLICA_VERIFY_WAIT_MS` |
 
 ## Readiness
 
@@ -116,8 +178,11 @@ reader and housekeeping threads (`REPLICA_LIVENESS_STALE_MS`).
 
 ## Metrics
 
-Prefixes `shadow_replica_*`, `shadow_align_*`, `shadow_trigger_*`,
-`shadow_retrieved_*` and `replica_attach_*`. The ones to alert on:
-`shadow_replica_fenced`, `shadow_replica_verified`,
+Prefixes `shadow_replica_*`, `shadow_align_*`, `shadow_oracle_*`,
+`shadow_trigger_*`, `shadow_retrieved_*` and `replica_attach_*`. The ones to
+alert on: `shadow_replica_fenced`, `shadow_replica_verified`,
+`shadow_oracle_mismatch_total`, `shadow_oracle_other_genesis_total`,
+`shadow_oracle_mismatch_latched`, `shadow_oracle_dump_incomplete`,
 `shadow_align_verify_timeouts_total`, `shadow_replica_internal_lag_bytes`,
 `shadow_replica_time_lag_ms`, `shadow_replica_backup_auth_rejected_total`.
+`shadow_oracle_match_total` equals `shadow_align_equal_total` by definition.

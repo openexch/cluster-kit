@@ -30,7 +30,7 @@ auth policy, its image format), the engine passes it in.
 | `com.openexchange.cluster.log` | `ClusterLogReader` (reads a committed cluster log without a cluster), `ReplayContainer`, `ShadowEngine` (the apply interface an engine implements), `SkipWindow`. |
 | `com.openexchange.cluster.replica` | The replica process: a non-member that follows the cluster through `ClusterBackup`, applies the log into its own engine instance and writes shadow images, with a trust check after every restore. See [docs/replica.md](docs/replica.md). |
 | `com.openexchange.cluster.shadow` | Shadow images: a verified engine image at a log position written by a non-leader producer, plus the catalog, loader, floor and retention that use it. See [docs/shadow.md](docs/shadow.md). |
-| `com.openexchange.cluster.testkit` | JUnit-free determinism harnesses the engines run in their own tests: `RunTwiceAssert`, `SnapshotSpliceRunner`, `ShadowEngineConformance`, `ShadowRestoreRunner`, `FakeTimerService`, recorded-log fixtures. |
+| `com.openexchange.cluster.testkit` | JUnit-free determinism harnesses the engines run in their own tests: `RunTwiceAssert`, `SnapshotSpliceRunner`, `ShadowEngineConformance`, `ShadowRestoreRunner`, `LogSpliceRunner` (restore at every SNAPSHOT action of a recorded log, equal image at every later action), `FakeTimerService`, recorded-log fixtures. |
 
 Readiness semantics are in [docs/readiness.md](docs/readiness.md); the replica's own `/ready` is in [docs/replica.md](docs/replica.md#readiness).
 

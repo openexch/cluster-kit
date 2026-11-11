@@ -172,6 +172,42 @@ public final class ShadowRetention implements AutoCloseable {
     }
 
     /**
+     * A history fence's suspect purge: every shadow of producer ({@code producerKind}, {@code producerId}) at a
+     * position above {@code position} (the last EQUAL alignment), in any state, forced (the anchor rule would keep
+     * the newest VERIFIED one, which is exactly a suspect: these shadows serialize a log the members never agreed).
+     * A fresh scan; {@code suspects} receives how many were found before the first purge.
+     */
+    public List<PurgeResult> purgeAbove(final long position, final int producerKind, final int producerId,
+                                        final String reason, final java.util.function.IntConsumer suspects) {
+        final Scan s = catalog.scan();
+        final List<ShadowEntry> found = new ArrayList<>();
+        for (final ShadowEntry e : s.all()) {
+            final ShadowHeader h = e.header();
+            final ShadowAlias a = e.alias();
+            final long p;
+            if (h != null && h.producerKind() == producerKind && h.producerId() == producerId) {
+                p = h.logPosition();
+            } else if (h == null && a != null && a.producerKind() == producerKind && a.producerId() == producerId) {
+                p = a.logPosition();
+            } else {
+                continue;
+            }
+            if (p > position) {
+                found.add(e);
+            }
+        }
+        suspects.accept(found.size());
+        final List<PurgeResult> results = new ArrayList<>();
+        for (final ShadowEntry e : found) {
+            final PurgeResult r = catalog.purge(e.recordingId(), true);
+            results.add(r);
+            System.err.println("[SHADOW-RETENTION] suspect purge of rec=" + e.recordingId() + " ("
+                    + (r.purged() ? "purged" : "refused code=" + r.code() + ": " + r.detail()) + "): " + reason);
+        }
+        return results;
+    }
+
+    /**
      * The operator's purge, routed here by the node endpoint (R07/R08). Refuses a pinned position with
      * {@link #PURGE_CODE_PINNED} unless {@code force}; otherwise {@link ShadowCatalog#purge} decides (anchor rule,
      * UNKNOWN, archive codes).

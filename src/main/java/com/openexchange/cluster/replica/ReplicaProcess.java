@@ -40,6 +40,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * exit 1). The backup's termination hook (an {@code AgentTerminationException} in the agent, e.g. STORAGE_SPACE,
  * CBA:1056-1064) is fatal unless the process is closing. A fenced follower and a refused bootstrap call
  * {@code host.fatal}. Exit codes are the lifecycle's: 1 fatal, 143 on a signal, never 0 on a fault.</p>
+ *
+ * <p>An oracle mismatch HOLDS instead ({@code host.hold}): the endpoint, the metrics, the housekeeping thread and the
+ * Aeron error handler stay up (driver loss still halts at once), the process exits on the operator's stop (143), on
+ * driver loss (1) or when {@code REPLICA_MISMATCH_HOLD_MS} elapses (1). The mismatch dump dir is created and checked
+ * writable before anything is launched ({@code REPLICA_MISMATCH_DIR is not writable: <path>}).</p>
  */
 public final class ReplicaProcess implements AutoCloseable {
 
@@ -53,6 +58,14 @@ public final class ReplicaProcess implements AutoCloseable {
 
         /** External mode: wait for the aeronmd's {@code cnc.dat} or throw. */
         void awaitExternalDriver(String aeronDir, long timeoutMs);
+
+        /**
+         * The replica entered the oracle mismatch hold: keep running until stopped. The default only logs; the
+         * lifecycle's stop and error paths are unchanged by a hold.
+         */
+        default void hold(final String reason) {
+            System.err.println("[REPLICA] HOLD: " + reason + " (the process stays up until it is stopped)");
+        }
     }
 
     public static Host of(final EngineLifecycle lifecycle) {
@@ -133,6 +146,7 @@ public final class ReplicaProcess implements AutoCloseable {
 
     private void start(final ReplicaEngine engine, final ClusterBackupEventsListener testListener) {
         System.out.println("[REPLICA] starting " + cfg);
+        MismatchDump.requireWritable(cfg.mismatchDir()); // before any Aeron component
         for (final String line : ReplicaContexts.windowWarnings(cfg)) {
             System.err.println("[REPLICA] " + line);
         }
@@ -172,11 +186,23 @@ public final class ReplicaProcess implements AutoCloseable {
                     final ShadowTriggerPolicy policy = f == null ? null : f.policy();
                     return policy == null ? -1 : policy.lastWriteCompletedNs();
                 }, cfg.off);
+        final ReplicaFollower.Halt halt = new ReplicaFollower.Halt() {
+            @Override
+            public void fatal(final String reason) {
+                host.fatal(reason);
+            }
+
+            @Override
+            public void hold(final String reason) {
+                host.hold(reason);
+            }
+        };
         follower = new ReplicaFollower(cfg, engine, aeron, followerArchive, ReplicaContexts.localArchiveClient(cfg),
-                events, readiness, shadowCounters, verdicts, clock, ReplicaContexts.idle(cfg), host::fatal);
+                events, readiness, shadowCounters, verdicts, clock, ReplicaContexts.idle(cfg), halt);
         followerRef[0] = follower;
         housekeeping = new ReplicaHousekeeping(cfg, aeron, ReplicaContexts.localArchiveClient(cfg), follower,
                 readiness, shadowCounters, verdicts, clock, host::fatal);
+        follower.suspectPurge(housekeeping);
         housekeeping.backupState(this::backupState);
         metrics = new ReplicaMetrics(follower, events, readiness, shadowCounters, this::backupState, clock, wall);
         metrics.housekeeping(housekeeping);

@@ -97,10 +97,17 @@ public final class ReplicaContexts {
     /**
      * Embedded mode only: the member driver tuning of AC:197-209 plus the image liveness. The directory is
      * checked before it is replaced ({@code dirDeleteOnStart(false)}, MD:479-510): a stale directory (no driver
-     * heartbeat within {@code driverTimeoutMs}) is deleted and recreated, a live driver's directory is refused with
-     * {@code ActiveDriverException}. {@code AERON_DIR} is honoured in embedded mode, so an operator's
+     * heartbeat within {@code REPLICA_DRIVER_DIR_ACTIVE_MS}) is deleted and recreated, a live driver's directory is
+     * refused with {@code ActiveDriverException}. {@code AERON_DIR} is honoured in embedded mode, so an operator's
      * {@code TRANSPORT_DRIVER_MODE=embedded} next to an aeronmd's {@code AERON_DIR} must never take over the shared
      * driver (the external-driver negative control).
+     *
+     * <p>A driver writes that heartbeat once per timer tick ({@code aeron.timer.interval}, 1 s by default, aeronmd
+     * the same), so a live driver's heartbeat is up to about a second old; the bound must sit well above that, and
+     * the default is Aeron's driver timeout (10 s). In the driver, {@code driverTimeoutMs} is read only by this
+     * directory check (and its wait for a CnC file still being initialised); the clients' timeouts are their own.
+     * The trade-off: the directory of a driver that crashed is treated as stale only after this long, so an embedded
+     * replica restarted sooner than that after a kill refuses the directory and does not start until it is.</p>
      */
     public static MediaDriver.Context driver(final ReplicaConfig c) {
         return new MediaDriver.Context()
@@ -109,7 +116,7 @@ public final class ReplicaContexts {
                 .sharedIdleStrategy(idle(c))
                 .dirDeleteOnStart(false)
                 .dirDeleteOnShutdown(true)
-                .driverTimeoutMs(500)
+                .driverTimeoutMs(c.driverDirActiveMs)
                 .timerIntervalNs(TimeUnit.MICROSECONDS.toNanos(500))
                 .clientLivenessTimeoutNs(TimeUnit.SECONDS.toNanos(5))
                 .publicationUnblockTimeoutNs(TimeUnit.SECONDS.toNanos(10))

@@ -23,7 +23,12 @@ an environment variable; the engine README lists the setting names (in core:
 | node endpoint | `/health`, `/ready`, `/metrics`. |
 
 Media driver: embedded (dev, demo, tests) or an external `aeronmd`
-(production). Close order: endpoint, follower (reader, then writer, so an
+(production). In embedded mode, when `AERON_DIR` already exists, a driver
+heartbeat at most `REPLICA_DRIVER_DIR_ACTIVE_MS` old (10 000, 2000..600 000)
+means a live driver owns the directory: the replica refuses to start
+(ActiveDriverException) and never takes over an `aeronmd`. A crashed driver's
+directory counts as stale only after this long, so an embedded replica
+restarted sooner after a kill -9 does not start until then. Close order: endpoint, follower (reader, then writer, so an
 in-flight write aborts), housekeeping, clients, backup, archive, driver, then
 (a decided re-bootstrap only) `cluster/` moved aside. Exit code 1 on any fault,
 3 on a decided re-bootstrap (the unit restarts it: `RestartForceExitStatus=3`),

@@ -20,7 +20,10 @@ import org.agrona.concurrent.NanoClock;
 import java.io.File;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
 
@@ -41,8 +44,16 @@ import java.util.function.LongSupplier;
  *       call {@code ArchiveHousekeeping.purgeBelow}, whose safety net would report every trimmed set as CRITICAL.</li>
  *   <li>{@link RetrievedSetTrim}, and the orphan purge through it.</li>
  * </ul>
+ *
+ * <p>Fences. While the replica HOLDS an oracle mismatch this thread keeps running: the log purge of L stays frozen
+ * (the fence gate, so an offline replay from the previous VERIFIED shadow to the mismatch position stays possible),
+ * the retrieved set at the mismatch position is pinned (never trimmed, not counted toward K), retention, the trim of
+ * other sets and the orphan purge continue, and each pass ticks the hold's own bound. A history fence hands this
+ * thread a one-slot suspect purge ({@link #request}): own shadows above the last EQUAL position (or the restore point,
+ * whichever is higher; the ones at or below it are kept) are purged through
+ * {@link ShadowRetention#purgeAbove} (counted {@code shadow_poisoned_purged_total}) while the fencing thread waits.</p>
  */
-public final class ReplicaHousekeeping implements Runnable, AutoCloseable {
+public final class ReplicaHousekeeping implements Runnable, AutoCloseable, ReplicaFence.SuspectPurge {
 
     private static final long PACE_MS = 200;
 
@@ -78,6 +89,9 @@ public final class ReplicaHousekeeping implements Runnable, AutoCloseable {
     private final java.util.Set<Long> sweptRecordings = new java.util.HashSet<>();
     private final java.util.Set<Long> aboveLSeen = new java.util.HashSet<>();
     private volatile LongSupplier backupState = () -> -1;
+    private final AtomicReference<SuspectRequest> suspectRequest = new AtomicReference<>();
+    private volatile long poisonedPurgedTotal;
+    private long pinnedLogged = -1;
 
     public ReplicaHousekeeping(final ReplicaConfig cfg, final Aeron aeron, final AeronArchive.Context archiveContext,
                                final ReplicaFollower follower, final ReplicaReadiness readiness,
@@ -108,7 +122,9 @@ public final class ReplicaHousekeeping implements Runnable, AutoCloseable {
     public void run() {
         while (running) {
             readiness.housekeepingTick();
+            follower.holdTick();
             try {
+                serveSuspectPurge();
                 pass();
             } catch (final RuntimeException failed) {
                 errorsTotal++;
@@ -142,13 +158,18 @@ public final class ReplicaHousekeeping implements Runnable, AutoCloseable {
         final String gate = purgeGate(follower.bootstrapDone(), follower.clusterChecked(), follower.fenced());
         if (gate != null) {
             refusedOnce("[REPLICA-HK] the log purge and the orphan purge wait: " + gate);
+            if (follower.holding()) {
+                // the hold freezes the log purge only: orphans are not an input of the disagreement
+                findOrphansAboveL();
+                purgeOrphans();
+            }
         } else {
             purgeLog(scan);
             findOrphansAboveL();
             purgeOrphans();
         }
         final RetrievedSetTrim.Pass t = trim.apply(cfg.clusterDir(), archive,
-                !cfg.off.contains(ReplicaNegativeControl.SET_TRIM_OFF));
+                !cfg.off.contains(ReplicaNegativeControl.SET_TRIM_OFF), pinned());
         retrievedSets = t.setsPresent();
         retrievedBytes = t.bytesPresent();
     }
@@ -222,11 +243,25 @@ public final class ReplicaHousekeeping implements Runnable, AutoCloseable {
         }
     }
 
-    /** The bootstrap's orphans, once bootstrap is done and the follower is not fenced. */
+    /** The retrieved set an oracle mismatch disagreed with: never trimmed while the replica holds it. */
+    private Set<Long> pinned() {
+        final long p = follower.mismatchPosition();
+        if (p < 0 || cfg.off.contains(ReplicaNegativeControl.MISMATCH_PIN_OFF)) {
+            return Set.of();
+        }
+        if (pinnedLogged != p) {
+            pinnedLogged = p;
+            System.err.println("[REPLICA-HK] CRITICAL: the retrieved member set at " + p + " is pinned (the oracle"
+                    + " disagreed with it); the log purge is frozen at " + logPurgePosition);
+        }
+        return Set.of(p);
+    }
+
+    /** The bootstrap's orphans, once bootstrap is done and the follower is not fenced (or holds a mismatch). */
     private void purgeOrphans() {
         final java.util.Collection<Long> candidates = follower.orphanRecordings();
-        if (candidates.isEmpty() || purgeGate(follower.bootstrapDone(), follower.clusterChecked(),
-                follower.fenced()) != null) {
+        if (candidates.isEmpty() || !follower.holding() && purgeGate(follower.bootstrapDone(),
+                follower.clusterChecked(), follower.fenced()) != null) {
             return;
         }
         for (final long id : trim.purgeOrphans(cfg.clusterDir(), archive, follower.logRecordingId(), candidates,
@@ -278,6 +313,92 @@ public final class ReplicaHousekeeping implements Runnable, AutoCloseable {
         }
         aboveLSeen.clear();
         aboveLSeen.addAll(now);
+    }
+
+    // ------------------------------------------------------------------------------------------------ suspect purge
+
+    /** One history fence's request; completed by this thread. */
+    private static final class SuspectRequest implements ReplicaFence.Pending {
+        final long above;
+        final String reason;
+        final CountDownLatch done = new CountDownLatch(1);
+        volatile int suspects = -1;
+        volatile int purged = -1;
+
+        SuspectRequest(final long above, final String reason) {
+            this.above = above;
+            this.reason = reason;
+        }
+
+        @Override
+        public int await(final long timeoutMs) throws InterruptedException {
+            return done.await(timeoutMs, TimeUnit.MILLISECONDS) ? purged : -1;
+        }
+
+        @Override
+        public int suspects() {
+            return suspects;
+        }
+
+        void complete(final int n) {
+            purged = n;
+            done.countDown();
+        }
+    }
+
+    /** A history fence asks for the suspect purge; served at the start of this thread's next pass. */
+    @Override
+    public ReplicaFence.Pending request(final long above, final String reason) {
+        final SuspectRequest r = new SuspectRequest(above, reason);
+        suspectRequest.set(r);
+        return r;
+    }
+
+    private void serveSuspectPurge() {
+        final SuspectRequest r = suspectRequest.getAndSet(null);
+        if (r == null) {
+            return;
+        }
+        try {
+            if (archive == null) {
+                archive = AeronArchive.connect(archiveContext.clone().aeron(aeron).ownsAeronClient(false));
+            }
+            if (retention == null && !build()) {
+                System.err.println("[REPLICA-HK] history fence: no genesis known, no shadow can exist: nothing to"
+                        + " purge above " + r.above);
+                r.suspects = 0;
+                r.complete(0);
+                return;
+            }
+            final List<com.openexchange.cluster.shadow.ShadowCatalog.PurgeResult> results = retention.purgeAbove(
+                    r.above, ProducerKind.REPLICA.code(), cfg.slot, r.reason, n -> r.suspects = n);
+            final StringBuilder line = new StringBuilder();
+            int purged = 0;
+            for (final com.openexchange.cluster.shadow.ShadowCatalog.PurgeResult result : results) {
+                if (result.purged()) {
+                    purged++;
+                    poisonedPurgedTotal++;
+                    final ShadowEntry e = result.target();
+                    final com.openexchange.cluster.shadow.ShadowHeader h = e == null ? null : e.header();
+                    line.append(line.length() == 0 ? "" : " ")
+                            .append(h != null ? h.logPosition() : e == null || e.alias() == null ? -1
+                                    : e.alias().logPosition())
+                            .append(':').append(h != null ? h.kindEnum() : "UNREADABLE_HEADER");
+                }
+            }
+            System.err.println("[REPLICA-HK] CRITICAL: poisoned shadows purged: [" + line + "] (above " + r.above
+                    + ", the last EQUAL position or the restore point; kept at or below " + r.above + "; "
+                    + (results.size() - purged) + " refused)");
+            r.complete(purged);
+        } catch (final RuntimeException failed) {
+            System.err.println("[REPLICA-HK] CRITICAL: history fence: the suspect purge failed: " + failed);
+            throw failed; // never completed: the fencing thread times out with the wipe line
+        }
+    }
+
+    /** {@code shadow_poisoned_purged_total}: shadows the history fence's suspect purge removed. */
+    public long poisonedPurgedTotal() {
+        return poisonedPurgedTotal;
     }
 
     /** The backup state counter ({@code ClusterBackup.State} code), read by the above-L orphan rule. */

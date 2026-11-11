@@ -60,6 +60,10 @@ public class ShadowTriggerPolicyTest {
     final long[] now = {1_000_000_000L};
     final FakeWriter writer = new FakeWriter();
     final List<String> fences = new ArrayList<>();
+    /** The family of each fence, in the order of {@link #fences}. */
+    final List<FenceFamily> families = new ArrayList<>();
+    /** Called after each recorded fence (a test wires the replica's fence latch here), or null. */
+    ShadowTriggerPolicy.Fence onFence;
     LogCursor cursor = new LogCursor(4096, 1_000, 1, 0);
     long genesis = 7;
     int serializeCalls;
@@ -110,12 +114,43 @@ public class ShadowTriggerPolicyTest {
                     if (serializeLength > dst.capacity()) {
                         throw new IndexOutOfBoundsException("index=" + serializeLength + " capacity=" + dst.capacity());
                     }
-                    return serializeLength;
-                }, () -> now[0], idle, TimeUnit.MILLISECONDS.toNanos(1_000), FALLBACK_MS, 16, fences::add,
-                ReplicaFaults.NONE, off);
+                    // an enveloped image of zero payload bytes, as an engine seals it (the compare opens it first)
+                    dst.setMemory(0, serializeLength, (byte)0);
+                    return new com.openexchange.cluster.SnapshotEnvelope().seal(dst,
+                            serializeLength - com.openexchange.cluster.SnapshotEnvelope.envelopedLength(0));
+                }, () -> now[0], idle, TimeUnit.MILLISECONDS.toNanos(1_000), FALLBACK_MS, 16,
+                new ShadowTriggerPolicy.Fence() {
+                    @Override
+                    public void fence(final String reason) {
+                        fence(FenceFamily.FAULT, reason);
+                    }
+
+                    @Override
+                    public void fence(final FenceFamily family, final String reason) {
+                        families.add(family);
+                        fences.add(reason);
+                        if (onFence != null) {
+                            onFence.fence(family, reason);
+                        }
+                    }
+                }, ReplicaFaults.NONE, off);
         p.startAt(cursor);
         p.attachWriter(writer);
         return p;
+    }
+
+    /**
+     * What the fake serializer writes ({@code length} enveloped bytes of a zero payload); {@code differ} flips one
+     * payload byte and seals again (a same-length copy whose envelope opens and whose bytes differ).
+     */
+    static UnsafeBuffer enveloped(final int length, final boolean differ) {
+        final UnsafeBuffer b = new UnsafeBuffer(new byte[length]);
+        final int payload = length - com.openexchange.cluster.SnapshotEnvelope.envelopedLength(0);
+        if (differ) {
+            b.putByte(com.openexchange.cluster.SnapshotEnvelope.payloadOffset() + payload / 2, (byte)1);
+        }
+        new com.openexchange.cluster.SnapshotEnvelope().seal(b, payload);
+        return b;
     }
 
     ShadowTriggerPolicy policy() {
@@ -445,7 +480,7 @@ public class ShadowTriggerPolicyTest {
         p.producePending();
         assertTrue("held", p.holding());
         latched[0] = true;
-        retrieved.put(4096L, new UnsafeBuffer(new byte[h.serializeLength]));
+        retrieved.put(4096L, enveloped(h.serializeLength, false));
         h.now[0] += TimeUnit.SECONDS.toNanos(1);
         p.pollHeld(4096);
         if (!h.writer.offered.isEmpty()) {

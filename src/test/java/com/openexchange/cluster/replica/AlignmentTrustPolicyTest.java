@@ -58,13 +58,9 @@ public class AlignmentTrustPolicyTest {
         }
     };
 
-    /** What the fake serializer writes: {@code serializeLength} zero bytes. */
+    /** What the fake serializer writes: {@code length} enveloped bytes of a zero payload ({@code differ}: one flipped). */
     DirectBuffer memberImage(final int length, final boolean differ) {
-        final UnsafeBuffer b = new UnsafeBuffer(new byte[length]);
-        if (differ) {
-            b.putByte(length / 2, (byte)1);
-        }
-        return b;
+        return ShadowTriggerPolicyTest.enveloped(length, differ);
     }
 
     AlignmentTrust trust(final boolean fullReplay, final Set<ReplicaNegativeControl> off) {
@@ -153,8 +149,7 @@ public class AlignmentTrustPolicyTest {
     }
 
     void assertDiffers() {
-        final String text = "FATAL replica: state at " + P + " differs from member snapshot (history mismatch or"
-                + " divergence); wipe BASE_DIR";
+        final String text = "oracle mismatch at " + P + ": first difference at byte";
         if (t.fences.stream().noneMatch(f -> f.contains(text))) {
             throw new AssertionError("divergence not fenced: expected '" + text + "', fences " + t.fences
                     + ", offered " + t.writer.offered.size());

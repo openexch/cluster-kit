@@ -24,6 +24,9 @@ import java.util.TreeMap;
  * <p>{@link #purgeOrphans} purges the recordings a {@code cluster/} wipe orphaned (found once at
  * bootstrap by {@code ClusterIdentityCheck.orphans}), re-checked before each purge.</p>
  *
+ * <p>A PINNED position (the set an oracle mismatch disagreed with) is never purged, whatever K, and does not count
+ * toward K, so {@code shadow_retrieved_sets} may read K+1 while a mismatch is held.</p>
+ *
  * <p>This class and {@code ShadowRetention} are the only purge call sites of the replica package (allow-listed by
  * name in {@code ShadowPurgeCallSiteTest}). Archive codes are surfaced; {@code ACTIVE_RECORDING} is retried on the
  * next pass.</p>
@@ -66,6 +69,15 @@ public final class RetrievedSetTrim {
      * @param purge false for the SET_TRIM_OFF control: measure, purge nothing
      */
     public Pass apply(final File clusterDir, final AeronArchive archive, final boolean purge) {
+        return apply(clusterDir, archive, purge, Set.of());
+    }
+
+    /**
+     * @param purge  false for the SET_TRIM_OFF control: measure, purge nothing
+     * @param pinned positions never purged and not counted toward K
+     */
+    public Pass apply(final File clusterDir, final AeronArchive archive, final boolean purge,
+                      final Set<Long> pinned) {
         final TreeMap<Long, List<RecordingLog.Entry>> sets = sets(clusterDir);
         int index = 0;
         int present = 0;
@@ -75,7 +87,8 @@ public final class RetrievedSetTrim {
         final List<String> refusals = new ArrayList<>();
         final List<Long> kept = new ArrayList<>();
         for (final Map.Entry<Long, List<RecordingLog.Entry>> set : sets.entrySet()) {
-            final boolean older = index++ >= keep;
+            final boolean pin = pinned.contains(set.getKey());
+            final boolean older = !pin && index++ >= keep;
             int remaining = 0;
             long setBytes = 0;
             for (final RecordingLog.Entry e : set.getValue()) {

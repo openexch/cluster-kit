@@ -85,19 +85,30 @@ import java.util.concurrent.TimeUnit;
  * <p>A GENESIS start is VERIFIED; a LOCAL_SHADOW start is UNVERIFIED ({@code /ready} 503 {@code unverified
  * continuation}, no STANDBY or LOCAL shadow) until the first ALIGNED image compares byte-equal with the member
  * snapshot the backup retrieved at the same position. Every ALIGNED is compared ({@link AlignmentTrust}); a
- * difference fences.</p>
+ * same-genesis byte difference holds, a copy of another genesis is a history fence.</p>
  *
  * <h2>Fence</h2>
- * <p>Any throwable out of a poll latches {@code fenced}, aborts the in-flight write and calls the host's fatal hook
+ * <p>Any throwable out of a poll latches the fence, aborts the in-flight write and calls the host's fatal hook
  * ({@code FATAL replica: apply fenced at <pos>: <reason>}); nothing is serialized after it because the trigger's
- * serialize runs only after a poll returned normally.</p>
+ * serialize runs only after a poll returned normally. The fence carries a {@link FenceFamily} ({@link ReplicaFence}):
+ * a same-history byte mismatch HOLDS (this thread stops applying and only ticks liveness until the process is
+ * stopped), a history fence (another genesis, an applied-past member snapshot, a cluster identity refusal) purges own
+ * shadows above the last EQUAL position or the restore point, whichever is higher, through the housekeeping thread,
+ * awaited, then exits 1; every other fence exits 1.</p>
  */
 public final class ReplicaFollower implements Runnable, AutoCloseable {
 
-    /** The host's fatal hook: {@code lifecycle.fatal(1, reason)}. */
+    /** The host's fatal hook: {@code lifecycle.fatal(1, reason)}; and the mismatch hold notice. */
     @FunctionalInterface
     public interface Halt {
         void fatal(String reason);
+
+        /**
+         * The replica entered the oracle mismatch hold: the process must stay up (endpoint, metrics, housekeeping)
+         * until it is stopped. The default does nothing beyond what the caller logged.
+         */
+        default void hold(final String reason) {
+        }
     }
 
     static final String REPLAY_CHANNEL = "aeron:ipc?linger=0|sparse=true";
@@ -124,7 +135,8 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
     private final RecordingLogView logView;
 
     private volatile boolean running = true;
-    private volatile String fenced;
+    /** The fence latch and what each family does after it. */
+    private final ReplicaFence fence;
     private volatile long knownGenesis;
     private volatile long logRecordingId = -1;
     private volatile long logStartPosition = -1;
@@ -195,6 +207,28 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
         this.halt = Objects.requireNonNull(halt, "halt");
         this.attachBackoffNs = TimeUnit.MILLISECONDS.toNanos(cfg.attachBackoffMs);
         this.attachRefusals = new AttachRefusalLog(System.err, clock);
+        this.fence = new ReplicaFence(halt, new ReplicaFence.Effects() {
+            @Override
+            public void fenced(final String reason) {
+                readiness.fenced(reason);
+            }
+
+            @Override
+            public void refused(final String reason) {
+                readiness.refused(reason);
+            }
+
+            @Override
+            public void abortWrite() {
+                final ShadowWriter w = writer;
+                if (w != null) {
+                    w.requestAbort();
+                }
+            }
+        }, new MismatchHold(cfg.mismatchHoldMs, clock, halt),
+                new MismatchDump(cfg.mismatchDir(), cfg.mismatchDumpMaxMb,
+                        org.agrona.concurrent.SystemEpochClock.INSTANCE, MismatchDump.FILES),
+                cfg.fencePurgeWaitMs, cfg.off);
         this.logView = new RecordingLogView(cfg.clusterDir());
         this.copies = new NamedCopyResolver(new NamedCopyResolver.Source() {
             @Override
@@ -239,6 +273,11 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
             public String termContradiction(final long recordingId) {
                 return ClusterIdentityCheck.termContradictionOf(logView.get(), recordingId);
             }
+
+            @Override
+            public String refusalOf(final GenesisGuard.Named n) {
+                return copies.refusalOf(n);
+            }
         }, clock, AlignmentTrust.CHECK_PACE_NS, cfg.off.contains(ReplicaNegativeControl.GENESIS_CHECK_OFF));
         if (binding.engineId() != cfg.engineId) {
             throw new IllegalArgumentException("engine binding id " + binding.engineId() + " != config engineId "
@@ -271,6 +310,22 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
                     + t);
         } finally {
             closeReplay();
+        }
+        holdLoop();
+    }
+
+    /**
+     * The mismatch hold: nothing is applied or written; this thread only keeps its liveness tick so {@code /health}
+     * reads the process as alive (it is: it serves its evidence) until the process is stopped.
+     */
+    private void holdLoop() {
+        if (!fence.holding()) {
+            return;
+        }
+        System.err.println("[REPLICA] follower held at " + applied + ": " + fence.reason());
+        while (running) {
+            readiness.followerTick();
+            sleepQuietly(100);
         }
     }
 
@@ -541,17 +596,26 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
         policy = new ShadowTriggerPolicy(imageBuffer, cfg.engineId, () -> container.cursor(), binding.identity(),
                 dst -> container.serialize(dst), clock, ReplicaContexts.idle(cfg),
                 TimeUnit.MILLISECONDS.toNanos(cfg.alignedWaitMs), cfg.standbyFallbackMs, cfg.shadowBufferMb,
-                this::fence, cfg.faults, cfg.off);
+                new ShadowTriggerPolicy.Fence() {
+                    @Override
+                    public void fence(final String reason) {
+                        ReplicaFollower.this.fence(reason);
+                    }
+
+                    @Override
+                    public void fence(final FenceFamily family, final String reason) {
+                        ReplicaFollower.this.fence(family, reason);
+                    }
+                }, cfg.faults, cfg.off);
         policy.startAt(container.cursor());
-        policy.fencedProbe(() -> fenced != null); // a fence on any thread stops every hand-off
+        policy.fencedProbe(() -> fence.reason() != null); // a fence on any thread stops every hand-off
         // only a full replay from genesis is trusted at once; a restore is UNVERIFIED until the first
         // byte-equal ALIGNED compare with a member snapshot
         final Set<Integer> snapshotStreams = cfg.snapshotStreamIds();
         trust = new AlignmentTrust(ClusterIdentityCheck.retrieved(aeron, archive, clock, logView,
                 TimeUnit.MILLISECONDS.toNanos(cfg.loadTimeoutMs), events::newestReportedServiceSnapshot,
-                () -> ClusterIdentityCheck.retrievalProgress(aeron.countersReader(), snapshotStreams)), clock,
-                cfg.verifyWaitMs, cfg.engineId,
-                cfg.clusterId, cfg.off.contains(ReplicaNegativeControl.ALIGN_COMPARE_OFF));
+                () -> ClusterIdentityCheck.retrievalProgress(aeron.countersReader(), snapshotStreams), binding,
+                cfg.clusterId), clock, cfg.verifyWaitMs, cfg.engineId, cfg.clusterId, cfg.off);
         trust.start(path == ReplicaReadiness.RestorePath.GENESIS, container.logPosition());
         trust.backupCycle(cfg.backupQueryIntervalMs + cfg.backupCooldownMs); // the no-usable-named-copy CRITICAL threshold
         // while the newest named snapshot has no usable copy the stall clock runs
@@ -575,7 +639,7 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
                 TimeUnit.MILLISECONDS.toNanos(cfg.writeOfferTimeoutMs),
                 TimeUnit.MILLISECONDS.toNanos(cfg.writeRecordTimeoutMs), maxSeq + 1, maxPos, shadowCounters);
         writerThread = new ShadowWriterThread(writer, policy, this::onWriterError, shadowCounters);
-        writerThread.fenceLatch(() -> fenced != null); // read by the writer thread before each write starts
+        writerThread.fenceLatch(() -> fence.reason() != null); // read by the writer thread before each write starts
         policy.attachWriter(ShadowTriggerPolicy.port(writerThread));
         readiness.restored(path);
         bootstrapDone = true;
@@ -602,10 +666,7 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
     }
 
     private void halt(final String text) {
-        fenced = text;
-        readiness.fenced(text);
-        System.err.println(text);
-        halt.fatal(text);
+        fence.fence(FenceFamily.FAULT, text, false, -1, null);
     }
 
     // ------------------------------------------------------------------------------------------------ follow
@@ -614,7 +675,7 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
         final long first = container.logPosition();
         System.out.println("[REPLICA] following L=" + logRecordingId + " from " + first);
         idle.reset();
-        while (running && fenced == null) {
+        while (running && fence.reason() == null) {
             logView.beginPass();
             readiness.followerTick();
             int work = 0;
@@ -622,7 +683,7 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
                 work += tryAttach();
             } else if (!checkCluster()) {
                 // every named snapshot is compared, paced; a refusal fences, an unreadable copy is retried
-                if (fenced != null) {
+                if (fence.reason() != null) {
                     return;
                 }
             }
@@ -658,12 +719,12 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
                     policy.observeFrames(at);
                     if (policy.hasPending()) {
                         policy.producePending();
-                        if (fenced != null) {
+                        if (fence.reason() != null) {
                             return;
                         }
                     }
                     policy.pollHeld(applied);
-                    if (fenced != null) {
+                    if (fence.reason() != null) {
                         return;
                     }
                 } else if (image.isEndOfStream() || image.isClosed()) {
@@ -676,6 +737,7 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
                 policy.producePending();
             }
             policy.pollHeld(applied);
+            attachRefusals.tick();
             status();
             idle.idle(work);
         }
@@ -805,21 +867,15 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
         }
     }
 
-    /** A cluster identity refusal after bootstrap: latched like a fence (the loop stops), read as refused, exit 1. */
+    /**
+     * A cluster identity refusal after bootstrap: a history fence (the loop stops, read as refused, own shadows above
+     * the last EQUAL position or the restore point purged, awaited, then exit 1). The same family and purge as
+     * another genesis seen at the alignment compare, whichever thread sees the new cluster first.
+     */
     private void refuseCluster(final String text) {
-        synchronized (this) {
-            if (fenced != null) {
-                return;
-            }
-            fenced = text;
-        }
-        System.err.println("[REPLICA] CRITICAL: " + text);
-        readiness.refused(text);
-        final ShadowWriter w = writer;
-        if (w != null) {
-            w.requestAbort();
-        }
-        halt.fatal(text);
+        final AlignmentTrust t = trust;
+        fence.fence(FenceFamily.HISTORY, text, true,
+                ReplicaFence.historyPurgeBound(t == null ? -1 : t.verifiedAt(), restoredPosition), null);
     }
 
     /** The counter recording L right now, by recording id (a recycled counter id never matches), or {@code NULL_VALUE}. */
@@ -897,21 +953,27 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
 
     // ------------------------------------------------------------------------------------------------ fence
 
-    /** Latch the fence (any thread): abort the in-flight write, readiness 503, the host's fatal hook. */
+    /** Latch a FAULT fence (any thread): abort the in-flight write, readiness 503, the host's fatal hook. */
     void fence(final String reason) {
-        synchronized (this) {
-            if (fenced != null) {
-                return;
-            }
-            fenced = reason;
-        }
-        System.err.println("[REPLICA] CRITICAL: " + reason);
-        readiness.fenced(reason);
-        final ShadowWriter w = writer;
-        if (w != null) {
-            w.requestAbort();
-        }
-        halt.fatal(reason);
+        fence(FenceFamily.FAULT, reason);
+    }
+
+    /** Latch a fence of {@code family} ({@link ReplicaFence}). */
+    void fence(final FenceFamily family, final String reason) {
+        final AlignmentTrust t = trust;
+        fence.fence(family, reason, false,
+                ReplicaFence.historyPurgeBound(t == null ? -1 : t.verifiedAt(), restoredPosition),
+                family == FenceFamily.MISMATCH && t != null ? t.mismatchEvidence() : null);
+    }
+
+    /** The housekeeping thread's suspect purge, armed by the process after the thread is built. */
+    void suspectPurge(final ReplicaFence.SuspectPurge port) {
+        fence.suspectPurge(port);
+    }
+
+    /** Housekeeping pass: the mismatch hold's own bound. */
+    void holdTick() {
+        fence.tickHold();
     }
 
     // ------------------------------------------------------------------------------------------------ close
@@ -990,7 +1052,33 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
     }
 
     public String fenced() {
-        return fenced;
+        return fence.reason();
+    }
+
+    /** The latched fence's family, null when not fenced. */
+    public FenceFamily fenceFamily() {
+        return fence.family();
+    }
+
+    /** {@code shadow_oracle_mismatch_latched}: in the oracle mismatch hold. */
+    public boolean holding() {
+        return fence.holding();
+    }
+
+    /** {@code shadow_oracle_hold_ms}: -1 when not holding. */
+    public long heldMs() {
+        return fence.heldMs();
+    }
+
+    /** {@code shadow_oracle_dump_incomplete}. */
+    public boolean dumpIncomplete() {
+        return fence.dumpIncomplete();
+    }
+
+    /** The position of the latched byte mismatch (the retrieved set housekeeping pins), -1 when none. */
+    public long mismatchPosition() {
+        final AlignmentTrust t = trust;
+        return t == null || fence.family() != FenceFamily.MISMATCH ? -1 : t.mismatchAt();
     }
 
     public long appliedPosition() {
@@ -1081,6 +1169,10 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
                                   final long timestamp, final int responseStreamId, final String responseChannel,
                                   final byte[] encodedPrincipal) {
             cfg.faults.beforeFrame(FrameKind.SESSION_OPEN, logPosition);
+            if (cfg.off.contains(ReplicaNegativeControl.SKIP_SESSION_OPEN)) {
+                System.err.println("[REPLICA] NC SKIP_SESSION_OPEN: session open at " + logPosition + " dropped");
+                return;
+            }
             container.onSessionOpen(leadershipTermId, logPosition, clusterSessionId, timestamp, responseStreamId,
                     responseChannel, encodedPrincipal);
         }

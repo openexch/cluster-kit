@@ -124,7 +124,7 @@ public class ReplicaProcessSmokeTest {
      * alignment compare sees the member snapshot it would see on a real engine.
      */
     static final class MirrorService implements ClusteredService {
-        final HashChainEngine engine = new HashChainEngine();
+        final EnvelopedEngine engine = new EnvelopedEngine(new HashChainEngine());
         private Cluster cluster;
 
         @Override
@@ -159,7 +159,7 @@ public class ReplicaProcessSmokeTest {
 
         @Override
         public void onTakeSnapshot(final ExclusivePublication snapshotPublication) {
-            final UnsafeBuffer image = new UnsafeBuffer(new byte[HashChainEngine.IMAGE_LENGTH]);
+            final UnsafeBuffer image = new UnsafeBuffer(new byte[ENVELOPED_IMAGE_LENGTH]);
             final int n = engine.serialize(image);
             while (snapshotPublication.offer(image, 0, n) < 0) {
                 Thread.onSpinWait();
@@ -286,8 +286,13 @@ public class ReplicaProcessSmokeTest {
 
     // ------------------------------------------------------------------------------------------------ replica
 
+    /** The hash-chain image inside the snapshot envelope (what the member writes and the replica serializes). */
+    static final int ENVELOPED_IMAGE_LENGTH = com.openexchange.cluster.SnapshotEnvelope.envelopedLength(
+            HashChainEngine.IMAGE_LENGTH);
+
     static final class Binding implements ReplicaEngine {
-        final HashChainEngine engine = new HashChainEngine();
+        final HashChainEngine hash = new HashChainEngine();
+        final EnvelopedEngine engine = new EnvelopedEngine(hash);
 
         @Override
         public int engineId() {
@@ -327,9 +332,9 @@ public class ReplicaProcessSmokeTest {
         @Override
         public ShadowSelfCheck selfCheck() {
             return (payload, length) -> {
-                final HashChainEngine scratch = new HashChainEngine();
+                final EnvelopedEngine scratch = new EnvelopedEngine(new HashChainEngine());
                 scratch.restore(payload, length);
-                final UnsafeBuffer again = new UnsafeBuffer(new byte[HashChainEngine.IMAGE_LENGTH]);
+                final UnsafeBuffer again = new UnsafeBuffer(new byte[ENVELOPED_IMAGE_LENGTH]);
                 final int n = scratch.serialize(again);
                 if (n != length) {
                     return false;
@@ -452,7 +457,7 @@ public class ReplicaProcessSmokeTest {
         assertTrue("fatal: " + fatals, fatals.isEmpty());
         assertEquals(ReplicaReadiness.RestorePath.GENESIS, replica.readiness().restorePath());
         await("applied past the first messages", () -> replica.follower().appliedPosition() > 0
-                && first.engine.count() >= 20, 60_000);
+                && first.hash.count() >= 20, 60_000);
 
         toggle(ClusterControl.ToggleState.SNAPSHOT);
         await("ALIGNED shadow", () -> replica.follower().policy().writtenTotal(ShadowKind.ALIGNED) >= 1
@@ -476,11 +481,11 @@ public class ReplicaProcessSmokeTest {
         // through the out-of-band control counter, so under load the STANDBY toggle can be sequenced before the five
         // messages above (one observed run: STANDBY at 2368 = ALIGNED 2272 + 96, L stop 2848 = 2368 + 5 x 96);
         // only those runs had a tail to replay at the restart. The restart path now always replays a tail.
-        final long countAtStandby = first.engine.count();
+        final long countAtStandby = first.hash.count();
         send(4);
-        await("the tail applied before the restart", () -> first.engine.count() >= countAtStandby + 4, 60_000);
-        final long countBefore = first.engine.count();
-        final long chainBefore = first.engine.chain();
+        await("the tail applied before the restart", () -> first.hash.count() >= countAtStandby + 4, 60_000);
+        final long countBefore = first.hash.count();
+        final long chainBefore = first.hash.chain();
         final long appliedBefore = replica.follower().appliedPosition();
         assertTrue("a tail after the newest shadow (applied " + appliedBefore + ", STANDBY " + standby + ")",
                 appliedBefore > standby);
@@ -511,11 +516,11 @@ public class ReplicaProcessSmokeTest {
                 + ", clusterChecked " + replica.follower().clusterChecked() + ", tail " + (appliedBefore - standby)
                 + " bytes)");
         assertEquals("the restored engine plus the tail equals the first run's engine", countBefore,
-                second.engine.count());
-        assertEquals(chainBefore, second.engine.chain());
+                second.hash.count());
+        assertEquals(chainBefore, second.hash.chain());
         send(3);
         try {
-            await("live after restart", () -> second.engine.count() >= countBefore + 3, 60_000);
+            await("live after restart", () -> second.hash.count() >= countBefore + 3, 60_000);
         } catch (final AssertionError timeout) {
             throw new AssertionError(timeout.getMessage() + ": " + replica.readiness().probe().detail() + " queries="
                     + replica.events().queries() + " responses=" + replica.events().responses() + " resets="
@@ -524,6 +529,6 @@ public class ReplicaProcessSmokeTest {
         assertTrue("fatal: " + fatals, fatals.isEmpty());
         System.out.println("GREEN replica smoke: ALIGNED at " + aligned + ", STANDBY at " + standby
                 + ", restart LOCAL_SHADOW at " + replica.follower().restoredPosition() + ", count "
-                + second.engine.count());
+                + second.hash.count());
     }
 }

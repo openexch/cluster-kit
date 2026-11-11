@@ -167,4 +167,32 @@ public class ReplicaPackageScanTest {
             System.out.println("NC REPLICA_PURGE_PROBE -> " + expected.getMessage());
         }
     }
+
+    // ------------------------------------------------------------------------------------------- the live oracle
+
+    /** The mismatch dump writes files only: it never references the shadow package or the archive client. */
+    @Test
+    public void theMismatchDumpNeverTouchesTheCatalogOrTheArchive() {
+        final NeverSchedulesScan.Rules archiveOrShadow = new NeverSchedulesScan.Rules(Set.of(),
+                List.of("com/openexchange/cluster/shadow/", "io/aeron/archive/"), Set.of(), Map.of(), Map.of(),
+                Map.of());
+        final NeverSchedulesScan.Report dump = NeverSchedulesScan.scanDirectory(main(),
+                n -> is(n, PKG + "MismatchDump"), archiveOrShadow);
+        assertTrue("scanned " + dump.classesScanned(), dump.classesScanned() >= 1);
+        assertTrue(dump.findings().toString(), dump.clean());
+        assertTrue("the dump is not in the shadow package",
+                MismatchDump.class.getPackageName().endsWith(".replica"));
+    }
+
+    /** The action ring is recorded at the action and has no fixed capacity (a capacity is a false history fence). */
+    @Test
+    public void theActionRingHasNoFixedCapacity() throws NoSuchFieldException {
+        for (final java.lang.reflect.Field f : AlignmentTrust.class.getDeclaredFields()) {
+            if (f.getName().toUpperCase(java.util.Locale.ROOT).contains("KEPT")
+                    || f.getName().toUpperCase(java.util.Locale.ROOT).contains("CAPACITY")) {
+                throw new AssertionError("action ring has a fixed capacity: " + f);
+            }
+        }
+        assertEquals(java.util.TreeSet.class, AlignmentTrust.class.getDeclaredField("actions").getType());
+    }
 }

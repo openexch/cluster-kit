@@ -114,6 +114,19 @@ public final class ReplicaMetrics {
         line(sb, "shadow_align_verify_timeouts_total", p == null ? 0 : p.verifyTimeouts());
         line(sb, "shadow_trigger_untrusted_total", p == null ? 0 : p.untrustedTotal());
         line(sb, "shadow_trigger_after_fence_total", p == null ? 0 : p.afterFenceDroppedTotal());
+        // the live oracle (the trust's compare verdicts and the mismatch hold); match_total is equal_total by name
+        line(sb, "shadow_oracle_match_total", trust == null ? 0 : trust.equalTotal());
+        line(sb, "shadow_oracle_mismatch_total", trust == null ? 0 : trust.mismatchTotal());
+        line(sb, "shadow_oracle_unreadable_total", trust == null ? 0 : trust.unreadableTotal());
+        line(sb, "shadow_oracle_other_genesis_total", trust == null ? 0 : trust.otherGenesisTotal());
+        line(sb, "shadow_oracle_pre_adopt_total", trust == null ? 0 : trust.preAdoptTotal());
+        line(sb, "shadow_oracle_stale_named_total", trust == null ? 0 : trust.staleNamedTotal());
+        line(sb, "shadow_oracle_mismatch_position", trust == null ? -1 : trust.mismatchAt());
+        line(sb, "shadow_oracle_mismatch_latched", follower.holding() ? 1 : 0);
+        line(sb, "shadow_oracle_hold_ms", follower.heldMs());
+        line(sb, "shadow_oracle_dump_incomplete", follower.dumpIncomplete() ? 1 : 0);
+        line(sb, "shadow_poisoned_purged_total", hk == null ? 0 : hk.poisonedPurgedTotal());
+        line(sb, "shadow_align_actions_ring", trust == null ? 0 : trust.actionsRing());
         for (final Map.Entry<String, Long> e : shadowCounters.snapshot().entrySet()) {
             line(sb, e.getKey(), e.getValue());
         }

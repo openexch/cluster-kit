@@ -45,6 +45,9 @@ final class NamedCopyResolver {
     private final Set<Long> notIt = new HashSet<>();
     private GenesisGuard.Named resolvedNamed;
     private long resolvedCopy = -1;
+    /** The named snapshot whose copy was last refused by its content, and why. */
+    private GenesisGuard.Named refusedNamed;
+    private String refusedReason;
 
     NamedCopyResolver(final Source source) {
         this.source = Objects.requireNonNull(source, "source");
@@ -77,6 +80,10 @@ final class NamedCopyResolver {
         try {
             return source.genesisOf(recordingId);
         } catch (final ClusterIdentityCheck.CopyRefused refused) {
+            if (resolvedCopy == recordingId && resolvedNamed != null) {
+                refusedNamed = resolvedNamed;
+                refusedReason = "rec " + recordingId + ": " + refused.getMessage();
+            }
             forget(recordingId);
             if (notIt.add(recordingId)) {
                 System.err.println("[REPLICA] CRITICAL: retrieved snapshot recording " + recordingId + " is refused by"
@@ -94,6 +101,11 @@ final class NamedCopyResolver {
             resolvedCopy = -1;
             resolvedNamed = null;
         }
+    }
+
+    /** Why the copy of {@code n} was refused by its content, null when no copy of it was. */
+    String refusalOf(final GenesisGuard.Named n) {
+        return n.equals(refusedNamed) ? refusedReason : null;
     }
 
     /** Candidates never read again (tests). */

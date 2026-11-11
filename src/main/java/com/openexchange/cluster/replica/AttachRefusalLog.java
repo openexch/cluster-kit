@@ -13,10 +13,12 @@ import java.util.regex.Pattern;
 /**
  * The follower's log of refused replay attaches ({@code archive.startReplay} of L throwing). Follower thread only.
  *
- * <p>Deduplicated on the reason text (the exception's string with the archive's correlation id
- * removed, so each attempt's new id does not make a new line): one line per distinct reason, plus a count line every
- * {@link #COUNT_PERIOD_MS} while refusals continue, and a last count when an attach succeeds. The readiness detail and
- * {@code replica_attach_failures_total} still see every refusal.</p>
+ * <p>Deduplicated on the reason text: the exception's string with every {@code =<number>} masked to {@code =*} (the
+ * correlation id, the replay limit and every other numeric field change between attempts of one cause; numeric
+ * archive codes are masked too, by design, while a code spelled as a name still separates two reasons): one line per
+ * distinct reason, plus a count line every {@link #COUNT_PERIOD_MS} while refusals continue, flushed by
+ * {@link #tick} when the window ended without another refusal, and a last count when an attach succeeds. The
+ * readiness detail and {@code replica_attach_failures_total} still see every refusal.</p>
  */
 final class AttachRefusalLog {
 
@@ -24,7 +26,7 @@ final class AttachRefusalLog {
     static final long COUNT_PERIOD_MS = 30_000;
     /** Distinct reasons remembered (least recently seen dropped first): a memory guard for the log only. */
     private static final int REASONS_REMEMBERED = 256;
-    private static final Pattern CORRELATION_ID = Pattern.compile("correlationId=-?\\d+");
+    private static final Pattern NUMBER_FIELD = Pattern.compile("=-?\\d+");
 
     private final PrintStream out;
     private final NanoClock clock;
@@ -48,9 +50,9 @@ final class AttachRefusalLog {
         this.clock = Objects.requireNonNull(clock, "clock");
     }
 
-    /** The reason text of a refusal: {@code text} without the archive's correlation id. */
+    /** The reason text of a refusal: {@code text} with every numeric field value masked. */
     static String reason(final String text) {
-        return CORRELATION_ID.matcher(text).replaceAll("correlationId=*");
+        return NUMBER_FIELD.matcher(text).replaceAll("=*");
     }
 
     /** One refused attach of {@code l} from {@code from}; {@code text} is the exception's string. */
@@ -76,6 +78,13 @@ final class AttachRefusalLog {
     /** An attach succeeded: the pending count is logged. */
     void attached() {
         if (windowCount > 0) {
+            count(clock.nanoTime());
+        }
+    }
+
+    /** Once per follower pass: logs the pending count when the window's period ended with no further refusal. */
+    void tick() {
+        if (windowCount > 0 && clock.nanoTime() - windowStartNs >= periodNs) {
             count(clock.nanoTime());
         }
     }

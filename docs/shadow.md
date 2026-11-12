@@ -200,6 +200,78 @@ host, and keep the retry backoff at or above 5 s, the source's replay linger).
 A LEADER never pulls: while the role is LEADER a pass lists and starts nothing,
 and every in-flight pull is stopped and its partial copy purged.
 
+Nobody pulls from the leader either. A host may pass the current leader's
+archive control endpoint (`ShadowPuller.deferredSource`; a member derives it
+from the leader id in the leader's own `CommitPosition` and the members table):
+a discovery pass skips that source (`shadow_pull_source_skipped_leader_total`)
+and lists it again once the leader changed. The comparison is a plain
+`host:port` text compare, so a member entry in `SHADOW_PULL_SOURCES` must be
+spelled as the cluster members table spells its archive endpoint. At boot
+`ShadowPullSettings.checkSpelling` resolves every source and every member
+archive endpoint: a source that names a member's endpoint under another
+spelling refuses the boot (`... names member <m>'s archive endpoint <e> with a
+different spelling: spell it ...`); a host that does not resolve logs CRITICAL
+and is kept; the boot line classifies each source as `member <id>` or
+`non-member`.
+
+## The follower producer
+
+A cluster member in shadow mode writes an ALIGNED shadow of its own engine
+image when it is the designated follower of the current term: the member whose
+id follows the leader's in the static members table, wrapping
+(`ProducerDesignation`). The leader id comes from the leader's own
+`CommitPosition` message for the current term (`ConsensusReadiness.leader()`),
+cross-checked against the log's `NewLeadershipTermEvent` when the process saw
+that frame; a disagreement skips the copy with one CRITICAL line per term. A
+follower restarted mid-term never replays the term's frame, so the commit wire
+is the primary source and it produces at the next P_cm without an election.
+Designation decides only whether this node writes a copy of its own image into
+its own archive; no replicated value reads it.
+
+The image is serialized inside the member's own `onTakeSnapshot`, after the
+stub was offered, at exactly P_cm; the self-check, offer, recording and
+registration run on the writer thread with its own archive client. Producer
+identity is `F<memberId>`. The writer is armed once per process after the
+ADOPT: the seq over header-bearing copies and header-less TOO_SHORT aliases of
+this producer, the position over its usable copies only. `CrashedWriteSweep`
+purges this producer's crashed writes from before this process through
+`ShadowRetention.purge` (`shadow_crashed_writes_purged_total`).
+
+Every false guard leg is a counted skip (`shadow_producer_skipped_total{reason}`),
+never a fault: `not_shadow_mode`, `full_image`, `producer_none`, `skip_window`,
+`not_ready`, `leader`, `leader_unknown`, `leader_mismatch`, `not_designated`,
+`unarmed`, `busy`, `liveness_bound` (the last serialize above half the client
+liveness timeout), `window_budget` (`ProducerWindowGuard`: the serialize would
+fill more than `SHADOW_PRODUCER_WINDOW_BUDGET_PCT` of the log receiver window
+at the recent ingress rate), `capacity` (the image does not fit
+`SHADOW_PRODUCER_BUFFER_MB`; caught inside the shadow branch, the callback
+returns normally). A write in flight when the node becomes LEADER is aborted
+and its partial recording purged. On an external driver a driver loss halts
+the member (exit 1) after the client driver timeout; a write the writer
+finishes over IPC before that timeout is a normal complete copy.
+
+Settings (`ShadowProducerSettings`, one parser; refusal text without a host
+prefix): `SHADOW_PRODUCER` designated-follower | none (none logs CRITICAL: the
+two-producer anchor depends on other producers), `SHADOW_TERM_LENGTH` 4m
+(64k..16m, power of two), `SHADOW_PRODUCER_BUFFER_MB` 512 (1..2047),
+`SHADOW_WRITE_CONNECT_TIMEOUT_MS` 10000, `SHADOW_WRITE_OFFER_TIMEOUT_MS` 30000,
+`SHADOW_WRITE_RECORD_TIMEOUT_MS` 60000 (each 1..86 400 000),
+`SHADOW_PRODUCER_WINDOW_BUDGET_PCT` 50 (1..100),
+`SHADOW_PRODUCER_SERIALIZE_ESTIMATE_MS` 1000 (1..600 000),
+`SHADOW_PRODUCER_RATE_WINDOW_MS` 10000 (1000..3 600 000).
+
+### The floor-side witness alarm
+
+`WitnessAlarm`, evaluated by every follower's floor after each scan under
+`two-producers`: when the newest VERIFIED position holding an ALIGNED copy has
+fewer than two producers for longer than the host's window, one CRITICAL line
+per window, `no two-producer anchor for <n> min: newest ALIGNED at P=<p> has
+producers [<list>]; missing kind <R (replica)|F (designated follower)>`, and
+`shadow_floor_witness_missing{kind}` reads 1 while it holds. The first
+evaluation with two producers clears it (`two-producer anchor restored: ...`).
+A leader's catalog is frozen (it neither pulls nor produces), so a leader does
+not evaluate; leading resets the alarm. Readiness never reads it.
+
 ## Writer edge cases
 
 - `requestAbort()` aborts only the write in flight; with none in flight it does

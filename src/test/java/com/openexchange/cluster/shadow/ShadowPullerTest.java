@@ -581,4 +581,42 @@ public class ShadowPullerTest {
                     + result.get().text() + "'");
         }
     }
+
+    // ------------------------------------------------------------------------------------------- leader source
+
+    /** The source is the current leader's archive: not listed, counted; listed and pulled once the leader changed. */
+    static void leaderSourceSkipped(final Set<NegativeControl> off) {
+        try (Pair p = new Pair(10)) {
+            p.src.write(R3, 1, ShadowKind.ALIGNED, 1_000, SMALL, 1, "64k");
+            final AtomicReference<String> leaderArchive = new AtomicReference<>("localhost:" + p.src.controlPort);
+            p.puller = p.puller(p.settings(120_000, 1, false), GENESIS, () -> false, off);
+            p.puller.deferredSource(leaderArchive::get);
+            p.puller.start();
+            await("discovery passes with the leader source deferred",
+                    () -> p.get(Counter.SOURCE_SKIPPED_LEADER_TOTAL) >= 2 || p.get(Counter.STARTED_TOTAL) > 0, 20_000);
+            sleep(2 * PERIOD_MS);
+            if (p.get(Counter.STARTED_TOTAL) != 0 || p.get(Counter.PULL_TOTAL) != 0) {
+                throw new AssertionError("a pull was started from the leader's archive: started="
+                        + p.get(Counter.STARTED_TOTAL) + " pulled=" + p.get(Counter.PULL_TOTAL));
+            }
+            assertTrue("skips counted", p.get(Counter.SOURCE_SKIPPED_LEADER_TOTAL) >= 2);
+            assertEquals("the leader gate is a different rule", 0, p.get(Counter.SKIPPED_LEADER_TOTAL));
+            leaderArchive.set(null);
+            await("pulled once the source is no longer the leader's", () -> p.get(Counter.PULL_TOTAL) == 1, 20_000);
+            final long skipped = p.get(Counter.SOURCE_SKIPPED_LEADER_TOTAL);
+            leaderArchive.set("localhost:1"); // another member leads: the source is listed
+            sleep(3 * PERIOD_MS);
+            assertEquals("a different leader endpoint skips nothing", skipped,
+                    p.get(Counter.SOURCE_SKIPPED_LEADER_TOTAL));
+            ShadowRig.green("puller leader source: skipped " + skipped + " passes while the source was the leader's"
+                    + " archive, 0 pulls, pulled after the leader changed");
+        }
+    }
+
+    @Test(timeout = 120_000)
+    public void theLeadersArchiveIsNeverASource() {
+        leaderSourceSkipped(Set.of());
+        nc("LEADER_SOURCE_SKIP_OFF", "a pull was started from the leader's archive",
+                () -> leaderSourceSkipped(Set.of(NegativeControl.LEADER_SOURCE_SKIP_OFF)));
+    }
 }

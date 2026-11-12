@@ -107,16 +107,15 @@ public final class ReplicaContexts {
      * the default is Aeron's driver timeout (10 s). In the driver, {@code driverTimeoutMs} is read only by this
      * directory check (and its wait for a CnC file still being initialised); the clients' timeouts are their own.
      * The trade-off: the directory of a driver that crashed is treated as stale only after this long, so an embedded
-     * replica restarted sooner than that after a kill refuses the directory and does not start until it is.</p>
+     * replica restarted sooner than that after a kill refuses the directory and does not start until it is. The check
+     * is the kit's {@link com.openexchange.cluster.EmbeddedDriverDir#guard}, shared with the member.</p>
      */
     public static MediaDriver.Context driver(final ReplicaConfig c) {
-        return new MediaDriver.Context()
+        return com.openexchange.cluster.EmbeddedDriverDir.guard(new MediaDriver.Context(), c.driverDirActiveMs)
                 .aeronDirectoryName(c.aeronDir)
                 .threadingMode(ThreadingMode.SHARED)
                 .sharedIdleStrategy(idle(c))
-                .dirDeleteOnStart(false)
                 .dirDeleteOnShutdown(true)
-                .driverTimeoutMs(c.driverDirActiveMs)
                 .timerIntervalNs(TimeUnit.MICROSECONDS.toNanos(500))
                 .clientLivenessTimeoutNs(TimeUnit.SECONDS.toNanos(5))
                 .publicationUnblockTimeoutNs(TimeUnit.SECONDS.toNanos(10))

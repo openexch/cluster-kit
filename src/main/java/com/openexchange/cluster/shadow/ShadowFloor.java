@@ -251,19 +251,28 @@ public final class ShadowFloor implements LongSupplier {
      * producer are one witness).
      */
     int witnesses(final LogicalShadow v) {
-        final Set<String> producers = new java.util.HashSet<>();
+        final Set<String> producers = new java.util.TreeSet<>();
+        final int recordings = witnessCopies(v, off.contains(NegativeControl.ANCHOR_ANY_KIND), producers);
+        return off.contains(NegativeControl.WITNESS_BY_RECORDING) ? recordings : producers.size();
+    }
+
+    /**
+     * The witness rule: VERIFIED copies with a header, ALIGNED only unless {@code anyKind}; their producers
+     * ({@code R3}, {@code F1}) go into {@code producers}. Returns the number of such copies.
+     */
+    static int witnessCopies(final LogicalShadow v, final boolean anyKind, final Set<String> producers) {
         int recordings = 0;
         for (final ShadowEntry e : v.copies()) {
             if (e.state() != ShadowEntry.State.VERIFIED || e.header() == null) {
                 continue;
             }
-            if (e.header().kind() != ShadowKind.ALIGNED.code() && !off.contains(NegativeControl.ANCHOR_ANY_KIND)) {
+            if (e.header().kind() != ShadowKind.ALIGNED.code() && !anyKind) {
                 continue;
             }
             producers.add(e.producer());
             recordings++;
         }
-        return off.contains(NegativeControl.WITNESS_BY_RECORDING) ? recordings : producers.size();
+        return recordings;
     }
 
     /** The scan the next evaluation reads (the housekeeping hook's latest). */

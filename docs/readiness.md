@@ -44,6 +44,14 @@ cannot establish readiness. A full fragment batch is treated as observer backlog
 until the available queue is drained. The observer does not publish messages or
 change membership, snapshots, retention or the application wire schema.
 
+The observer also keeps the leader member id from the decoded `CommitPosition`.
+`ConsensusReadiness.leader()` returns `{term, leaderMemberId, position}` only on
+a FOLLOWER with a closed election, for the current term and a known member; it
+is null after `leader-checkpoint-unavailable`, during an election, on a LEADER
+and for an older term. Readiness verdicts do not read it; hosts use it for
+node-local decisions (the follower producer's designation, the puller's
+leader-source skip).
+
 This shares Aeron's configured consensus transport trust boundary; it adds no
 independent peer authentication. A leader uses its local quorum commit evidence.
 A rollout must still compare independently observed member checkpoints and stop

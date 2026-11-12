@@ -14,7 +14,8 @@ import java.util.function.Function;
  * own boot guard ({@code CORE BOOT GUARD: }, {@code CORE REPLICA BOOT GUARD: }).
  *
  * <pre>
- * SHADOW_PULL_SOURCES              empty (disabled)  comma list of host:port archive control endpoints, in order
+ * SHADOW_PULL_SOURCES              empty (disabled)  comma list of host:port archive control endpoints, in order;
+ *                                                    a member spelled as the members table spells it ({@link #checkSpelling})
  * SHADOW_PULL_PERIOD_MS            5000              500..3600000
  * SHADOW_PULL_STARTUP_WAIT_MS      60000             1000..86400000 (the one bound of a startup pull)
  * SHADOW_PULL_TIMEOUT_MS           120000            1000..86400000 (one steady-state replication)
@@ -207,6 +208,110 @@ public record ShadowPullSettings(List<Endpoint> sources, long periodMs, long sta
         return new ShadowPullSettings(sources, period, startupWait, timeout, backoff, (int)inflight,
                 parseKinds(env.apply(KINDS)), endpointSetting(env, REPLICATION_ENDPOINT),
                 endpointSetting(env, RESPONSE_ENDPOINT));
+    }
+
+    /** Host name resolution for the boot spelling check (the JDK's in production, a table in tests). */
+    @FunctionalInterface
+    public interface Resolver {
+        Set<java.net.InetAddress> resolve(String host) throws java.net.UnknownHostException;
+
+        /** {@code InetAddress.getAllByName}. */
+        Resolver SYSTEM = host -> Set.of(java.net.InetAddress.getAllByName(host));
+    }
+
+    /** What the boot spelling check found: the boot line and the CRITICAL lines (an unverifiable entry). */
+    public record SpellingCheck(String bootLine, List<String> criticalLines) {
+        public SpellingCheck {
+            criticalLines = List.copyOf(criticalLines);
+        }
+    }
+
+    /**
+     * The boot check that keeps the leader-source skip honest. The puller compares a source with the leader's archive
+     * endpoint by its {@code host:port} text, and the members table spells each member's archive endpoint the way the
+     * cluster configuration does; a source that names a member under another spelling ({@code core1:9302} against
+     * {@code 10.0.0.5:9302}) would never match and the skip would silently never fire. So every source and every
+     * member archive endpoint is resolved once here: a source whose resolved address and port equal a member
+     * endpoint's but whose text differs is a refusal; a source or member host that does not resolve is a CRITICAL
+     * line and the entry is kept (the puller's unreachable handling owns it from there). The runtime comparison stays
+     * a plain text compare (no name resolution on the puller thread). The same rule covers this node's own endpoint
+     * under another spelling, since the own endpoint is a member endpoint.
+     *
+     * @param memberArchiveEndpoints member id to its archive control endpoint as the members table spells it
+     * @throws IllegalArgumentException with the refusal text (no host prefix)
+     */
+    public SpellingCheck checkSpelling(final java.util.Map<Integer, String> memberArchiveEndpoints) {
+        return checkSpelling(memberArchiveEndpoints, Resolver.SYSTEM, Set.of());
+    }
+
+    SpellingCheck checkSpelling(final java.util.Map<Integer, String> memberArchiveEndpoints, final Resolver resolver,
+                                final Set<NegativeControl> off) {
+        Objects.requireNonNull(memberArchiveEndpoints, "memberArchiveEndpoints");
+        Objects.requireNonNull(resolver, "resolver");
+        final List<String> critical = new ArrayList<>();
+        final java.util.Map<Integer, Endpoint> members = new java.util.TreeMap<>();
+        for (final java.util.Map.Entry<Integer, String> m : memberArchiveEndpoints.entrySet()) {
+            final Endpoint e = Endpoint.tryParse(m.getValue());
+            if (e == null) {
+                critical.add("cannot verify " + SOURCES + " against member " + m.getKey() + "'s archive endpoint '"
+                        + m.getValue() + "': not host:port");
+            } else {
+                members.put(m.getKey(), e);
+            }
+        }
+        final java.util.Map<String, Set<java.net.InetAddress>> resolved = new java.util.HashMap<>();
+        final java.util.function.Function<String, Set<java.net.InetAddress>> lookup = host ->
+                resolved.computeIfAbsent(host, h -> {
+                    try {
+                        return resolver.resolve(h);
+                    } catch (final java.net.UnknownHostException | RuntimeException e) {
+                        return Set.of();
+                    }
+                });
+        final StringBuilder boot = new StringBuilder(SOURCES + ":");
+        for (final Endpoint src : sources) {
+            Integer textual = null;
+            for (final java.util.Map.Entry<Integer, Endpoint> m : members.entrySet()) {
+                if (m.getValue().equals(src)) {
+                    textual = m.getKey();
+                }
+            }
+            boot.append(boot.charAt(boot.length() - 1) == ':' ? " " : ", ").append(src.text()).append(' ');
+            if (textual != null) {
+                boot.append("member ").append(textual);
+                continue;
+            }
+            final Set<java.net.InetAddress> srcAddresses = lookup.apply(src.host());
+            if (srcAddresses.isEmpty()) {
+                critical.add("cannot verify " + src.text() + " against the members table: " + src.host()
+                        + " does not resolve");
+                boot.append("unverified");
+                continue;
+            }
+            for (final java.util.Map.Entry<Integer, Endpoint> m : members.entrySet()) {
+                final Endpoint me = m.getValue();
+                if (me.port() != src.port()) {
+                    continue;
+                }
+                final Set<java.net.InetAddress> memberAddresses = lookup.apply(me.host());
+                if (memberAddresses.isEmpty()) {
+                    critical.add("cannot verify " + src.text() + " against member " + m.getKey()
+                            + "'s archive endpoint " + me.text() + ": " + me.host() + " does not resolve");
+                    continue;
+                }
+                if (!java.util.Collections.disjoint(srcAddresses, memberAddresses)
+                        && !off.contains(NegativeControl.SOURCE_SPELLING_CHECK_OFF)) {
+                    throw new IllegalArgumentException(SOURCES + " entry " + src.text() + " names member "
+                            + m.getKey() + "'s archive endpoint " + me.text() + " with a different spelling: spell it"
+                            + " as the cluster members table does so the leader skip can recognise it");
+                }
+            }
+            boot.append("non-member");
+        }
+        if (sources.isEmpty()) {
+            boot.append(" none");
+        }
+        return new SpellingCheck(boot.toString(), critical);
     }
 
     /** {@code SHADOW_PULL_KINDS}; blank = ALIGNED. */

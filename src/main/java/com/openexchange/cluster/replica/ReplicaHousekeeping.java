@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.cluster.replica;
 
+import com.openexchange.cluster.shadow.CrashedWriteSweep;
 import com.openexchange.cluster.shadow.LogicalShadow;
 import com.openexchange.cluster.shadow.ProducerKind;
-import com.openexchange.cluster.shadow.ShadowAlias;
 import com.openexchange.cluster.shadow.ShadowCatalog;
 import com.openexchange.cluster.shadow.ShadowCounters;
 import com.openexchange.cluster.shadow.ShadowEntry;
 import com.openexchange.cluster.shadow.ShadowFloor;
 import com.openexchange.cluster.shadow.ShadowHousekeeping;
+import com.openexchange.cluster.shadow.ShadowProducer;
 import com.openexchange.cluster.shadow.ShadowRetention;
 import com.openexchange.cluster.shadow.ShadowVerdicts;
 import io.aeron.Aeron;
@@ -84,9 +85,8 @@ public final class ReplicaHousekeeping implements Runnable, AutoCloseable, Repli
     private volatile long logPurgesTotal;
     private volatile long errorsTotal;
     private volatile long newestVerifiedPosition = -1;
-    private volatile long crashedWritesPurgedTotal;
     private long lastPurgeSet = -1;
-    private final java.util.Set<Long> sweptRecordings = new java.util.HashSet<>();
+    private final CrashedWriteSweep crashedWrites;
     private final java.util.Set<Long> aboveLSeen = new java.util.HashSet<>();
     private volatile LongSupplier backupState = () -> -1;
     private final AtomicReference<SuspectRequest> suspectRequest = new AtomicReference<>();
@@ -107,6 +107,8 @@ public final class ReplicaHousekeeping implements Runnable, AutoCloseable, Repli
         this.clock = Objects.requireNonNull(clock, "clock");
         this.halt = Objects.requireNonNull(halt, "halt");
         this.trim = new RetrievedSetTrim(cfg.retrievedSetsKeep);
+        this.crashedWrites = new CrashedWriteSweep(new ShadowProducer(cfg.clusterId, ProducerKind.REPLICA, cfg.slot),
+                "[REPLICA-HK]", System.out::println, shadowCounters);
     }
 
     public void start() {
@@ -206,42 +208,12 @@ public final class ReplicaHousekeeping implements Runnable, AutoCloseable, Repli
     }
 
     /**
-     * A {@code kill -9} in the middle of a write leaves a TOO_SHORT or NO_TRAILER recording of this
-     * replica's producer that no writer will clean up (the writer purges only its own aborted writes). The
-     * retention owner purges such copies when their producer seq is below the seq this process's writer started at
-     * (so it predates this process and no write of this process can be in flight on it), on a scan that can answer.
-     * Never another producer's (evidence for its operator), never a usable copy.
+     * A {@code kill -9} in the middle of a write leaves a TOO_SHORT or NO_TRAILER recording of this replica's producer
+     * that no writer will clean up: the kit's {@link CrashedWriteSweep} (shared with the member producer) purges this
+     * producer's copies whose seq is below the seq this process's writer started at, through retention.
      */
     private void sweepCrashedWrites(final ShadowCatalog.Scan scan) {
-        final long firstSeq = follower.firstProducerSeq();
-        if (scan == null || !scan.known() || firstSeq <= 0 || retention == null) {
-            return;
-        }
-        for (final ShadowEntry e : scan.all()) {
-            if (e.state() != ShadowEntry.State.TOO_SHORT && e.state() != ShadowEntry.State.NO_TRAILER) {
-                continue;
-            }
-            final ShadowAlias a = e.alias();
-            if (sweptRecordings.contains(e.recordingId()) || a == null
-                    || a.producerKind() != ProducerKind.REPLICA.code() || a.producerId() != cfg.slot) {
-                continue;
-            }
-            final long seq = e.header() != null ? e.header().producerSeq() : a.producerSeq();
-            if (seq >= firstSeq) {
-                continue;
-            }
-            final ShadowCatalog.PurgeResult r = retention.purge(e.recordingId(), false);
-            if (r.purged()) {
-                sweptRecordings.add(e.recordingId()); // the cached scan may list it until the next re-scan
-                crashedWritesPurgedTotal++;
-                System.out.println("[REPLICA-HK] purged a crashed write of R" + cfg.slot + " from before this"
-                        + " process: rec=" + e.recordingId() + " seq=" + seq + " state=" + e.state() + " P="
-                        + a.logPosition());
-            } else {
-                refusedOnce("[REPLICA-HK] crashed write rec=" + e.recordingId() + " of R" + cfg.slot
-                        + " not purged: " + r.detail() + " (code " + r.code() + ", retried next pass)");
-            }
-        }
+        crashedWrites.sweep(scan, follower.firstProducerSeq(), retention);
     }
 
     /** The retrieved set an oracle mismatch disagreed with: never trimmed while the replica holds it. */
@@ -566,7 +538,7 @@ public final class ReplicaHousekeeping implements Runnable, AutoCloseable, Repli
 
     /** {@code shadow_replica_crashed_writes_purged_total}. */
     public long crashedWritesPurgedTotal() {
-        return crashedWritesPurgedTotal;
+        return crashedWrites.purgedTotal();
     }
 
     public long errorsTotal() {

@@ -73,7 +73,7 @@ final class ConsensusCommitObserver implements AutoCloseable {
             ambiguous = true; return;
         }
         if (checkpoint != null && term == checkpoint.term() && position < checkpoint.position()) { return; }
-        checkpoint = new ConsensusReadiness.LeaderCheckpoint(term, source, position, nowNs);
+        checkpoint = new ConsensusReadiness.LeaderCheckpoint(term, source, position, nowNs, member);
     }
 
     @Override public void close() {

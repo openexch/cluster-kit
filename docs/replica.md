@@ -28,7 +28,12 @@ heartbeat at most `REPLICA_DRIVER_DIR_ACTIVE_MS` old (10 000, 2000..600 000)
 means a live driver owns the directory: the replica refuses to start
 (ActiveDriverException) and never takes over an `aeronmd`. A crashed driver's
 directory counts as stale only after this long, so an embedded replica
-restarted sooner after a kill -9 does not start until then. Close order: endpoint, follower (reader, then writer, so an
+restarted sooner after a kill -9 does not start until then. The check is
+the kit's `EmbeddedDriverDir`, shared with core members' embedded drivers
+(`CORE_DRIVER_DIR_ACTIVE_MS`); the replica keeps Aeron's
+`ActiveDriverException` text, a member's refusal reads `AERON_DIR <dir> has a
+live media driver (<others>; heartbeat <age> ms old, bound <bound> ms): stop it
+or point this member at its own directory`. Close order: endpoint, follower (reader, then writer, so an
 in-flight write aborts), housekeeping, clients, backup, archive, driver, then
 (a decided re-bootstrap only) `cluster/` moved aside. Exit code 1 on any fault,
 3 on a decided re-bootstrap (the unit restarts it: `RestartForceExitStatus=3`),
@@ -119,6 +124,12 @@ closed, so `cluster/` is not moved and the next start decides again.
 A genesis start compares every member snapshot named after its ADOPT against
 the adopted genesis. The housekeeping purge gate holds from the ADOPT until the
 first compare passes (`genesis check armed at ADOPT: genesisId <g>`).
+
+The pulled shadow a re-bootstrap restores from may be any producer's ALIGNED:
+with members in shadow mode the designated follower's `F<id>` copy is pulled
+from that member's (or a peer's) archive and restored at the second start
+(LOCAL_SHADOW). Crashed writes of the replica's own producer from before this
+process are purged by the kit's `CrashedWriteSweep` through retention.
 
 ## Trust after a restore
 
@@ -270,3 +281,5 @@ and the puller's `shadow_pull_*` (`shadow_pull_total`,
 `shadow_pull_bytes_total`, `shadow_pull_retries_total`,
 `shadow_pull_refused_total{reason}`, `shadow_pull_source_unreachable_total`,
 `shadow_pull_aborted_leader_total`, `shadow_pull_skipped_leader_total`).
+Crashed writes: `shadow_replica_crashed_writes_purged_total` and the shared
+`shadow_crashed_writes_purged_total` (same count).

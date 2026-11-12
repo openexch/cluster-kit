@@ -29,6 +29,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 import java.util.function.LongSupplier;
 
 /**
@@ -78,6 +79,10 @@ import java.util.function.LongSupplier;
  * <p>While {@code leaderNow} is true a pass lists nothing and starts nothing ({@code shadow_pull_skipped_leader_total});
  * every in-flight replication is stopped and its partial copy purged ({@code shadow_pull_aborted_leader_total}). The
  * aborted candidate is pulled again after the role changed (its alias is not held by a usable local copy).</p>
+ *
+ * <h2>Nobody pulls from the leader</h2>
+ * <p>A member passes {@link #deferredSource} the current leader's archive control endpoint: a discovery pass skips
+ * that source ({@code shadow_pull_source_skipped_leader_total}) and lists it again once the leader changed.</p>
  *
  * <p>Threads: one owner thread per instance ({@link #start} or the caller of {@link #pullOnce}); the counters are
  * atomic for the host's exporter. Never opens a {@code RecordingLog}, never launches a driver, never schedules a cluster
@@ -144,6 +149,7 @@ public final class ShadowPuller implements AutoCloseable {
         SOURCE_UNREACHABLE_TOTAL("shadow_pull_source_unreachable_total"),
         SOURCE_RECONNECTS_TOTAL("shadow_pull_source_reconnects_total"),
         SKIPPED_LEADER_TOTAL("shadow_pull_skipped_leader_total"),
+        SOURCE_SKIPPED_LEADER_TOTAL("shadow_pull_source_skipped_leader_total"),
         ABORTED_LEADER_TOTAL("shadow_pull_aborted_leader_total"),
         INFLIGHT("shadow_pull_inflight"),
         PURGE_PENDING("shadow_pull_purge_pending"),
@@ -283,6 +289,8 @@ public final class ShadowPuller implements AutoCloseable {
     private ShadowEntry lastPulled;
     private Endpoint lastPulledFrom;
     private volatile String lastRefusal;
+    private volatile Supplier<String> deferredSource = () -> null;
+    private String deferredLogged;
 
     /**
      * @param aeron           the host's Aeron client (driver loss reaches the host's error handler)
@@ -341,6 +349,19 @@ public final class ShadowPuller implements AutoCloseable {
 
     public ShadowPullSettings settings() {
         return settings;
+    }
+
+    /**
+     * The source the puller must not list or pull from this pass: a member passes the current leader's archive
+     * control endpoint, spelled as its members table spells it (a peer replicating from the leader's archive opens a
+     * replay there, disk and network on the commit path), or null while the leader is unknown or is not a source.
+     * Compared to each source's {@code host:port} text once per discovery pass; a source skipped this way is counted
+     * ({@code shadow_pull_source_skipped_leader_total}) and listed again once the supplier names another endpoint.
+     * Default: nothing deferred (the replica). Set before {@link #start}.
+     */
+    public ShadowPuller deferredSource(final Supplier<String> leaderArchiveEndpoint) {
+        this.deferredSource = Objects.requireNonNull(leaderArchiveEndpoint, "leaderArchiveEndpoint");
+        return this;
     }
 
     /** The source recordings refused for their content in this process ({@code host:port#recordingId}). */
@@ -680,8 +701,20 @@ public final class ShadowPuller implements AutoCloseable {
         final long now = clock.nanoTime();
         final List<Candidate> out = new ArrayList<>();
         final List<Endpoint> sources = settings.sources();
+        final String deferred = off.contains(NegativeControl.LEADER_SOURCE_SKIP_OFF) ? null : deferredSource.get();
+        if (!Objects.equals(deferred, deferredLogged)) {
+            deferredLogged = deferred;
+            if (deferred != null && sources.stream().anyMatch(e -> e.text().equals(deferred))) {
+                System.out.println("[SHADOW-PULL] source " + deferred + " is the current leader's archive: not listed"
+                        + " while it leads");
+            }
+        }
         for (int i = 0; i < sources.size(); i++) {
             final Endpoint src = sources.get(i);
+            if (deferred != null && deferred.equals(src.text())) {
+                counters.increment(Counter.SOURCE_SKIPPED_LEADER_TOTAL);
+                continue;
+            }
             final List<long[]> descriptors = new ArrayList<>();
             final List<String> channels = new ArrayList<>();
             if (!list(src, descriptors, channels)) {

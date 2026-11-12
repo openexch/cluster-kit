@@ -82,6 +82,96 @@ public class ConsensusReadinessTest {
         }
     }
 
+    /**
+     * The current term's leader id from the leader's own commit message: carried into {@code leader()} on a FOLLOWER
+     * with the election CLOSED for the current term, null after {@code leader-checkpoint-unavailable}, null for an
+     * older term's checkpoint, null while the observer withholds an ambiguous term, null during an election and on a
+     * LEADER. Readiness verdicts are those of the row above.
+     */
+    @Test public void theLeaderIdOfTheCurrentTermComesFromTheCommitWire() throws Exception {
+        final var dir = Files.createTempDirectory("consensus-leader-");
+        final CountersManager counters = new CountersManager(new UnsafeBuffer(java.nio.ByteBuffer.allocateDirect(8192)),
+                new UnsafeBuffer(java.nio.ByteBuffer.allocateDirect(2048)));
+        try (ClusterMarkFile mark = new ClusterMarkFile(dir.resolve(ClusterMarkFile.FILENAME).toFile(),
+                ClusterComponentType.CONSENSUS_MODULE, ClusterMarkFile.ERROR_BUFFER_MIN_LENGTH,
+                System::currentTimeMillis, 0, 4096)) {
+            mark.updateActivityTimestamp(System.currentTimeMillis());
+            final var context = new ConsensusModule.Context().clusterMarkFile(mark)
+                    .clusterClock(new MillisecondClusterClock())
+                    .commitPositionCounter(counter(counters, 100))
+                    .leadershipTermIdCounter(counter(counters, 7))
+                    .electionCounter(counter(counters, 2))
+                    .electionStateCounter(counter(counters, ElectionState.CLOSED.code()))
+                    .moduleStateCounter(counter(counters, ConsensusModule.State.ACTIVE.code()))
+                    .clusterNodeRoleCounter(counter(counters, Cluster.Role.FOLLOWER.code()));
+            final Cluster.Role[] role = {Cluster.Role.FOLLOWER};
+            final Cluster cluster = (Cluster) Proxy.newProxyInstance(Cluster.class.getClassLoader(),
+                    new Class<?>[]{Cluster.class}, (proxy, method, args) -> switch (method.getName()) {
+                        case "role" -> role[0];
+                        case "logPosition" -> 100L;
+                        default -> throw new AssertionError("unexpected blocking/API call " + method);
+                    });
+            final NodeReadiness r = new NodeReadiness(); r.started();
+            final long[] wireTerm = {7};
+            final int[] wireLeader = {2};
+            final boolean[] known = {true};
+            final ConsensusReadiness probe = new ConsensusReadiness(context, r, t -> known[0]
+                    ? new ConsensusReadiness.LeaderCheckpoint(wireTerm[0], 999, 100, t, wireLeader[0]) : null);
+            long now = System.nanoTime();
+            assertNull("nothing polled yet", probe.leader());
+            probe.poll(cluster, now);
+            probe.poll(cluster, now += 20_000_000);
+            assertTrue(r.describe(), r.ready());
+            assertEquals(2, probe.leader().leaderMemberId());
+            assertEquals(7, probe.leader().term());
+            // the observer withholds an ambiguous term (two members claimed it): the poll sees null
+            known[0] = false;
+            probe.poll(cluster, now += 20_000_000);
+            assertFalse(r.ready());
+            assertTrue(r.describe(), r.describe().contains("leader-checkpoint-unavailable"));
+            assertNull("unavailable: no leader", probe.leader());
+            known[0] = true;
+            probe.poll(cluster, now += 20_000_000);
+            assertEquals(2, probe.leader().leaderMemberId());
+            // the local counters moved to term 8 but the wire still carries term 7: never the older term's leader
+            context.leadershipTermIdCounter().set(8);
+            probe.poll(cluster, now += 20_000_000);
+            assertNull("an older term's checkpoint is not the current leader", probe.leader());
+            wireTerm[0] = 8; wireLeader[0] = 0;
+            probe.poll(cluster, now += 20_000_000);
+            assertEquals("re-learned from the wire alone", 0, probe.leader().leaderMemberId());
+            // a checkpoint without a leader id (the older seam) never names a leader
+            final ConsensusReadiness legacy = new ConsensusReadiness(context, new NodeReadiness(),
+                    t -> new ConsensusReadiness.LeaderCheckpoint(8, 999, 100, t));
+            legacy.poll(cluster, now);
+            assertNull(legacy.leader());
+            // an election: no leader
+            context.electionStateCounter().set(ElectionState.CANVASS.code());
+            probe.poll(cluster, now += 20_000_000);
+            assertNull("during an election", probe.leader());
+            context.electionStateCounter().set(ElectionState.CLOSED.code());
+            probe.poll(cluster, now += 20_000_000);
+            assertEquals(0, probe.leader().leaderMemberId());
+            // this node leads: no leader from the wire
+            role[0] = Cluster.Role.LEADER;
+            context.clusterNodeRoleCounter().set(Cluster.Role.LEADER.code());
+            probe.poll(cluster, now += 20_000_000);
+            assertNull("on a LEADER", probe.leader());
+            role[0] = Cluster.Role.FOLLOWER;
+            context.clusterNodeRoleCounter().set(Cluster.Role.FOLLOWER.code());
+            probe.poll(cluster, now += 20_000_000);
+            assertEquals(0, probe.leader().leaderMemberId());
+            context.commitPositionCounter().close();
+            probe.poll(cluster, now += 20_000_000);
+            assertNull("consensus unavailable", probe.leader());
+            probe.close();
+        } finally {
+            try (var paths = Files.walk(dir)) {
+                for (var path : paths.sorted(java.util.Comparator.reverseOrder()).toList()) { Files.delete(path); }
+            }
+        }
+    }
+
     private static Counter counter(CountersManager manager, long value) {
         int id = manager.allocate("readiness test");
         manager.setCounterRegistrationId(id, 100 + id);

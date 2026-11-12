@@ -23,8 +23,19 @@ public final class ConsensusReadiness implements AutoCloseable {
     private long leaderSource = -1;
     private long lastSampleNs;
     private boolean sampled;
+    private volatile LeaderCheckpoint leader;
 
-    public record LeaderCheckpoint(long term, long source, long position, long observedNs) { }
+    /**
+     * The leader's latest {@code CommitPosition} for a term as the observer decoded it: the term, the image it came
+     * on, the position, when it was observed and the leader member id the message names ({@code -1} when the source
+     * did not name one).
+     */
+    public record LeaderCheckpoint(long term, long source, long position, long observedNs, int leaderMemberId) {
+        /** A checkpoint without a leader id (the test seams that predate it): {@link #leader()} never returns it. */
+        public LeaderCheckpoint(final long term, final long source, final long position, final long observedNs) {
+            this(term, source, position, observedNs, -1);
+        }
+    }
 
     public ConsensusReadiness(final ConsensusModule.Context context, final NodeReadiness readiness) {
         this.context = context;
@@ -41,7 +52,17 @@ public final class ConsensusReadiness implements AutoCloseable {
     }
 
     public void start(final io.aeron.Aeron aeron) { if (observer != null) { observer.start(aeron); } }
-    @Override public void close() { if (observer != null) { observer.close(); } }
+    @Override public void close() { leader = null; if (observer != null) { observer.close(); } }
+
+    /**
+     * The current term's leader as the leader's own {@code CommitPosition} names it: the checkpoint the last poll
+     * accepted on a FOLLOWER with the election CLOSED, for the term the local consensus counters report, carrying a
+     * leader member id. Null before the first such poll, after {@code leader-checkpoint-unavailable}, while the term
+     * is ambiguous (two members claimed it: the observer withholds the checkpoint), on a LEADER, during an election
+     * and while the consensus counters are unavailable or changing. A read of state readiness already computes, never
+     * a readiness input. Written and meant to be read on the service thread that polls; volatile for exporters.
+     */
+    public LeaderCheckpoint leader() { return leader; }
 
     public void poll(final Cluster cluster, final long nowNs) {
         readiness.tick();
@@ -60,6 +81,7 @@ public final class ConsensusReadiness implements AutoCloseable {
         final ClusterMarkFile mark = context.clusterMarkFile();
         if (absent(commit) || absent(term) || absent(elections) || absent(election)
                 || absent(module) || absent(role) || mark == null || mark.isClosed()) {
+            leader = null;
             readiness.unavailable("consensus-unavailable");
             return;
         }
@@ -78,16 +100,20 @@ public final class ConsensusReadiness implements AutoCloseable {
                 || moduleState != module.get() || consensusRole != role.get()
                 || absent(commit) || absent(term) || absent(elections) || absent(election)
                 || absent(module) || absent(role) || mark.isClosed()) {
+            leader = null;
             readiness.unavailable("consensus-changing");
             return;
         }
         long committed = localCommit;
         long authorityAge = heartbeat <= 0 ? -1 : heartbeatAge;
+        LeaderCheckpoint accepted = null;
         if (cluster.role() == Cluster.Role.FOLLOWER && electionState == ElectionState.CLOSED.code()) {
             if (remote == null || remote.term() != termId || remote.source() < 0 || remote.position() < 0
                     || observedNs - remote.observedNs() < 0) {
+                leader = null;
                 readiness.unavailable("leader-checkpoint-unavailable"); return;
             }
+            accepted = remote.leaderMemberId() >= 0 ? remote : null;
             if (leaderSource != remote.source()) { readiness.catchingUp(); leaderSource = remote.source(); }
             committed = Math.max(localCommit, remote.position());
             if (authorityAge >= 0) {
@@ -95,6 +121,7 @@ public final class ConsensusReadiness implements AutoCloseable {
                         observedNs - remote.observedNs()));
             }
         }
+        leader = accepted;
         readiness.observe(commit.registrationId(), termId, electionCount, cluster.role(),
                 applied, committed, electionState == ElectionState.CLOSED.code(),
                 moduleState == ConsensusModule.State.ACTIVE.code() && consensusRole == cluster.role().code(),

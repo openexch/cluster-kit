@@ -82,5 +82,17 @@ enum NegativeControl {
      * Puller: steady-state discovery skips every position at or below the newest VERIFIED one, a second producer's
      * ALIGNED at a held position included (the second witness is never pulled).
      */
-    WITNESS_PULL_OFF
+    WITNESS_PULL_OFF,
+    /** Producer window guard: the window leg always produces. */
+    WINDOW_GUARD_OFF,
+    /** Producer window guard: the liveness leg always produces. */
+    LIVENESS_BOUND_OFF,
+    /** Crashed-write sweep: another producer's crashed copies are swept too. */
+    SWEEP_OTHER_PRODUCERS,
+    /** Puller: the current leader's archive endpoint is listed and pulled from like any source. */
+    LEADER_SOURCE_SKIP_OFF,
+    /** Pull settings: a source spelled differently from a member's archive endpoint passes the boot check. */
+    SOURCE_SPELLING_CHECK_OFF,
+    /** Witness alarm: no floor-side line and no gauge, whatever the witnesses. */
+    WITNESS_ALARM_OFF
 }

@@ -42,10 +42,10 @@ public final class ReplicaConfig {
      * {@code REPLICA_DRIVER_DIR_ACTIVE_MS}: an existing driver directory whose driver heartbeat is at most this old is
      * a live driver's, and the embedded launch refuses it. Aeron's default driver timeout; a setting.
      */
-    public static final long DEFAULT_DRIVER_DIR_ACTIVE_MS = 10_000;
+    public static final long DEFAULT_DRIVER_DIR_ACTIVE_MS = com.openexchange.cluster.EmbeddedDriverDir.DEFAULT_ACTIVE_MS;
     /** A live driver heartbeats once per timer tick (Aeron's default 1 s); a shorter bound reads it as stale. */
-    public static final long MIN_DRIVER_DIR_ACTIVE_MS = 2_000;
-    public static final long MAX_DRIVER_DIR_ACTIVE_MS = 600_000;
+    public static final long MIN_DRIVER_DIR_ACTIVE_MS = com.openexchange.cluster.EmbeddedDriverDir.MIN_ACTIVE_MS;
+    public static final long MAX_DRIVER_DIR_ACTIVE_MS = com.openexchange.cluster.EmbeddedDriverDir.MAX_ACTIVE_MS;
     public static final int DEFAULT_SHADOW_BUFFER_MB = 512;
     /** H14: a shadow payload plus its header fits an int-sized buffer, so one image buffer holds at most this. */
     public static final int MAX_SHADOW_BUFFER_MB = 2047;
@@ -522,8 +522,7 @@ public final class ReplicaConfig {
 
     /** Null when valid, else the refusal text. */
     public static String driverDirActiveRefusal(final long v) {
-        return v < MIN_DRIVER_DIR_ACTIVE_MS || v > MAX_DRIVER_DIR_ACTIVE_MS ? "REPLICA_DRIVER_DIR_ACTIVE_MS must be "
-                + MIN_DRIVER_DIR_ACTIVE_MS + ".." + MAX_DRIVER_DIR_ACTIVE_MS + " ms: " + v : null;
+        return com.openexchange.cluster.EmbeddedDriverDir.rangeRefusal("REPLICA_DRIVER_DIR_ACTIVE_MS", v);
     }
 
     /** Null when valid, else the refusal text. */

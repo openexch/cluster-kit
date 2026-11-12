@@ -34,6 +34,7 @@ public class ConsensusCommitObserverTest {
             observer.start(aeron);
             send(publication, consensus, 7, 0, 100);
             var proof = await(observer, consensus, 7, 100);
+            assertEquals("the leader id the commit message names", 0, proof.leaderMemberId());
             assertTrue(proof.source() >= 0);
             assertTrue(proof.observedNs() > 0);
             // Same-term older commit cannot replace the established bound.
@@ -47,7 +48,7 @@ public class ConsensusCommitObserverTest {
             while (System.nanoTime() < deadline) { consensus.poll((b,o,l,h) -> {}, 100); observer.poll(System.nanoTime()); }
             assertNull(observer.poll(System.nanoTime()));
             send(publication, consensus, 8, 2, 200);
-            await(observer, consensus, 8, 200);
+            assertEquals("a new term's leader", 2, await(observer, consensus, 8, 200).leaderMemberId());
             for (int i = 0; i < 40; i++) { send(publication, consensus, 8, 2, 201 + i); }
             // Wait for receipt on the normal subscriber, leaving the observer unread.
             deadline = System.nanoTime() + 100_000_000;

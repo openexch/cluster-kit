@@ -167,8 +167,14 @@ public class ShadowCatalogTest {
             }
             pad.offer(filler, 0, 480);
             assertEquals(ShadowRig.TERM - 96, pad.publication().position());
-            assertEquals("padding written, the term rotated", ExclusivePublication.ADMIN_ACTION,
-                    pad.offerOnce(filler, 0, 1376));
+            // back-pressure (the recorder behind) writes nothing, so retrying it keeps the padding case intact
+            long rotated = pad.offerOnce(filler, 0, 1376);
+            final long until = System.nanoTime() + 10_000_000_000L;
+            while (rotated == ExclusivePublication.BACK_PRESSURED && System.nanoTime() - until < 0) {
+                Thread.onSpinWait();
+                rotated = pad.offerOnce(filler, 0, 1376);
+            }
+            assertEquals("padding written, the term rotated", ExclusivePublication.ADMIN_ACTION, rotated);
             final long padStop = pad.stopRecording();
             assertEquals(ShadowRig.TERM, padStop);
             final ShadowCatalog catalog = rig.catalog();

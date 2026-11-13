@@ -167,15 +167,20 @@ Positions below the newest VERIFIED one that the node never held are not
 pulled.
 
 A copy is complete only after SYNC, or after it ended with the source's
-length. Only then does the local catalog classify it, and the deep read verify
-it.
+length, and it is judged only once the local recording's stop position is
+recorded. The archive signals SYNC and REPLICATE_END before the destination's
+recording session closes, so a copy the catalog still lists as ACTIVE is
+unknown: it is read again next pass, like SCAN_ERROR, never refused for its
+content. Only a stopped, complete copy is classified by the local catalog and
+verified by the deep read. A copy that reaches its bound (`SHADOW_PULL_TIMEOUT_MS`
+or the startup deadline) before it was judged is a TIMEOUT.
 
 | Class | Action |
 |---|---|
 | archive refusal (GENERIC with the source's text, MAX_RECORDINGS, REPLICATION_CONNECTION_FAILURE, STORAGE_SPACE) | partial purged, retried with backoff |
 | INCOMPLETE (ended short, no error: the source died) | partial purged, retried |
-| TIMEOUT (`SHADOW_PULL_TIMEOUT_MS`, or the startup deadline) | stopped, purged, retried |
-| content (a complete copy that is not COMPLETE locally or reads CORRUPT) | purged; the source recording is refused for the life of the process; CRITICAL |
+| TIMEOUT (`SHADOW_PULL_TIMEOUT_MS`, or the startup deadline, reached before the copy was judged) | stopped, purged, retried |
+| content (a complete, stopped copy that is not COMPLETE locally or reads CORRUPT) | purged; the source recording is refused for the life of the process; CRITICAL |
 | CONFLICT with a local copy | kept; never anchors |
 
 When a source archive stops mid-copy, Aeron ends the replication one of two
@@ -187,6 +192,27 @@ that has just pulled it (the same alias in another archive, until that peer
 purges it). A puller that lists that peer may refuse it a second time, as a
 second source recording. Each source recording is refused once and never
 pulled again.
+
+The CRITICAL content line tells the operator to purge the source recording on
+the producer only when the copy's deep read is CORRUPT. Any other content
+refusal (a structural state such as NO_TRAILER, or a copy that is not
+verifiable) says not to purge it there before a deep read on the producer says
+CORRUPT. A CONFLICT is kept and an operator purges one side.
+
+A startup pull (`pullOnce`, the restore's step 3b) ends at its deadline, and the
+deadline bounds every pass: no source is listed past it, a listing's connect
+wait and message timeout are the period or the time left, whichever is
+shorter, no replication is started past it, and the local catalog's structural
+reads end by it. A read already in progress is not interrupted: a local
+descriptor whose segment file is gone is answered by the archive only after its
+replay connect timeout (5 s by default), so the deadline can be overrun by that
+one read. A descriptor the first scan of a startup pull found SCAN_ERROR is not
+read again by the later scans of the same pull (discovery, verification,
+purge); recordings created after that scan, the pulled copies, are always read.
+A pull that VERIFIED a copy returns without another discovery pass. A host may
+hold its own catalog's unknown entries the same way (`holdUnknown`) for one
+bounded caller, such as a member's restore that scans before and after its
+startup pull.
 
 Settings: `SHADOW_PULL_PERIOD_MS` 5000 (500..3 600 000),
 `SHADOW_PULL_STARTUP_WAIT_MS` 60 000 (1000..86 400 000, the one bound of a

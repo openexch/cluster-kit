@@ -6,15 +6,19 @@ import io.aeron.ChannelUri;
 import io.aeron.ExclusivePublication;
 import io.aeron.Subscription;
 import io.aeron.archive.client.AeronArchive;
+import io.aeron.archive.codecs.RecordingSignal;
 import io.aeron.archive.status.RecordingPos;
 import org.agrona.CloseHelper;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.status.CountersReader;
+import org.junit.Assume;
 import org.junit.Test;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -43,6 +47,11 @@ public class ShadowPullerTest {
     static final long PERIOD_MS = 500;
     static final int SMALL = 4_000;
     static final int BIG = 200_000_000;
+    /**
+     * The slack a startup pull may take past its deadline: the pass in progress finishes its current step (a local
+     * catalog listing, a stop and purge). A test setting ({@code -Dkit.test.pull.deadline.slack.ms}).
+     */
+    static final long DEADLINE_SLACK_MS = Long.getLong("kit.test.pull.deadline.slack.ms", 1_500);
 
     /** Two nodes and a puller on the destination. */
     static final class Pair implements AutoCloseable {
@@ -618,5 +627,229 @@ public class ShadowPullerTest {
         leaderSourceSkipped(Set.of());
         nc("LEADER_SOURCE_SKIP_OFF", "a pull was started from the leader's archive",
                 () -> leaderSourceSkipped(Set.of(NegativeControl.LEADER_SOURCE_SKIP_OFF)));
+    }
+    // ------------------------------------------------------------------------------------------- judged once stopped
+
+    /** True while the destination recording {@code dst} has no stop position recorded in its catalog. */
+    static boolean destinationActive(final PullRig.Node n, final long dst) {
+        final long[] stop = {0};
+        n.archive().listRecording(dst, (a, b, c, d, e, f, g, h, i, j, k, l, m, nn, oc, pp) -> stop[0] = g);
+        return stop[0] == AeronArchive.NULL_POSITION;
+    }
+
+    /**
+     * SYNC and REPLICATE_END reach the puller before the destination recording's stop position is in its catalog
+     * (the archive signals the end of a replication before the recording session closes). The copy is not judged
+     * then: no content refusal, the pull stays in flight and is VERIFIED once the stop is recorded. Deterministic: the
+     * test owns the passes, the destination is genuinely ACTIVE mid-copy, the two signals are injected for the
+     * in-flight replication.
+     */
+    @Test(timeout = 240_000)
+    public void aCopyIsJudgedOnlyOnceItsLocalStopIsRecorded() {
+        try (Pair p = new Pair(10)) {
+            final long big = p.src.write(R3, 1, ShadowKind.ALIGNED, 1_000, BIG, 1, "4m");
+            final ShadowAlias alias = aliasOf(p.src, big);
+            p.puller = p.puller(p.settings(120_000, 1, false), GENESIS, () -> false, Set.of());
+            final long[] ids = {-1, -1};
+            await("a pull in flight with its destination recording", () -> {
+                p.puller.pass(null);
+                final Map<Long, Long> in = p.puller.inflightDestinations();
+                if (in.size() == 1) {
+                    final Map.Entry<Long, Long> e = in.entrySet().iterator().next();
+                    ids[0] = e.getKey();
+                    ids[1] = e.getValue();
+                }
+                return ids[1] >= 0;
+            }, 30_000);
+            p.awaitDestinationProgress(16L * 1024 * 1024);
+            assertTrue("the destination is still recording", destinationActive(p.dst, ids[1]));
+            p.puller.onSignal(ids[0], ids[1], 16L * 1024 * 1024, RecordingSignal.SYNC);
+            p.puller.onSignal(ids[0], ids[1], AeronArchive.NULL_POSITION, RecordingSignal.REPLICATE_END);
+            p.puller.pass(null);
+            assertEquals("a copy without a recorded stop was judged for content: " + p.puller.lastRefusal(), 0,
+                    p.refused("ACTIVE"));
+            assertTrue("refused: " + p.puller.contentRefused(), p.puller.contentRefused().isEmpty());
+            assertEquals("still in flight", Set.of(ids[0]), p.puller.inflightDestinations().keySet());
+            await("VERIFIED once the copy completed", () -> {
+                p.puller.pass(null);
+                return p.get(Counter.PULL_TOTAL) == 1 || !p.puller.contentRefused().isEmpty();
+            }, 120_000);
+            assertTrue("refused: " + p.puller.lastRefusal(), p.puller.contentRefused().isEmpty());
+            assertEquals(1, p.get(Counter.STARTED_TOTAL));
+            final List<ShadowEntry> local = p.copies(alias);
+            assertEquals(local.toString(), 1, local.size());
+            assertEquals(ShadowEntry.State.VERIFIED, local.get(0).state());
+            ShadowRig.green("puller judged once stopped: SYNC + REPLICATE_END before the destination's stop, 0"
+                    + " content refusals, VERIFIED " + local.get(0));
+        }
+    }
+
+    /**
+     * The window above, without seams: two DEDICATED archives, 640 KB shadows, 80 startup pulls; none may be refused
+     * for content. Statistical (about one pull in ten met the window before the fix), so it is a control run on
+     * demand ({@code -Dkit.test.pull.statistical=true}), not a CI row.
+     */
+    @Test(timeout = 900_000)
+    public void startupPullsNeverRefuseACopyForItsActiveState() {
+        Assume.assumeTrue("statistical control: -Dkit.test.pull.statistical=true",
+                Boolean.getBoolean("kit.test.pull.statistical"));
+        final int pulls = Integer.getInteger("kit.test.pull.statistical.pulls", 80);
+        final int length = 640 * 1024;
+        int verified = 0;
+        long active = 0;
+        try (Pair p = new Pair(10)) {
+            for (int i = 1; i <= pulls; i++) {
+                final long pos = 1_000L * i;
+                p.src.write(R3, i, ShadowKind.ALIGNED, pos, length, i, "64k");
+                try (ShadowPuller once = p.puller(p.settings(120_000, 1, false), GENESIS, () -> false, Set.of())) {
+                    final ShadowPuller.Report r = once.pullOnce(a -> a.logPosition() == pos ? 0 : -1,
+                            System.nanoTime() + TimeUnit.SECONDS.toNanos(30));
+                    active += once.counters().refused("ACTIVE");
+                    verified += r.kind() == ShadowPuller.Report.Kind.VERIFIED ? 1 : 0;
+                }
+            }
+        }
+        assertEquals("content refusals of an ACTIVE copy", 0, active);
+        assertEquals("VERIFIED pulls", pulls, verified);
+        ShadowRig.green("puller statistical control (" + PullRig.ARCHIVE_THREADING + "): " + verified + "/" + pulls
+                + " VERIFIED, 0 ACTIVE refusals");
+    }
+
+    // ------------------------------------------------------------------------------------------- deadline per pass
+
+    /** Deletes every segment file of {@code n}'s archive while it is stopped: the catalog keeps the descriptors. */
+    static int wipeSegments(final PullRig.Node n) {
+        n.stop();
+        int deleted = 0;
+        final File[] files = new File(n.dir, "archive").listFiles();
+        for (final File f : files == null ? new File[0] : files) {
+            if (f.getName().endsWith(".rec") && f.delete()) {
+                deleted++;
+            }
+        }
+        n.start(false);
+        return deleted;
+    }
+
+    ShadowPullSettings deadlineSettings(final Pair p, final int closedPort) {
+        final List<ShadowPullSettings.Endpoint> sources = new ArrayList<>();
+        if (closedPort > 0) {
+            sources.add(new ShadowPullSettings.Endpoint("localhost", closedPort));
+        }
+        sources.add(new ShadowPullSettings.Endpoint("localhost", p.src.controlPort));
+        return new ShadowPullSettings(sources, 5_000, 60_000, 120_000, 100, 1, Set.of(ShadowKind.ALIGNED), null,
+                null);
+    }
+
+    static long timedPull(final ShadowPuller once, final long deadlineMs, final ShadowPuller.Report[] out) {
+        final long t0 = System.nanoTime();
+        out[0] = once.pullOnce(a -> 0, t0 + TimeUnit.MILLISECONDS.toNanos(deadlineMs));
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+    }
+
+    /** A source that never answers (a closed port, listed first, period 5 s) fits inside a 3 s startup deadline. */
+    @Test(timeout = 120_000)
+    public void aSilentSourceFitsInsideTheStartupDeadline() {
+        try (Pair p = new Pair(10)) {
+            p.src.write(R3, 2, ShadowKind.ALIGNED, 2_000, SMALL, 2, "64k");
+            final ShadowPuller.Report[] r = {null};
+            try (ShadowPuller once = p.puller(deadlineSettings(p, PullRig.freeUdpPort()), GENESIS, () -> false,
+                    Set.of())) {
+                final long ms = timedPull(once, 3_000, r);
+                assertTrue("a silent source held the startup pull " + ms + " ms against a 3000 ms deadline ("
+                        + r[0].text() + ")", ms <= 3_000 + DEADLINE_SLACK_MS);
+                ShadowRig.green("puller startup deadline: a silent source, " + ms + " ms against 3000 + "
+                        + DEADLINE_SLACK_MS + " ms (" + r[0].text() + ")");
+            }
+        }
+    }
+
+    /** One structural scan of {@code n}'s catalog with a fresh instance, in ms. */
+    static long oneScanMs(final PullRig.Node n, final int expectedErrors) {
+        final ShadowCatalog fresh = new ShadowCatalog(n.aeron(), n.archive(), ENGINE, 0, GENESIS, new ShadowVerdicts(),
+                100, ShadowRig.CLOCK, ShadowRig.TIMEOUT_NS, new ShadowCounters());
+        final long s0 = System.nanoTime();
+        assertEquals(expectedErrors, fresh.scan().errors());
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - s0);
+    }
+
+    /**
+     * A local shadow whose segment file is gone and a silent source: the startup pull ends at its deadline, or once
+     * the one structural read in progress at the deadline returned (the archive answers a replay of a missing segment
+     * file only after its replay connect timeout, 5 s by default; a read in progress is not interrupted). Nothing
+     * else runs past the deadline: no listing, no second read.
+     */
+    @Test(timeout = 120_000)
+    public void aDeadLocalShadowFitsInsideTheStartupDeadline() {
+        try (Pair p = new Pair(10)) {
+            p.src.write(R3, 2, ShadowKind.ALIGNED, 2_000, SMALL, 2, "64k");
+            p.dst.write(R3, 1, ShadowKind.ALIGNED, 1_000, SMALL, 1, "64k");
+            assertEquals(1, wipeSegments(p.dst));
+            final long readMs = oneScanMs(p.dst, 1);
+            final ShadowPuller.Report[] r = {null};
+            try (ShadowPuller once = p.puller(deadlineSettings(p, PullRig.freeUdpPort()), GENESIS, () -> false,
+                    Set.of())) {
+                final long ms = timedPull(once, 3_000, r);
+                final long bound = Math.max(3_000, readMs) + DEADLINE_SLACK_MS;
+                assertTrue("a dead local shadow and a silent source held the startup pull " + ms + " ms against a"
+                        + " 3000 ms deadline, one dead read " + readMs + " ms (" + r[0].text() + ")", ms <= bound);
+                ShadowRig.green("puller startup deadline: a dead local shadow and a silent source, " + ms
+                        + " ms against max(3000, one read " + readMs + ") + " + DEADLINE_SLACK_MS + " ms ("
+                        + r[0].text() + ")");
+            }
+        }
+    }
+
+    /** A dead descriptor found by the first scan of a startup pull is not read again by its later scans. */
+    @Test(timeout = 120_000)
+    public void aStartupPullReadsADeadShadowOnce() {
+        try (Pair p = new Pair(10)) {
+            p.src.write(R3, 2, ShadowKind.ALIGNED, 2_000, SMALL, 2, "64k");
+            p.dst.write(R3, 1, ShadowKind.ALIGNED, 1_000, SMALL, 1, "64k");
+            assertEquals(1, wipeSegments(p.dst));
+            final long scanMs = oneScanMs(p.dst, 1);
+            final ShadowPuller.Report[] r = {null};
+            try (ShadowPuller once = p.puller(deadlineSettings(p, -1), GENESIS, () -> false, Set.of())) {
+                final long ms = timedPull(once, 60_000, r);
+                assertEquals(r[0].text(), ShadowPuller.Report.Kind.VERIFIED, r[0].kind());
+                assertTrue("the dead shadow was read again by the same startup pull: " + ms + " ms, one read "
+                        + scanMs + " ms", ms < scanMs * 3 / 2 + DEADLINE_SLACK_MS);
+                ShadowRig.green("puller startup deadline: VERIFIED in " + ms + " ms with one dead read of " + scanMs
+                        + " ms");
+            }
+        }
+    }
+
+    /**
+     * A startup pull returns on its first VERIFIED copy without another discovery: no second listing of the sources
+     * and no replication started for the return to abandon. Deterministic: each pass is followed by a wait past the
+     * period, so a discovery is due in the pass that VERIFIES, and the source holds a second candidate to start.
+     */
+    @Test(timeout = 120_000)
+    public void aStartupPullDiscoversNoMoreAfterItsVerifiedCopy() {
+        try (Pair p = new Pair(10)) {
+            p.src.write(R3, 1, ShadowKind.ALIGNED, 1_000, SMALL, 1, "64k");
+            p.src.write(R3, 2, ShadowKind.ALIGNED, 2_000, SMALL, 2, "64k");
+            try (ShadowPuller once = p.puller(p.settings(120_000, 1, false), GENESIS, () -> false, Set.of())) {
+                final ShadowPuller.Report r = once.pullOnce(a -> 0,
+                        System.nanoTime() + TimeUnit.SECONDS.toNanos(60), () -> sleepMs(PERIOD_MS + 100));
+                assertEquals(r.text(), ShadowPuller.Report.Kind.VERIFIED, r.kind());
+                assertEquals("discoveries in the startup pull", 1, once.discoveries());
+                assertEquals("replications started by the startup pull", 1, once.counters().get(Counter.STARTED_TOTAL));
+                assertTrue("in flight after the return: " + once.inflightDestinations(),
+                        once.inflightDestinations().isEmpty());
+                ShadowRig.green("puller startup: VERIFIED after 1 discovery and 1 started replication ("
+                        + r.text() + ")");
+            }
+        }
+    }
+
+    static void sleepMs(final long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (final InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(e);
+        }
     }
 }

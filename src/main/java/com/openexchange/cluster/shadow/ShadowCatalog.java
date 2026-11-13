@@ -231,6 +231,10 @@ public final class ShadowCatalog {
     private final String prefix;
     private Map<Long, Cached> cache = new HashMap<>();
     private Scan lastScan;
+    private boolean readBounded;
+    private long readDeadlineNs;
+    private boolean holdUnknown;
+    private Map<Long, Cached> heldUnknown;
 
     /**
      * @param genesisId 0 = unknown (replica bootstrap only); otherwise COMPLETE copies of another genesis are FOREIGN
@@ -291,6 +295,33 @@ public final class ShadowCatalog {
 
     // ------------------------------------------------------------------------------------------------------- scan
 
+    /**
+     * {@link #scan()} inside the caller's bound: every structural read ends by {@code deadlineNs} (an absolute value
+     * of the injected clock) or its own replay timeout, whichever is first, and a descriptor not read by then is
+     * SCAN_ERROR ("not read"). Unknown, never corrupt: the next scan reads it again.
+     */
+    public Scan scan(final long deadlineNs) {
+        readBounded = true;
+        readDeadlineNs = deadlineNs;
+        try {
+            return scan();
+        } finally {
+            readBounded = false;
+        }
+    }
+
+    /**
+     * While on, the descriptors the first scan after this call found SCAN_ERROR are not read again by the later
+     * scans of this instance while their descriptor is unchanged (a recording whose segment file is gone costs the
+     * archive's error answer on every read). For one bounded caller (a startup pull, a member's restore): turned off
+     * when it ends, and every call drops what an earlier one held. Recordings created after that first scan are
+     * always read. A held entry stays SCAN_ERROR: never usable, so holding it can only cost a candidate, never add one.
+     */
+    public void holdUnknown(final boolean on) {
+        holdUnknown = on;
+        heldUnknown = null;
+    }
+
     /** 6.2. Never throws. */
     public Scan scan() {
         counters.increment(ShadowCounters.Counter.CATALOG_SCANS_TOTAL);
@@ -309,9 +340,15 @@ public final class ShadowCatalog {
         for (final Descriptor d : descriptors) {
             final Cached cached = cache.get(d.recordingId());
             final ShadowEntry e;
+            final Cached held = heldUnknown == null ? null : heldUnknown.get(d.recordingId());
             if (cached != null && (off.contains(NegativeControl.STRUCTURAL_CACHE_BY_RECORDING_ID)
                     || cached.descriptor().equals(d))) {
                 e = cached.entry();
+            } else if (held != null && held.descriptor().equals(d)) {
+                e = held.entry();
+            } else if (readBounded && clock.nanoTime() - readDeadlineNs >= 0) {
+                e = entry(d, ShadowAlias.tryParse(ShadowAlias.aliasOfChannel(d.originalChannel())), null, null, 0,
+                        null, State.SCAN_ERROR, "not read: the caller's deadline passed", SCAN_CODE_TIMEOUT);
             } else {
                 e = classify(d);
             }
@@ -321,6 +358,14 @@ public final class ShadowCatalog {
             entries.add(e);
         }
         cache = nextCache;
+        if (holdUnknown && heldUnknown == null) {
+            heldUnknown = new HashMap<>();
+            for (int i = 0; i < descriptors.size(); i++) {
+                if (entries.get(i).state() == State.SCAN_ERROR) {
+                    heldUnknown.put(descriptors.get(i).recordingId(), new Cached(descriptors.get(i), entries.get(i)));
+                }
+            }
+        }
         lastScan = assemble(entries);
         publish(lastScan);
         return lastScan;
@@ -445,7 +490,7 @@ public final class ShadowCatalog {
                 final byte[] bytes = new byte[len];
                 buffer.getBytes(offset, bytes);
                 w.messages.add(bytes);
-            }, clock.nanoTime() + replayTimeoutNs);
+            }, readDeadline());
         } catch (final ArchiveException ae) {
             if (trailerWindow && ae.errorCode() == ArchiveException.INVALID_POSITION
                     && !off.contains(NegativeControl.INVALID_POSITION_AS_SCAN_ERROR)) {
@@ -471,6 +516,13 @@ public final class ShadowCatalog {
                     SCAN_CODE_CLIENT);
         }
         return w;
+    }
+
+    /** The deadline of one structural read: the replay timeout, or the bounded caller's deadline when earlier. */
+    private long readDeadline() {
+        final long now = clock.nanoTime();
+        return readBounded ? now + Math.min(replayTimeoutNs, Math.max(0, readDeadlineNs - now))
+                : now + replayTimeoutNs;
     }
 
     /** 6.2 steps 4-7 over the structural entries. */

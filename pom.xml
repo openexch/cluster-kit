@@ -37,7 +37,7 @@
              it moves. CI also runs the tests against 1.53.1
              (-Daeron.version=1.53.1), the version match ships; the
              1.53.0 -> 1.53.1 delta was reviewed before the move. -->
-        <aeron.version>1.53.0</aeron.version>
+        <aeron.version>1.54.0</aeron.version>
         <agrona.version>2.6.0</agrona.version>
         <junit.version>4.13.2</junit.version>
         <!-- Reproducible jar (maven-jar entry times), so the kit jar the engines shade is derived by

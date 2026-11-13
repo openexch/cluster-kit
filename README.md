@@ -47,6 +47,14 @@ CI (`.github/workflows/build.yml`) runs both. Aeron 1.53.0 with Agrona 2.6.0 is
 the compile floor set in `pom.xml`; the jar that is verified and published is
 always the 1.53.0 build.
 
+Test settings (system properties, defaults in brackets):
+
+| Setting | Effect |
+|---|---|
+| `kit.pullrig.archive.threading` [`DEDICATED`] | archive threading mode of the pull test nodes; DEDICATED is the member's mode, `SHARED` hides the window between REPLICATE_END and a copy's recorded stop |
+| `kit.test.pull.deadline.slack.ms` [`1500`] | how far past its deadline a startup pull may return in the deadline rows |
+| `kit.test.pull.statistical` [`false`] | runs the statistical startup-pull control (`kit.test.pull.statistical.pulls` [`80`] pulls of 640 KB, none refused for an ACTIVE copy); not a CI row |
+
 ## Consuming it
 
 ```xml

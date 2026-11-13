@@ -55,20 +55,25 @@ import java.util.function.LongSupplier;
  * <p>At most {@code SHADOW_PULL_MAX_INFLIGHT} replications ({@code replicate} with {@link ReplicationParams}: the
  * replication channel from {@code SHADOW_PULL_REPLICATION_ENDPOINT}, the source's response channel from
  * {@code SHADOW_PULL_RESPONSE_ENDPOINT}, each only when set). A copy is COMPLETE when the archive signalled SYNC for the
- * replication, or when it ended with the local length equal to the source length recorded at discovery; then the local
- * catalog classifies it and the deep read verifies it (shared {@link ShadowVerdicts}). REPLICATE_END without either is
- * INCOMPLETE (the source crashed, its driver went away, its replay was stopped): the partial copy is purged and the
- * candidate retried. Only a COMPLETE copy can be refused for its content.</p>
+ * replication, or when it ended with the local length equal to the source length recorded at discovery. It is judged
+ * only once the local recording's stop position is recorded (the archive signals SYNC and REPLICATE_END before the
+ * destination's recording session closes; an ACTIVE copy is unknown, read again next pass, like SCAN_ERROR); then the
+ * local catalog classifies it and the deep read verifies it (shared {@link ShadowVerdicts}). REPLICATE_END without
+ * either is INCOMPLETE (the source crashed, its driver went away, its replay was stopped): the partial copy is purged
+ * and the candidate retried. Only a COMPLETE copy can be refused for its content; a copy that reaches its bound before
+ * it was judged is a TIMEOUT, never content.</p>
  *
  * <h2>Refusal classes (never relabelled into each other)</h2>
  * <pre>
  * archive     an error response: GENERIC with the source's text (Aeron answers every source-side refusal so), or a
  *             destination code (MAX_RECORDINGS, REPLICATION_CONNECTION_FAILURE, STORAGE_SPACE): purge, retry
  * INCOMPLETE  the copy ended short of the source without an error: purge, retry
- * TIMEOUT     the replication outlived SHADOW_PULL_TIMEOUT_MS (or a startup pull's deadline): stop, purge, retry
+ * TIMEOUT     the replication, or the judgement of its copy, outlived SHADOW_PULL_TIMEOUT_MS (or a startup pull's
+ *             deadline): stop, purge, retry
  * source      the source did not answer its listing: skipped this pass, reconnected
- * content     a COMPLETE copy that is not COMPLETE locally or whose deep read is CORRUPT: purged, the SOURCE
- *             recording refused for the life of the process (never re-pulled, never pinned), CRITICAL
+ * content     a COMPLETE copy, stopped locally, that is not COMPLETE locally or whose deep read is CORRUPT: purged, the
+ *             SOURCE recording refused for the life of the process (never re-pulled, never pinned), CRITICAL; only a
+ *             deep read that is CORRUPT tells the operator to purge it on the producer
  * conflict    a COMPLETE copy that disagrees with a local copy at its position: kept (an operator resolves it), CRITICAL
  * </pre>
  * <p>Retries wait {@code SHADOW_PULL_RETRY_BACKOFF_MS}, doubling to 8x per candidate, reset on success. The puller
@@ -243,6 +248,8 @@ public final class ShadowPuller implements AutoCloseable {
         AeronArchive.AsyncConnect connecting;
         AeronArchive client;
         boolean everConnected;
+        /** The message timeout the client (or the connect in progress) was created with. */
+        long timeoutNs;
     }
 
     private final Aeron aeron;
@@ -287,6 +294,8 @@ public final class ShadowPuller implements AutoCloseable {
     private int refusedThisCall;
     private String lastReason = "no candidate";
     private ShadowEntry lastPulled;
+    /** Discovery passes run by this puller; for the tests. */
+    private long discoveries;
     private Endpoint lastPulledFrom;
     private volatile String lastRefusal;
     private volatile Supplier<String> deferredSource = () -> null;
@@ -384,6 +393,18 @@ public final class ShadowPuller implements AutoCloseable {
         return Set.copyOf(pulledThisProcess);
     }
 
+    /** The discovery passes this puller ran; for the tests. */
+    long discoveries() {
+        return discoveries;
+    }
+
+    /** {@code replicationId -> local recording id} (-1 before REPLICATE) of the in-flight pulls; for the tests. */
+    Map<Long, Long> inflightDestinations() {
+        final Map<Long, Long> out = new LinkedHashMap<>();
+        inflight.forEach((id, f) -> out.put(id, f.dst));
+        return out;
+    }
+
     // ------------------------------------------------------------------------------------------------ lifecycle
 
     /** Starts {@code <threadName>}: a pass every 10th of the period (polls signals), discovery every period. */
@@ -465,7 +486,10 @@ public final class ShadowPuller implements AutoCloseable {
     /**
      * A startup pull on the caller's thread: discovery at once, then every period, until one candidate the
      * {@code target} accepts was pulled and VERIFIED, or {@code deadlineNs}. An in-flight replication is stopped and
-     * purged at the deadline whatever {@code SHADOW_PULL_TIMEOUT_MS} says (the deadline is the one bound).
+     * purged at the deadline whatever {@code SHADOW_PULL_TIMEOUT_MS} says (the deadline is the one bound). The deadline
+     * also bounds every pass: no source is listed past it, a listing's connect wait and message timeout are at most
+     * the time left, no candidate is started past it, and the local catalog's structural reads end by it. A local
+     * descriptor the first scan of the call found SCAN_ERROR is not read again during the call.
      */
     public Report pullOnce(final Target target, final long deadlineNs) {
         return pullOnce(target, deadlineNs, () -> { });
@@ -498,6 +522,9 @@ public final class ShadowPuller implements AutoCloseable {
         lastPulled = null;
         lastPulledFrom = null;
         nextDiscoveryNs = clock.nanoTime();
+        if (catalog != null) {
+            catalog.holdUnknown(true);
+        }
         try {
             boolean stopped = false;
             while (running && clock.nanoTime() - deadlineNs < 0) {
@@ -542,6 +569,9 @@ public final class ShadowPuller implements AutoCloseable {
             return report(lastPulled != null ? Report.Kind.VERIFIED : Report.Kind.NONE);
         } finally {
             this.target = null;
+            if (catalog != null) {
+                catalog.holdUnknown(false);
+            }
         }
     }
 
@@ -591,17 +621,31 @@ public final class ShadowPuller implements AutoCloseable {
         pollSignals();
         outcomes();
         retryPurges();
+        if (target != null && lastPulled != null) {
+            // a startup pull that VERIFIED a copy in this call returns after this pass: a further discovery would list
+            // every source again (dead ones to their timeout) and start a replication the return then abandons
+            return;
+        }
         final long now = clock.nanoTime();
         if (inflight.size() < settings.maxInflight() && now - nextDiscoveryNs >= 0) {
             nextDiscoveryNs = now + TimeUnit.MILLISECONDS.toNanos(settings.periodMs());
-            final List<Candidate> candidates = discover();
+            final List<Candidate> candidates = discover(startupDeadlineNs);
             for (final Candidate c : candidates) {
-                if (inflight.size() >= settings.maxInflight()) {
+                if (inflight.size() >= settings.maxInflight() || past(startupDeadlineNs)) {
                     break;
                 }
                 start(c, startupDeadlineNs);
             }
         }
+    }
+
+    /** True when {@code deadlineNs} is set and passed. */
+    private boolean past(final Long deadlineNs) {
+        return deadlineNs != null && clock.nanoTime() - deadlineNs >= 0;
+    }
+
+    private ShadowCatalog.Scan scanLocal(final Long deadlineNs) {
+        return deadlineNs == null ? catalog.scan() : catalog.scan(deadlineNs);
     }
 
     private void ensureLocal() {
@@ -620,6 +664,7 @@ public final class ShadowPuller implements AutoCloseable {
         if (catalog == null || catalogGenesis != g) {
             catalog = new ShadowCatalog(aeron, catalogClient, engineId, clusterId, g, verdicts,
                     ShadowCatalog.DEFAULT_LIST_BATCH, clock, replayTimeoutNs, shadowCounters);
+            catalog.holdUnknown(target != null);
             catalogGenesis = g;
         }
     }
@@ -632,8 +677,9 @@ public final class ShadowPuller implements AutoCloseable {
         // the error handler above
     }
 
-    private void onSignal(final long replicationId, final long recordingId, final long position,
-                          final RecordingSignal signal) {
+    /** The local archive's recording signal for {@code replicationId} (package-private for the tests). */
+    void onSignal(final long replicationId, final long recordingId, final long position,
+                  final RecordingSignal signal) {
         final Inflight f = inflight.get(replicationId);
         if (f == null) {
             early.computeIfAbsent(replicationId, k -> new ArrayList<>()).add(new Object[] {recordingId, position,
@@ -672,8 +718,9 @@ public final class ShadowPuller implements AutoCloseable {
 
     // ------------------------------------------------------------------------------------------------ discovery
 
-    private List<Candidate> discover() {
-        final ShadowCatalog.Scan local = catalog.scan();
+    private List<Candidate> discover(final Long deadlineNs) {
+        discoveries++;
+        final ShadowCatalog.Scan local = scanLocal(deadlineNs);
         final Set<ShadowAlias> heldUsable = new HashSet<>();
         final Set<ShadowAlias> heldAny = new HashSet<>();
         final Set<String> heldSeq = new HashSet<>();
@@ -711,13 +758,16 @@ public final class ShadowPuller implements AutoCloseable {
         }
         for (int i = 0; i < sources.size(); i++) {
             final Endpoint src = sources.get(i);
+            if (past(deadlineNs)) {
+                break; // the startup deadline: no source is listed past it
+            }
             if (deferred != null && deferred.equals(src.text())) {
                 counters.increment(Counter.SOURCE_SKIPPED_LEADER_TOTAL);
                 continue;
             }
             final List<long[]> descriptors = new ArrayList<>();
             final List<String> channels = new ArrayList<>();
-            if (!list(src, descriptors, channels)) {
+            if (!list(src, descriptors, channels, deadlineNs)) {
                 continue;
             }
             for (int d = 0; d < descriptors.size(); d++) {
@@ -809,18 +859,37 @@ public final class ShadowPuller implements AutoCloseable {
         return heldUsable.contains(alias);
     }
 
-    /** Lists one source; false (counted, the client closed for a reconnect) when it did not answer. */
-    private boolean list(final Endpoint src, final List<long[]> descriptors, final List<String> channels) {
+    /**
+     * Lists one source; false (counted, the client closed for a reconnect) when it did not answer. The connect wait and
+     * the client's message timeout are the period, or the time left before {@code deadlineNs} when that is shorter (a
+     * client created with a longer timeout than this listing's bound is replaced first, uncounted).
+     */
+    private boolean list(final Endpoint src, final List<long[]> descriptors, final List<String> channels,
+                         final Long deadlineNs) {
+        final long periodNs = TimeUnit.MILLISECONDS.toNanos(settings.periodMs());
+        final long boundNs = deadlineNs == null ? periodNs : Math.min(periodNs, deadlineNs - clock.nanoTime());
+        if (boundNs <= 0) {
+            return false;
+        }
         final Remote r = remotes.computeIfAbsent(src.text(), k -> new Remote());
+        boolean replaced = false;
+        if ((r.client != null || r.connecting != null)
+                && (deadlineNs == null ? r.timeoutNs != periodNs : r.timeoutNs > boundNs)) {
+            CloseHelper.quietCloseAll(r.connecting, r.client);
+            r.connecting = null;
+            r.client = null;
+            replaced = true;
+        }
         try {
             if (r.client == null) {
                 if (r.connecting == null) {
-                    if (r.everConnected) {
+                    if (r.everConnected && !replaced) {
                         counters.increment(Counter.SOURCE_RECONNECTS_TOTAL);
                     }
-                    r.connecting = AeronArchive.asyncConnect(remoteContext(src));
+                    r.connecting = AeronArchive.asyncConnect(remoteContext(src, boundNs));
+                    r.timeoutNs = boundNs;
                 }
-                final long deadline = clock.nanoTime() + TimeUnit.MILLISECONDS.toNanos(settings.periodMs());
+                final long deadline = clock.nanoTime() + boundNs;
                 while ((r.client = r.connecting.poll()) == null) {
                     if (clock.nanoTime() - deadline >= 0) {
                         return false; // still connecting: tried again next pass
@@ -856,7 +925,7 @@ public final class ShadowPuller implements AutoCloseable {
         }
     }
 
-    private AeronArchive.Context remoteContext(final Endpoint src) {
+    private AeronArchive.Context remoteContext(final Endpoint src, final long messageTimeoutNs) {
         final String response = settings.responseEndpoint() != null ? settings.responseEndpoint().udpChannel()
                 : "aeron:udp?endpoint=" + responseHost + ":0";
         return new AeronArchive.Context()
@@ -866,7 +935,7 @@ public final class ShadowPuller implements AutoCloseable {
                 .controlRequestStreamId(AeronArchive.Configuration.CONTROL_STREAM_ID_DEFAULT)
                 .controlResponseChannel(response)
                 .controlResponseStreamId(LISTING_RESPONSE_STREAM_ID)
-                .messageTimeoutNs(TimeUnit.MILLISECONDS.toNanos(settings.periodMs()));
+                .messageTimeoutNs(messageTimeoutNs);
     }
 
     // ------------------------------------------------------------------------------------------------ start
@@ -914,11 +983,17 @@ public final class ShadowPuller implements AutoCloseable {
     // ------------------------------------------------------------------------------------------------ outcomes
 
     private void outcomes() {
-        final long now = clock.nanoTime();
         for (final Inflight f : new ArrayList<>(inflight.values())) {
+            final long now = clock.nanoTime();
             if (f.verifying || (f.ended && f.error == null)) {
-                if (!f.verifying && !f.sync && f.dst >= 0 && localLength(f.dst) < 0 && now - f.deadlineNs < 0) {
-                    continue; // REPLICATE_END arrives before the destination's stop: judge the length once it is set
+                // SYNC and REPLICATE_END arrive before the destination's stop position is recorded: a copy is judged
+                // (length, classification, deep read) only once it is; until then it is unknown, and at its bound a
+                // TIMEOUT, never content
+                if (f.dst >= 0 && localLength(f.dst) < 0) {
+                    if (now - f.deadlineNs >= 0) {
+                        timeout(f, "the copy's stop position was not recorded within its bound");
+                    }
+                    continue;
                 }
                 if (!f.verifying && !f.sync && !lengthsEqual(f)
                         && !off.contains(NegativeControl.INCOMPLETE_AS_CONTENT)) {
@@ -932,16 +1007,23 @@ public final class ShadowPuller implements AutoCloseable {
                 }
                 f.verifying = true;
                 verify(f);
+                if (inflight.containsKey(f.replicationId) && clock.nanoTime() - f.deadlineNs >= 0) {
+                    timeout(f, "the copy was not judged within its bound");
+                }
             } else if (f.ended) {
                 done(f);
                 purgeOwn(f.dst);
                 archiveRefusal(f.candidate, f.errorCode, f.error);
             } else if (now - f.deadlineNs >= 0) {
-                done(f);
-                stopAndPurge(f);
-                retryLater(f.candidate, "TIMEOUT", "the replication outlived its bound (signals " + f.signals + ")");
+                timeout(f, "the replication outlived its bound");
             }
         }
+    }
+
+    private void timeout(final Inflight f, final String why) {
+        done(f);
+        stopAndPurge(f);
+        retryLater(f.candidate, "TIMEOUT", why + " (signals " + f.signals + ")");
     }
 
     private void done(final Inflight f) {
@@ -979,17 +1061,20 @@ public final class ShadowPuller implements AutoCloseable {
         return len[0];
     }
 
-    /** A COMPLETE copy (SYNC or equal lengths): local classification, then the deep read. */
+    /**
+     * A COMPLETE copy (SYNC or equal lengths) whose local stop is recorded: local classification (inside the copy's
+     * bound), then the deep read.
+     */
     private void verify(final Inflight f) {
-        final ShadowCatalog.Scan s = catalog.scan();
+        final ShadowCatalog.Scan s = catalog.scan(f.deadlineNs);
         final ShadowEntry e = s.entry(f.dst);
         if (e == null) {
             done(f);
             retryLater(f.candidate, "INCOMPLETE", "the copy rec=" + f.dst + " is not listed locally");
             return;
         }
-        if (e.state() == State.SCAN_ERROR) {
-            return; // unknown, not corrupt: the next pass reads it again
+        if (e.state() == State.SCAN_ERROR || e.state() == State.ACTIVE) {
+            return; // unknown or not stopped yet, never content: the next pass reads it again
         }
         if (e.state() == State.CONFLICT) {
             final DeepResult d = catalog.verifyDeep(e);
@@ -998,7 +1083,7 @@ public final class ShadowPuller implements AutoCloseable {
             }
             done(f);
             if (d.kind() == DeepResult.Kind.CORRUPT) {
-                content(f, "CORRUPT", d.reason());
+                content(f, "CORRUPT", d.reason(), true);
                 return;
             }
             conflictKept.add(f.candidate.key());
@@ -1009,7 +1094,7 @@ public final class ShadowPuller implements AutoCloseable {
         }
         if (!e.state().usable()) {
             done(f);
-            content(f, e.state().name(), e.reason());
+            content(f, e.state().name(), e.reason(), false);
             return;
         }
         final DeepResult d = catalog.verifyDeep(e);
@@ -1028,11 +1113,11 @@ public final class ShadowPuller implements AutoCloseable {
             }
             case CORRUPT -> {
                 done(f);
-                content(f, "CORRUPT", d.reason());
+                content(f, "CORRUPT", d.reason(), true);
             }
             case NOT_VERIFIABLE -> {
                 done(f);
-                content(f, String.valueOf(d.reason()), "not verifiable");
+                content(f, String.valueOf(d.reason()), "not verifiable", false);
             }
             default -> {
                 // SCAN_ERROR: unknown, read again next pass
@@ -1044,7 +1129,7 @@ public final class ShadowPuller implements AutoCloseable {
 
     private void archiveRefusal(final Candidate c, final int code, final String text) {
         if (off.contains(NegativeControl.PULL_RETRY_AS_CONTENT)) {
-            refuseForContent(c, "CORRUPT", "archive refusal (code " + code + "): " + text);
+            refuseForContent(c, "CORRUPT", "archive refusal (code " + code + "): " + text, false);
             return;
         }
         retryLater(c, archiveReason(code), "archive refusal code " + code + ": " + text);
@@ -1074,12 +1159,17 @@ public final class ShadowPuller implements AutoCloseable {
                 + settings.retryBackoffMs() * factor + " ms");
     }
 
-    private void content(final Inflight f, final String reason, final String detail) {
+    private void content(final Inflight f, final String reason, final String detail, final boolean readCorrupt) {
         purgeOwn(f.dst);
-        refuseForContent(f.candidate, reason, detail);
+        refuseForContent(f.candidate, reason, detail, readCorrupt);
     }
 
-    private void refuseForContent(final Candidate c, final String reason, final String detail) {
+    /**
+     * @param readCorrupt the local copy's deep read is CORRUPT: the only refusal whose operator text says to purge
+     *                    the source recording on the producer; any other one says not to purge it unverified
+     */
+    private void refuseForContent(final Candidate c, final String reason, final String detail,
+                                  final boolean readCorrupt) {
         if (off.contains(NegativeControl.PULL_CONTENT_AS_RETRY)) {
             retryLater(c, reason, detail);
             return;
@@ -1091,7 +1181,9 @@ public final class ShadowPuller implements AutoCloseable {
         lastRefusal = reason + ": " + detail;
         System.err.println("[SHADOW-PULL] CRITICAL: refused for content (" + reason + "): source " + c.source().text()
                 + " recording " + c.srcRecordingId() + " " + c.alias().format() + ": " + detail
-                + "; never pulled again in this process (purge it on the producer)");
+                + "; never pulled again in this process " + (readCorrupt
+                ? "(its copy read CORRUPT: purge it on the producer)"
+                : "(not read CORRUPT: do not purge it on the producer before a deep read there says CORRUPT)"));
     }
 
     // ------------------------------------------------------------------------------------------------ purges
@@ -1102,7 +1194,24 @@ public final class ShadowPuller implements AutoCloseable {
         } catch (final RuntimeException alreadyDone) {
             // the session ended on its own
         }
+        awaitStopped(f.dst);
         purgeOwn(f.dst);
+    }
+
+    /**
+     * The destination recording stops on another archive thread shortly after its replication was stopped, and the
+     * archive refuses to purge it before (ACTIVE_RECORDING): waits for its stop position, at most the shorter of the
+     * period and one local read bound (a purge still refused then is retried next pass).
+     */
+    private void awaitStopped(final long dst) {
+        if (dst < 0 || !pulledThisProcess.contains(dst)) {
+            return;
+        }
+        final long deadline = clock.nanoTime()
+                + Math.min(replayTimeoutNs, TimeUnit.MILLISECONDS.toNanos(settings.periodMs()));
+        while (localLength(dst) < 0 && clock.nanoTime() - deadline < 0) {
+            sleep(1);
+        }
     }
 
     private void abortAll(final String why) {

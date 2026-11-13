@@ -25,8 +25,16 @@ import java.util.List;
  * control channel on {@code localhost:<port>} (a replication source), a replication channel and an archive client
  * response channel on UDP (a replication destination), and an archive dir that survives {@link Node#stop} so a
  * stopped source can come back with its recordings ({@link Node#start(boolean)} with {@code wipe=false}).
+ *
+ * <p>The archive runs in {@link ArchiveThreadingMode#DEDICATED}, the member's mode (its recorder, replayer and
+ * conductor race as they do on a member; SHARED hides the window between REPLICATE_END and the destination's stop).
+ * The test setting {@code -Dkit.pullrig.archive.threading=SHARED} runs every node in SHARED instead.</p>
  */
 final class PullRig {
+
+    /** The archive threading mode of every node (a test setting, default DEDICATED like the member). */
+    static final ArchiveThreadingMode ARCHIVE_THREADING = ArchiveThreadingMode.valueOf(
+            System.getProperty("kit.pullrig.archive.threading", ArchiveThreadingMode.DEDICATED.name()));
 
     private PullRig() {
     }
@@ -58,13 +66,19 @@ final class PullRig {
         final File dir;
         final int controlPort;
         final int maxReplays;
+        final ArchiveThreadingMode threading;
         private ArchivingMediaDriver driver;
         private Aeron aeron;
         private AeronArchive archive;
         private final List<AutoCloseable> extra = new ArrayList<>();
 
         Node(final String name, final int maxReplays) {
+            this(name, maxReplays, ARCHIVE_THREADING);
+        }
+
+        Node(final String name, final int maxReplays, final ArchiveThreadingMode threading) {
             this.name = name;
+            this.threading = threading;
             this.dir = tempDir("kit-pull-" + name + "-");
             this.controlPort = freeUdpPort();
             this.maxReplays = maxReplays;
@@ -90,7 +104,7 @@ final class PullRig {
                             .replicationChannel("aeron:udp?endpoint=localhost:0")
                             .maxConcurrentReplays(maxReplays)
                             .recordingEventsEnabled(false)
-                            .threadingMode(ArchiveThreadingMode.SHARED)
+                            .threadingMode(threading)
                             .deleteArchiveOnStart(wipe));
             aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(aeronDir));
             archive = AeronArchive.connect(localContext());

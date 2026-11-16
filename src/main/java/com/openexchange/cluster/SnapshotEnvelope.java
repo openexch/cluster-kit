@@ -57,6 +57,27 @@ public final class SnapshotEnvelope {
         return envelopedLength(payloadLength);
     }
 
+    /**
+     * The CRC32C {@link #seal} stored in the trailer of {@code buf[0..sealedLength)}, as an unsigned value
+     * (0..4294967295). It covers the payload only, header excluded, so two nodes that serialized the same state
+     * report the same value. No traversal and no allocation: it reads the trailer {@link #seal} already wrote.
+     * It does not verify the payload; {@link #open} does.
+     *
+     * @param sealedLength the length {@link #seal} returned (or the verified image length)
+     * @throws IllegalArgumentException when {@code buf} carries no envelope of exactly that length
+     */
+    public static long sealedCrc(final DirectBuffer buf, final int sealedLength) {
+        if (!isEnveloped(buf, sealedLength)) {
+            throw new IllegalArgumentException("no snapshot envelope in " + sealedLength + " bytes");
+        }
+        final int payloadLength = buf.getInt(8);
+        if (payloadLength < 0 || envelopedLength(payloadLength) != sealedLength) {
+            throw new IllegalArgumentException("sealed length " + sealedLength + " is not the envelope of "
+                    + payloadLength + " payload bytes");
+        }
+        return buf.getInt(HEADER_LENGTH + payloadLength) & 0xFFFF_FFFFL;
+    }
+
     /** True if {@code buf[0..length)} starts with this envelope's magic. Diagnostic only; {@link #open} decides. */
     public static boolean isEnveloped(final DirectBuffer buf, final int length) {
         return length >= HEADER_LENGTH + TRAILER_LENGTH && buf.getInt(0) == MAGIC;

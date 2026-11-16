@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.openexchange.cluster.replica;
 
+import com.openexchange.cluster.BuildInfo;
 import com.openexchange.cluster.log.ShadowEngine;
 import com.openexchange.cluster.shadow.ShadowHeader;
 import com.openexchange.cluster.shadow.ShadowIdentitySource;
@@ -49,4 +50,12 @@ public interface ReplicaEngine {
      * kit reads a stub's genesis from the stub itself.
      */
     long imageGenesisId(org.agrona.DirectBuffer image, int length);
+
+    /**
+     * The build the replica reports on {@code /health} and {@code /ready}. By default the manifest of the jar this
+     * binding was loaded from, which is the engine's own jar.
+     */
+    default BuildInfo build() {
+        return BuildInfo.of(getClass());
+    }
 }

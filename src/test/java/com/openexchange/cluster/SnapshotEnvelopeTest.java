@@ -86,4 +86,29 @@ public class SnapshotEnvelopeTest {
         direct.putByte(SnapshotEnvelope.payloadOffset() + 50, (byte) 0x7F);
         assertThrows(IllegalStateException.class, () -> new SnapshotEnvelope().open(direct, len));
     }
+    @Test
+    public void sealedCrcIsTheTrailerAsAnUnsignedValue() {
+        final int[] len = new int[1];
+        final ExpandableArrayBuffer buf = sealed(1_000, len);
+        final java.util.zip.CRC32C independent = new java.util.zip.CRC32C();
+        independent.update(buf.byteArray(), SnapshotEnvelope.payloadOffset(), 1_000);
+        assertEquals(independent.getValue(), SnapshotEnvelope.sealedCrc(buf, len[0]));
+        assertEquals(buf.getInt(SnapshotEnvelope.payloadOffset() + 1_000) & 0xFFFF_FFFFL,
+                SnapshotEnvelope.sealedCrc(buf, len[0]));
+
+        final ExpandableArrayBuffer high = new ExpandableArrayBuffer();
+        final int highLen = new SnapshotEnvelope().seal(high, 0);
+        high.putInt(SnapshotEnvelope.payloadOffset(), 0xFFFF_FFFE); // a trailer with the top bit set
+        assertEquals(0xFFFF_FFFEL, SnapshotEnvelope.sealedCrc(high, highLen));
+    }
+
+    @Test
+    public void sealedCrcRefusesALengthThatIsNotTheSealedOne() {
+        final int[] len = new int[1];
+        final ExpandableArrayBuffer buf = sealed(64, len);
+        assertThrows(IllegalArgumentException.class, () -> SnapshotEnvelope.sealedCrc(buf, len[0] - 1));
+        assertThrows(IllegalArgumentException.class, () -> SnapshotEnvelope.sealedCrc(buf, len[0] + 4));
+        assertThrows(IllegalArgumentException.class,
+                () -> SnapshotEnvelope.sealedCrc(new UnsafeBuffer(new byte[64]), 64));
+    }
 }

@@ -234,7 +234,7 @@ public final class ReplicaProcess implements AutoCloseable {
         housekeeping.backupState(this::backupState);
         metrics = new ReplicaMetrics(follower, events, readiness, shadowCounters, this::backupState, clock, wall);
         metrics.housekeeping(housekeeping);
-        endpoint = new NodeEndpoint(readiness::probe, metrics::body);
+        endpoint = new NodeEndpoint(readiness::probe, metrics::body).withBuild(engine.build());
         try {
             endpoint.start(cfg.nodePort);
         } catch (final IOException e) {

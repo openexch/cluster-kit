@@ -12,7 +12,8 @@ import java.util.function.Supplier;
 
 /**
  * The three things a cluster node has to answer for itself: {@code /health},
- * {@code /ready} and {@code /metrics}.
+ * {@code /ready} and {@code /metrics}. The first two end with the node's build
+ * identity ({@link #withBuild}).
  *
  * <p>They live in the node process because the node owns the facts. Deriving
  * health from outside meant reading another process's Aeron counters and
@@ -29,6 +30,8 @@ public final class NodeEndpoint {
     private final Runnable onStop;
     private final Supplier<String> metricsBody;
     private HttpServer server;
+    /** The {@code " version=<v> build=<sha>"} suffix, built once; the HTTP thread only reads the reference. */
+    private volatile String buildTokens = BuildInfo.unknown().tokens();
 
     /**
      * @param readiness   the node's own view of itself
@@ -54,6 +57,19 @@ public final class NodeEndpoint {
         this.metricsBody = metricsBody;
     }
 
+    /**
+     * The build this node runs. {@code /health} and {@code /ready} end with {@code version=<v> build=<sha>} after
+     * every token the probe detail carries, so a reader that knows the old body still finds each token where it was.
+     * The token is {@code build=}, not {@code commit=}: {@code commit=} is the commit log position. Without a call
+     * both read {@code unknown}.
+     *
+     * @return this endpoint, for chaining at construction
+     */
+    public NodeEndpoint withBuild(final BuildInfo build) {
+        this.buildTokens = (build == null ? BuildInfo.unknown() : build).tokens();
+        return this;
+    }
+
     public void start(final int port) throws IOException {
         server = HttpServer.create(new InetSocketAddress(port), 0);
 
@@ -61,14 +77,14 @@ public final class NodeEndpoint {
         // request: the process is up but no longer doing its job.
         server.createContext("/health", exchange -> {
             final NodeReadiness.Probe p = probe.get();
-            respond(exchange, p.live() ? 200 : 503, p.detail());
+            respond(exchange, p.live() ? 200 : 503, p.detail() + buildTokens);
         });
 
         // 200 only when this member can be counted on. A rolling restart waits
         // on this, so a false 200 costs quorum.
         server.createContext("/ready", exchange -> {
             final NodeReadiness.Probe p = probe.get();
-            respond(exchange, p.ready() ? 200 : 503, p.detail());
+            respond(exchange, p.ready() ? 200 : 503, p.detail() + buildTokens);
         });
 
         if (metricsBody != null) {

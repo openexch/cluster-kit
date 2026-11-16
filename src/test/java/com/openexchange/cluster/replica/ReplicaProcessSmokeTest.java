@@ -300,6 +300,11 @@ public class ReplicaProcessSmokeTest {
         }
 
         @Override
+        public com.openexchange.cluster.BuildInfo build() {
+            return new com.openexchange.cluster.BuildInfo("9.9.9-smoke", "abc1234");
+        }
+
+        @Override
         public ShadowEngine engine() {
             return engine;
         }
@@ -474,6 +479,14 @@ public class ReplicaProcessSmokeTest {
         await("both shadows VERIFIED", () -> verified(replica).contains(aligned)
                 && verified(replica).contains(standby), 60_000);
         await("ready", () -> replica.readiness().probe().ready(), 30_000);
+        for (final String path : new String[] {"/health", "/ready"}) {
+            final com.openexchange.cluster.NodeEndpointProbeTest.Response r =
+                    com.openexchange.cluster.NodeEndpointProbeTest.get(replica.endpoint().port(), path);
+            assertTrue(path + " " + r.body(), r.body().startsWith(replica.readiness().probe().detail()
+                    .substring(0, replica.readiness().probe().detail().indexOf(' '))));
+            assertTrue(path + " carries the engine's build identity: " + r.body(),
+                    r.body().endsWith(" version=9.9.9-smoke build=abc1234\n"));
+        }
         assertTrue(replica.metrics().body(), replica.metrics().body().contains("shadow_replica_live_recording_alive 1"));
         assertEquals("no attach storm: " + replica.follower().attachAttemptsTotal(), 1,
                 replica.follower().attachAttemptsTotal());

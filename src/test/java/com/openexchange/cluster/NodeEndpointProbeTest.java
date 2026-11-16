@@ -27,10 +27,10 @@ public class NodeEndpointProbeTest {
         }
     }
 
-    record Response(int status, String body) {
+    public record Response(int status, String body) {
     }
 
-    static Response get(final int port, final String path) throws IOException {
+    public static Response get(final int port, final String path) throws IOException {
         final HttpURLConnection c = (HttpURLConnection)URI.create("http://127.0.0.1:" + port + path).toURL()
                 .openConnection();
         final int status = c.getResponseCode();

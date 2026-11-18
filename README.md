@@ -87,6 +87,7 @@ system property:
 | `ENGINE_FATAL_EXIT_GRACE_MS` / `-Dengine.fatal.exit.grace.ms` | `EngineLifecycle` | `5000` |
 | `TRANSPORT_EXTERNAL_DRIVER_TIMEOUT_MS` / `-Dtransport.external.driver.timeout.ms` | `EngineLifecycle` | `30000` |
 | `ENGINE_QUORUM_WAIT_MS` / `-Dengine.quorum.wait.ms` | `EngineLifecycle`, `QuorumWatchdog` | `120000` |
+| `ENGINE_REJOIN_WAIT_MS` / `-Dengine.rejoin.wait.ms` | `EngineLifecycle`, `RejoinWatchdog` | `60000`. After this process has known a leader, a stretch without a leader (election state INIT, CANVASS, NOMINATE, CANDIDATE_BALLOT or FOLLOWER_BALLOT) that lasts this long logs one CRITICAL line and exits 1 for a supervised restart. Size it above the election timeouts. |
 
 Other settings are read by the engines and validated by the kit: the auth key
 table and client credential (names per engine, see [docs/auth.md](docs/auth.md)),

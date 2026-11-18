@@ -46,6 +46,8 @@ import java.util.function.IntConsumer;
  *       durable to write without a driver; the restart recovers exactly as from SIGKILL.</li>
  *   <li>No leader ever known: the consensus module's election stays in a no-leader state for the
  *       quorum wait after its launch; {@link QuorumWatchdog} records a fatal fault, exit 1.</li>
+ *   <li>No rejoin after a leader was known: one election stays open for the rejoin wait and is in a no-leader
+ *       state (or INIT); {@link RejoinWatchdog} logs one CRITICAL line and records a fatal fault, exit 1.</li>
  * </ul>
  *
  * <p>This replaces Agrona's {@code ShutdownSignalBarrier} in the engines. That barrier's static JVM hook waits,
@@ -77,6 +79,14 @@ public final class EngineLifecycle {
     public static final String QUORUM_WAIT_ENV = "ENGINE_QUORUM_WAIT_MS";
     public static final String QUORUM_WAIT_PROP = "engine.quorum.wait.ms";
     public static final long DEFAULT_QUORUM_WAIT_MS = 120_000;
+    /**
+     * How long one election may stay open, once this process has known a leader, before a member still without a
+     * leader exits 1 ({@link RejoinWatchdog}). Size it above the cluster's election timeouts and below the time the
+     * cluster may run one member short.
+     */
+    public static final String REJOIN_WAIT_ENV = "ENGINE_REJOIN_WAIT_MS";
+    public static final String REJOIN_WAIT_PROP = "engine.rejoin.wait.ms";
+    public static final long DEFAULT_REJOIN_WAIT_MS = 60_000;
 
     /** Status of a fatal fault (driver death, unexpected agent termination, startup failure). */
     public static final int EXIT_FATAL = 1;
@@ -103,14 +113,16 @@ public final class EngineLifecycle {
     private final long shutdownTimeoutMs;
     private final long fatalExitGraceMs;
     private final long quorumWaitMs;
+    private final long rejoinWaitMs;
     private final AtomicReference<Stop> stop = new AtomicReference<>(RUNNING);
     private final CountDownLatch stopLatch = new CountDownLatch(1);
     private final CountDownLatch closedLatch = new CountDownLatch(1);
     private final AtomicBoolean halted = new AtomicBoolean();
     /** Released only when the halter returns (tests): until then no thread that lost the halt may return. */
     private final CountDownLatch haltReturned = new CountDownLatch(1);
-    /** The quorum watchdogs, stopped by {@link #awaitStop} before the components close. */
-    private final java.util.List<QuorumWatchdog> watchdogs = new java.util.concurrent.CopyOnWriteArrayList<>();
+    /** The quorum and rejoin watchdogs' stops, run by {@link #awaitStop} before the components close. */
+    private final java.util.List<java.util.function.LongConsumer> watchdogs =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
     static final long WATCHDOG_JOIN_MS = 2_000;
     /** Set when a component close threw during the stop, so a signal stop is not reported clean. */
     private volatile String closeFailure;
@@ -122,7 +134,13 @@ public final class EngineLifecycle {
 
     EngineLifecycle(final String name, final Consumer<String> log, final IntConsumer halter,
                     final long shutdownTimeoutMs, final long fatalExitGraceMs, final long quorumWaitMs) {
-        if (shutdownTimeoutMs <= 0 || fatalExitGraceMs <= 0 || quorumWaitMs <= 0) {
+        this(name, log, halter, shutdownTimeoutMs, fatalExitGraceMs, quorumWaitMs, DEFAULT_REJOIN_WAIT_MS);
+    }
+
+    EngineLifecycle(final String name, final Consumer<String> log, final IntConsumer halter,
+                    final long shutdownTimeoutMs, final long fatalExitGraceMs, final long quorumWaitMs,
+                    final long rejoinWaitMs) {
+        if (shutdownTimeoutMs <= 0 || fatalExitGraceMs <= 0 || quorumWaitMs <= 0 || rejoinWaitMs <= 0) {
             throw new IllegalArgumentException("lifecycle bounds must be positive");
         }
         this.name = name;
@@ -131,6 +149,7 @@ public final class EngineLifecycle {
         this.shutdownTimeoutMs = shutdownTimeoutMs;
         this.fatalExitGraceMs = fatalExitGraceMs;
         this.quorumWaitMs = quorumWaitMs;
+        this.rejoinWaitMs = rejoinWaitMs;
     }
 
     /**
@@ -138,13 +157,14 @@ public final class EngineLifecycle {
      * hook registered for the signal stop. Call first in the node's bootstrap, before any thread starts.
      */
     public static EngineLifecycle install(final String name, final Consumer<String> log) {
-        // All four settings are parsed here, in every driver mode: a malformed one refuses the start.
+        // All five settings are parsed here, in every driver mode: a malformed one refuses the start.
         final long shutdownMs = shutdownTimeoutMs();
         final long graceMs = fatalExitGraceMs();
         driverWaitMs();
         final long quorumMs = quorumWaitMs();
+        final long rejoinMs = rejoinWaitMs();
         final EngineLifecycle lifecycle = new EngineLifecycle(name, log, status -> Runtime.getRuntime().halt(status),
-                shutdownMs, graceMs, quorumMs);
+                shutdownMs, graceMs, quorumMs, rejoinMs);
         Runtime.getRuntime().addShutdownHook(new Thread(lifecycle::onJvmShutdown, name + "-shutdown"));
         return lifecycle;
     }
@@ -165,27 +185,54 @@ public final class EngineLifecycle {
         return positiveSetting(QUORUM_WAIT_ENV, QUORUM_WAIT_PROP, DEFAULT_QUORUM_WAIT_MS);
     }
 
+    public static long rejoinWaitMs() {
+        return positiveSetting(REJOIN_WAIT_ENV, REJOIN_WAIT_PROP, DEFAULT_REJOIN_WAIT_MS);
+    }
+
+    /** One line through the node's log (the watchdogs' CRITICAL line). */
+    void log(final String line) {
+        log.accept(name + " " + line);
+    }
+
     /**
      * Call right after {@code ConsensusModule.launch} (or {@code ClusteredMediaDriver.launch})
      * returns, before the service container launches: starts the {@link QuorumWatchdog} clock now, on the context's
-     * election-state counter, with this lifecycle's quorum wait. Both driver modes: the watchdog reads a counter,
-     * not the driver.
+     * election-state counter, with this lifecycle's quorum wait, and arms the {@link RejoinWatchdog} on the same
+     * counters with the rejoin wait. Both driver modes: the watchdogs read counters, not the driver.
      */
     public QuorumWatchdog watchQuorum(final io.aeron.cluster.ConsensusModule.Context context) {
         log.accept(name + " quorum watchdog armed: exit 1 if no leader is known within " + quorumWaitMs + " ms ("
                 + QUORUM_WAIT_ENV + ")");
-        return register(QuorumWatchdog.of(this, context, quorumWaitMs)).startDaemon(name);
+        final QuorumWatchdog quorum = QuorumWatchdog.of(this, context, quorumWaitMs);
+        watchdogs.add(quorum::stop);
+        quorum.startDaemon(name);
+        watchRejoin(RejoinWatchdog.of(this, context, rejoinWaitMs));
+        return quorum;
     }
 
     /** {@link #watchQuorum(io.aeron.cluster.ConsensusModule.Context)} on explicit suppliers (tests, other hosts). */
     public QuorumWatchdog watchQuorum(final java.util.function.LongSupplier electionState,
                                       final java.util.function.LongSupplier elections) {
-        return register(new QuorumWatchdog(this, electionState, elections, quorumWaitMs)).startDaemon(name);
+        final QuorumWatchdog quorum = new QuorumWatchdog(this, electionState, elections, quorumWaitMs);
+        watchdogs.add(quorum::stop);
+        quorum.startDaemon(name);
+        watchRejoin(new RejoinWatchdog(this, electionState, elections, rejoinWaitMs));
+        return quorum;
     }
 
-    private QuorumWatchdog register(final QuorumWatchdog w) {
-        watchdogs.add(w);
-        return w;
+    /** The rejoin watchdog armed by the last {@code watchQuorum} call, or null (tests). */
+    private volatile RejoinWatchdog rejoin;
+
+    RejoinWatchdog rejoinWatchdog() {
+        return rejoin;
+    }
+
+    private void watchRejoin(final RejoinWatchdog w) {
+        log.accept(name + " rejoin watchdog armed: exit 1 if, after a leader was known, one election stays open "
+                + "without a leader for " + rejoinWaitMs + " ms (" + REJOIN_WAIT_ENV + ")");
+        watchdogs.add(w::stop);
+        rejoin = w;
+        w.startDaemon(name);
     }
 
     static long positiveSetting(final String env, final String prop, final long defaultValue) {
@@ -237,8 +284,8 @@ public final class EngineLifecycle {
             Thread.currentThread().interrupt();
         }
         // The caller closes the components next: no watchdog may read a consensus counter from here on.
-        for (final QuorumWatchdog w : watchdogs) {
-            w.stop(WATCHDOG_JOIN_MS);
+        for (final java.util.function.LongConsumer stopWatchdog : watchdogs) {
+            stopWatchdog.accept(WATCHDOG_JOIN_MS);
         }
     }
 

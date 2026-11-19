@@ -570,7 +570,7 @@ public final class EngineLifecycle {
             if (driverLossSeen) {
                 // A client whose driver is gone stops its conductor with this, then closes itself and unmaps the CnC:
                 // keep this thread in the halt the driver loss started instead of letting it close the client.
-                haltAfterDriverLoss();
+                haltAfterDriverLoss(t);
                 return false;
             }
             return fatal(EXIT_FATAL, "agent terminated unexpectedly: " + t);
@@ -615,8 +615,13 @@ public final class EngineLifecycle {
      * Another client of the lost driver stopped its conductor after {@link #driverLost} ran: join the same halt on
      * this thread (it returns only once the halter has returned, which in production it never does).
      */
-    private void haltAfterDriverLoss() {
-        halt(driverLossStatus());
+    private void haltAfterDriverLoss(final Throwable t) {
+        // This thread can win the halt while the reporting thread still waits to print its own line (both log
+        // through the same stream), so say why here too: the operator log must name the driver loss either way.
+        final int status = driverLossStatus();
+        log.accept(name + " FATAL (exit " + status + "): media driver lost in EXTERNAL driver mode (an Aeron client"
+                + " stopped after the loss: " + t + ") - halting now, no component close");
+        halt(status);
     }
 
     /**

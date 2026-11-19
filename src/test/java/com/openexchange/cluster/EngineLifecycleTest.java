@@ -443,4 +443,41 @@ public class EngineLifecycleTest {
         assertFalse(logs.toString(), logs.stream().anyMatch(l -> l.contains("agent terminated unexpectedly")));
         assertTrue(logs.toString(), logs.stream().anyMatch(l -> l.contains("media driver lost in EXTERNAL driver mode")));
     }
+
+    /**
+     * The reporting thread has recorded the driver loss but still waits to print its line (the log stream is busy)
+     * when the terminating client's thread arrives and wins the halt: that thread names the driver loss itself.
+     */
+    @Test(timeout = 20_000)
+    public void aThreadThatWinsTheHaltAfterADriverLossNamesTheLoss() throws Exception {
+        final CountDownLatch reporterLogging = new CountDownLatch(1);
+        final CountDownLatch releaseReporterLog = new CountDownLatch(1);
+        final List<String> lines = new java.util.concurrent.CopyOnWriteArrayList<>();
+        final List<Integer> halted = new java.util.concurrent.CopyOnWriteArrayList<>();
+        final EngineLifecycle lf = new EngineLifecycle("test-node", line -> {
+            if (Thread.currentThread().getName().equals("reporter")) {
+                reporterLogging.countDown();
+                try {
+                    releaseReporterLog.await(10, TimeUnit.SECONDS);
+                } catch (final InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            lines.add(line);
+        }, halted::add, 1_000, 60_000);
+        final Thread reporter = new Thread(() -> lf.onError(
+                new DriverTimeoutException("MediaDriver keepalive: age=10090ms > timeout=10000ms"), true), "reporter");
+        reporter.start();
+        assertTrue("the reporter reached its log line", reporterLogging.await(5, TimeUnit.SECONDS));
+
+        final Thread conductor = new Thread(() -> lf.onError(new AgentTerminationException(), true), "conductor");
+        conductor.start();
+        conductor.join(5_000);
+        assertEquals("the conductor won the halt", List.of(1), halted);
+        assertTrue("the winner named the driver loss before halting: " + lines, lines.stream().anyMatch(l ->
+                l.contains("media driver lost in EXTERNAL driver mode") && l.contains("halting now, no component close")));
+
+        releaseReporterLog.countDown();
+        reporter.join(5_000);
+    }
 }

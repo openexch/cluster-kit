@@ -43,7 +43,12 @@ import java.util.function.IntConsumer;
  *       still write counters in it: an archive whose own client closed decrements its recording-session counter
  *       in the unmapped page ({@code ArchiveConductor.closeRecordingSession} line 1362) and the JVM dies with
  *       SIGSEGV (139, seen on all three ME members). Closing the components cannot win that race and has nothing
- *       durable to write without a driver; the restart recovers exactly as from SIGKILL.</li>
+ *       durable to write without a driver; the restart recovers exactly as from SIGKILL. A client call made from
+ *       another thread can see the loss first: Aeron then throws the timeout to that caller, marks the client
+ *       terminating and its conductor later stops with an unexpected {@code AgentTerminationException} instead of
+ *       reporting the loss. Such a caller hands the timeout to the client's error handler
+ *       ({@link SnapshotLogPruner} does), and an unexpected agent termination after a driver loss joins the halt
+ *       on its own thread instead of letting its client close.</li>
  *   <li>No leader ever known: the consensus module's election stays in a no-leader state for the
  *       quorum wait after its launch; {@link QuorumWatchdog} records a fatal fault, exit 1.</li>
  *   <li>No rejoin after a leader was known: one election stays open for the rejoin wait and is in a no-leader
@@ -154,6 +159,8 @@ public final class EngineLifecycle {
     private final CountDownLatch stopLatch = new CountDownLatch(1);
     private final CountDownLatch closedLatch = new CountDownLatch(1);
     private final AtomicBoolean halted = new AtomicBoolean();
+    /** Set by {@link #driverLost}: from then on no thread may close an Aeron client (see {@link #onError}). */
+    private volatile boolean driverLossSeen;
     /** Released only when the halter returns (tests): until then no thread that lost the halt may return. */
     private final CountDownLatch haltReturned = new CountDownLatch(1);
     /** The quorum and rejoin watchdogs' stops, run by {@link #awaitStop} before the components close. */
@@ -508,6 +515,12 @@ public final class EngineLifecycle {
             return fatal(EXIT_FATAL, "FATAL Aeron error in EXTERNAL driver mode: " + t);
         }
         if (t instanceof AgentTerminationException ate && !ate.isExpected()) {
+            if (driverLossSeen) {
+                // A client whose driver is gone stops its conductor with this, then closes itself and unmaps the CnC:
+                // keep this thread in the halt the driver loss started instead of letting it close the client.
+                haltAfterDriverLoss();
+                return false;
+            }
             return fatal(EXIT_FATAL, "agent terminated unexpectedly: " + t);
         }
         return false;
@@ -532,12 +545,26 @@ public final class EngineLifecycle {
     boolean driverLost(final Throwable t) {
         final String reason = "media driver lost in EXTERNAL driver mode: " + t;
         final boolean recorded = record(new Stop(Cause.FATAL, EXIT_FATAL, reason));
-        final Stop s = stop.get();
-        final int status = s.cause() == Cause.FATAL || s.cause() == Cause.RESTART ? s.status() : EXIT_SIGNAL;
+        driverLossSeen = true;
+        final int status = driverLossStatus();
         log.accept(name + " FATAL (exit " + status + "): " + reason + " - halting now, no component close: the "
                 + "client unmaps the CnC under running agents (SIGSEGV), and nothing is durable without a driver");
         halt(status);
         return recorded;
+    }
+
+    /** The status a driver loss halts with: a recorded fault or restart keeps its own, a signal stop 143. */
+    private int driverLossStatus() {
+        final Stop s = stop.get();
+        return s.cause() == Cause.FATAL || s.cause() == Cause.RESTART ? s.status() : EXIT_SIGNAL;
+    }
+
+    /**
+     * Another client of the lost driver stopped its conductor after {@link #driverLost} ran: join the same halt on
+     * this thread (it returns only once the halter has returned, which in production it never does).
+     */
+    private void haltAfterDriverLoss() {
+        halt(driverLossStatus());
     }
 
     /**

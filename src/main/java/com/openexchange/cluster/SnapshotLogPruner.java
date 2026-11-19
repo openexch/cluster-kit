@@ -5,6 +5,7 @@ import io.aeron.archive.client.AeronArchive;
 import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.service.ClusterCounters;
 import org.agrona.CloseHelper;
+import org.agrona.ErrorHandler;
 import org.agrona.concurrent.status.CountersReader;
 
 import java.io.File;
@@ -150,6 +151,9 @@ public final class SnapshotLogPruner {
     private volatile long prunesRun;
     private long bytesReclaimed;
     private volatile String lastError;
+    /** The media driver's loss has been handed to the client's error handler (once per pruner). */
+    private final java.util.concurrent.atomic.AtomicBoolean driverLossReported =
+        new java.util.concurrent.atomic.AtomicBoolean();
 
     /**
      * @param clusterDir     the node's cluster directory, the one holding recording.log
@@ -335,6 +339,7 @@ public final class SnapshotLogPruner {
                     wakeHook.run();
                     shadowRequested = purgeRequested.getAsBoolean();
                 } catch (final RuntimeException hookFailed) {
+                    reportDriverLoss(hookFailed);
                     shadowRequested = false;
                     lastError = "wake hook: " + hookFailed;
                     System.err.println("[PRUNE] CRITICAL: the wake hook failed, no shadow-requested purge this "
@@ -385,6 +390,7 @@ public final class SnapshotLogPruner {
                 // stop() interrupted an archive or consensus module call in flight: a stop, not a failure
                 return;
             }
+            reportDriverLoss(e);
             // A pruner that dies must not do it silently: from here the log grows
             // without bound and everything else still looks healthy.
             lastError = String.valueOf(e);
@@ -410,6 +416,7 @@ public final class SnapshotLogPruner {
                     System.currentTimeMillis());
             }
         } catch (final RuntimeException e) {
+            reportDriverLoss(e);
             // noting is an optimisation: the purge pass asks again and holds when it gets no answer
             lastError = "member positions: " + e;
         }
@@ -447,6 +454,7 @@ public final class SnapshotLogPruner {
             if (!running) {
                 throw e; // stop() interrupted a read in flight; run() treats it as the stop it is
             }
+            reportDriverLoss(e);
             // An error is not permission to purge: hold, within the bound.
             floor = floorUnknown("the floor could not be computed: " + e, snapshotPosition, Math.max(0, ownStart),
                 nowMs);
@@ -512,6 +520,7 @@ public final class SnapshotLogPruner {
             if (!running) {
                 throw e; // stop() interrupted the read: a stop, not an unknown floor
             }
+            reportDriverLoss(e);
             return floorUnknown("the log start of the leader (member " + leader.memberId + ") could not be read from"
                 + " its archive at " + leader.archiveEndpoint + ": " + e, snapshotPosition, ownStart, nowMs);
         }
@@ -525,6 +534,39 @@ public final class SnapshotLogPruner {
             + " leader, member " + leader.memberId + "; own log start " + ownStart + ", snapshot at "
             + snapshotPosition + ")");
         return extent.startPosition;
+    }
+
+    /**
+     * A client call on this thread can be the first to see the media driver gone. Aeron then throws the timeout to
+     * the caller, not to the client's error handler, and marks the client terminating; that client's conductor never
+     * reports the loss and later stops with an unexpected agent termination, which the engine treats as an ordinary
+     * fatal fault and closes its components under a lost driver. The members query and the archive session run on
+     * the service container's client, and this thread holds that client's lock for the whole wait of a call the
+     * dead driver never answers, so it is regularly the first. Hand the loss to that client's error handler, where
+     * Aeron would have reported it (the engine's {@link EngineLifecycle#onError} halts at once with an external
+     * driver). A loss seen on one of this class's own clients is the same driver's: it is handed over too. Once.
+     */
+    private void reportDriverLoss(final Throwable failure) {
+        Throwable loss = failure;
+        for (int depth = 0; loss != null && depth < 8 && !EngineLifecycle.isDriverLoss(loss); depth++) {
+            loss = loss.getCause();
+        }
+        if (loss == null || !EngineLifecycle.isDriverLoss(loss) || !driverLossReported.compareAndSet(false, true)) {
+            return;
+        }
+        final io.aeron.Aeron client = archiveContext.aeron();
+        final ErrorHandler handler = client != null ? client.context().errorHandler() : archiveContext.errorHandler();
+        System.err.println("[PRUNE] CRITICAL: the media driver is gone (seen first by a pruner call), reporting it to"
+            + " the client's error handler: " + loss);
+        if (handler == null) {
+            return;
+        }
+        try {
+            handler.onError(loss);
+        } catch (final RuntimeException handlerFailed) {
+            System.err.println("[PRUNE] CRITICAL: the client's error handler failed on the driver loss: "
+                + handlerFailed);
+        }
     }
 
     /**

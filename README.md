@@ -89,6 +89,7 @@ system property:
 | `ENGINE_QUORUM_WAIT_MS` / `-Dengine.quorum.wait.ms` | `EngineLifecycle`, `QuorumWatchdog` | `120000` |
 | `ENGINE_REJOIN_WAIT_MS` / `-Dengine.rejoin.wait.ms` | `EngineLifecycle`, `RejoinWatchdog` | `60000`. After this process has known a leader, a stretch without a leader (election state INIT, CANVASS, NOMINATE, CANDIDATE_BALLOT or FOLLOWER_BALLOT) that lasts this long **while a quorum of members is reachable** logs one CRITICAL line and exits 1 for a supervised restart. Size it above the election timeouts. It must exceed `ENGINE_REJOIN_PEER_WINDOW_MS`, or the boot is refused. |
 | `ENGINE_REJOIN_PEER_WINDOW_MS` / `-Dengine.rejoin.peer.window.ms` | `EngineLifecycle`, `RejoinWatchdog`, `PeerReachability` | `10000` (1000..600000). How long a gap in the evidence of a reachable quorum is bridged before the rejoin watchdog's clock is cleared. Set it no shorter than the media driver's publication connection timeout. See [Rejoin and peer reachability](#rejoin-and-peer-reachability). |
+| `ENGINE_LEADER_ELECT_WAIT_MS` / `-Dengine.leader.elect.wait.ms` | `EngineLifecycle`, `RejoinWatchdog` | `300000` (10000..3600000). How long a leader elect may stay in election state LEADER_LOG_REPLICATION or LEADER_READY, counted only **while a quorum of members is reachable**, before it logs one CRITICAL line and exits 1 for a supervised restart. Aeron leaves those states only once a quorum of followers reports its position, without a timeout. Size it above the time followers need to replicate the longest log a new leader may send them. It must exceed `ENGINE_REJOIN_PEER_WINDOW_MS`, or the boot is refused. |
 | `ENGINE_CATCHUP_REFUSALS` / `-Dengine.catchup.refusals` | `EngineLifecycle`, `CatchupWatchdog` | `3` (1..1000). Failed catch-up attempts in a row after which a member reads the leader's log start; a member below it exits 1. See [Log retention](#log-retention-and-a-member-that-was-away). |
 | `ENGINE_CATCHUP_REFUSAL_WAIT_MS` / `-Dengine.catchup.refusal.wait.ms` | `EngineLifecycle`, `CatchupWatchdog` | `30000` (1000..3600000). The time bound next to the count: catch-up attempts failing for this long trigger the same read. |
 | `RETENTION_FLOOR` / `-Dretention.floor` | `SnapshotLogPruner` | `apply`. `report` computes and logs the retention floor without applying it. |
@@ -187,6 +188,20 @@ the window at or above that timeout. `ENGINE_REJOIN_WAIT_MS` must exceed the
 window, and a pair that does not refuses the boot.
 While no quorum is reachable the member stays up, not ready, and says so once
 per election when the wait passes.
+
+A leader elect has the same gate with its own, longer wait
+(`ENGINE_LEADER_ELECT_WAIT_MS`). Aeron 1.53 leaves LEADER_LOG_REPLICATION and
+LEADER_READY only once a quorum of followers reports its append position, with
+no timeout: a member whose voter vanished after the ballot, or whose followers
+cannot hear it, stays leader elect for ever. The watchdog times each continuous
+stretch in one of those two states within one election, over the time a quorum
+is reachable, and restarts the member when it reaches the wait. Leaving the
+state (LEADER_REPLAY, LEADER_INIT, CLOSED, a new election, canvass) restarts
+the clock; a fall back to canvass is timed against `ENGINE_REJOIN_WAIT_MS`
+from there. A leader elect stays in LEADER_LOG_REPLICATION while its followers
+replicate the log it sends them, which is why this wait is longer than the
+rejoin wait. A leader elect that has lost its quorum
+stays up, as above. `ENGINE_LEADER_ELECT_WAIT_MS` must exceed the window.
 
 Other settings are read by the engines and validated by the kit: the auth key
 table and client credential (names per engine, see [docs/auth.md](docs/auth.md)),

@@ -397,4 +397,272 @@ public class RejoinWatchdogTest {
         assertFalse(lf.stopRequested());
         assertEquals(0, criticalLines());
     }
+
+    // ---- the leader elect wait ----
+
+    private static final long LE_WAIT_MS = 3_000;
+    private static final long LE_WAIT_NS = TimeUnit.MILLISECONDS.toNanos(LE_WAIT_MS);
+
+    private RejoinWatchdog leaderElect(final EngineLifecycle lf) {
+        return new RejoinWatchdog(lf, state::get, elections::get, WAIT_MS, LE_WAIT_MS, quorum::get, WINDOW_MS, null);
+    }
+
+    /** A leader is known (CLOSED), then election 2 opens and this member wins its ballot: a leader elect. */
+    private RejoinWatchdog leaderElectIn(final EngineLifecycle lf, final ElectionState leaderElectState) {
+        final RejoinWatchdog w = leaderElect(lf);
+        state.set(ElectionState.CLOSED.code());
+        assertFalse(w.poll(0));
+        elections.set(2);
+        state.set(leaderElectState.code());
+        return w;
+    }
+
+    private String critical() {
+        return logs.stream().filter(l -> l.contains("CRITICAL")).findFirst().orElseThrow();
+    }
+
+    /**
+     * The reproduced wedge: the voter that made this member leader elect vanished, the peers stay reachable, and
+     * Aeron's LEADER_LOG_REPLICATION has no timeout. The member gets the longer wait, not the rejoin wait.
+     */
+    @Test
+    public void aLeaderElectStuckInLogReplicationTripsAfterTheLeaderElectWait() throws Exception {
+        final EngineLifecycle lf = lifecycle();
+        final RejoinWatchdog w = leaderElectIn(lf, ElectionState.LEADER_LOG_REPLICATION);
+        quorum.set(true);
+        for (long t = 0; t < LE_WAIT_NS; t += WAIT_NS / 4) {
+            assertFalse("tripped at " + t + " ns, before the leader elect wait", w.poll(t));
+        }
+        assertFalse(w.poll(LE_WAIT_NS - 1));
+        assertFalse("the rejoin wait does not apply to a leader elect", lf.stopRequested());
+        assertTrue(w.poll(LE_WAIT_NS));
+        assertTrue(lf.stopRequested());
+        assertEquals(EngineLifecycle.Cause.FATAL, lf.cause());
+        assertFalse("trips once", w.poll(2 * LE_WAIT_NS));
+        assertEquals(logs.toString(), 1, criticalLines());
+        final String critical = critical();
+        assertTrue(critical, critical.contains("leader elect") && critical.contains("election 2")
+                && critical.contains("election state LEADER_LOG_REPLICATION for 3000 ms")
+                && critical.contains("a quorum of members reachable for 3000 ms")
+                && critical.contains("wait 3000 ms, ENGINE_LEADER_ELECT_WAIT_MS")
+                && critical.contains("exiting 1 for a supervised restart"));
+        assertTrue(logs.toString(), logs.stream().anyMatch(l -> l.contains("FATAL (exit 1)")
+                && l.contains("leader elect did not complete election 2: election state LEADER_LOG_REPLICATION")));
+        lf.awaitStop();
+        lf.finish();
+        assertEquals(List.of(1), halts);
+    }
+
+    @Test
+    public void aLeaderElectStuckInLeaderReadyTripsAfterTheLeaderElectWait() {
+        final EngineLifecycle lf = lifecycle();
+        final RejoinWatchdog w = leaderElectIn(lf, ElectionState.LEADER_READY);
+        quorum.set(true);
+        assertFalse(w.poll(0));
+        assertFalse(w.poll(LE_WAIT_NS - 1));
+        assertTrue(w.poll(LE_WAIT_NS));
+        assertTrue(critical(), critical().contains("election state LEADER_READY for 3000 ms"));
+    }
+
+    /** A first election that stalls as leader elect arms the watchdog too: the state itself names a leader. */
+    @Test
+    public void aLeaderElectInTheFirstElectionIsCovered() {
+        final EngineLifecycle lf = lifecycle();
+        final RejoinWatchdog w = leaderElect(lf);
+        state.set(ElectionState.LEADER_LOG_REPLICATION.code());
+        quorum.set(true);
+        assertFalse(w.poll(0));
+        assertTrue(w.leaderKnown());
+        assertFalse(w.poll(LE_WAIT_NS - 1));
+        assertTrue(w.poll(LE_WAIT_NS));
+    }
+
+    /** Followers replicating a long log: progress through LEADER_REPLAY and LEADER_INIT restarts the clock. */
+    @Test
+    public void leavingTheLeaderElectStatesRestartsTheClock() {
+        final EngineLifecycle lf = lifecycle();
+        final RejoinWatchdog w = leaderElectIn(lf, ElectionState.LEADER_LOG_REPLICATION);
+        quorum.set(true);
+        assertFalse(w.poll(0));
+        assertFalse(w.poll(LE_WAIT_NS - 1));
+        state.set(ElectionState.LEADER_REPLAY.code());
+        assertFalse(w.poll(LE_WAIT_NS));
+        state.set(ElectionState.LEADER_INIT.code());
+        assertFalse(w.poll(LE_WAIT_NS + 1));
+        state.set(ElectionState.LEADER_READY.code());
+        final long ready = LE_WAIT_NS + 2;
+        assertFalse(w.poll(ready));
+        assertFalse(w.poll(ready + LE_WAIT_NS - 1));
+        assertTrue("LEADER_READY for the whole wait trips", w.poll(ready + LE_WAIT_NS));
+        assertTrue(critical(), critical().contains("election state LEADER_READY for 3000 ms"));
+    }
+
+    /** LEADER_READY seen right after LEADER_LOG_REPLICATION: the member passed LEADER_INIT between two polls. */
+    @Test
+    public void readyAfterLogReplicationBetweenTwoPollsIsANewStretch() {
+        final EngineLifecycle lf = lifecycle();
+        final RejoinWatchdog w = leaderElectIn(lf, ElectionState.LEADER_LOG_REPLICATION);
+        quorum.set(true);
+        assertFalse(w.poll(0));
+        assertFalse(w.poll(LE_WAIT_NS - 1));
+        state.set(ElectionState.LEADER_READY.code());
+        assertFalse(w.poll(LE_WAIT_NS));
+        assertFalse(w.poll(2 * LE_WAIT_NS - 1));
+        assertTrue(w.poll(2 * LE_WAIT_NS));
+    }
+
+    /** A closed election, or a new one, clears the leader elect clock. */
+    @Test
+    public void aClosedOrANewElectionRestartsTheLeaderElectClock() {
+        final EngineLifecycle lf = lifecycle();
+        final RejoinWatchdog w = leaderElectIn(lf, ElectionState.LEADER_READY);
+        quorum.set(true);
+        assertFalse(w.poll(0));
+        state.set(ElectionState.CLOSED.code());
+        assertFalse(w.poll(LE_WAIT_NS - 1));
+        elections.set(3);
+        state.set(ElectionState.LEADER_LOG_REPLICATION.code());
+        final long third = LE_WAIT_NS;
+        assertFalse(w.poll(third));
+        // election 3 closed and election 4 reached the same state between two polls: the counter moved
+        elections.set(4);
+        final long fourth = third + LE_WAIT_NS - 1;
+        assertFalse(w.poll(fourth));
+        assertFalse(w.poll(fourth + LE_WAIT_NS - 1));
+        assertTrue(w.poll(fourth + LE_WAIT_NS));
+        assertTrue(critical(), critical().contains("election 4"));
+    }
+
+    /** A leader elect that falls back to canvass gets the rejoin wait, counted from the canvass. */
+    @Test
+    public void aFallBackToCanvassSwitchesToTheRejoinWait() {
+        final EngineLifecycle lf = lifecycle();
+        final RejoinWatchdog w = leaderElectIn(lf, ElectionState.LEADER_LOG_REPLICATION);
+        quorum.set(true);
+        assertFalse(w.poll(0));
+        assertFalse(w.poll(LE_WAIT_NS - 1));
+        elections.set(3);
+        state.set(ElectionState.CANVASS.code());
+        final long canvass = LE_WAIT_NS;
+        assertFalse(w.poll(canvass));
+        assertFalse(w.poll(canvass + WAIT_NS - 1));
+        assertTrue(w.poll(canvass + WAIT_NS));
+        assertTrue(critical(), critical().contains("election state CANVASS")
+                && critical().contains("ENGINE_REJOIN_WAIT_MS") && !critical().contains("ENGINE_LEADER_ELECT"));
+    }
+
+    /** Two of three members gone while this member is leader elect: a restart cannot help, it never trips. */
+    @Test
+    public void aGenuineQuorumLossNeverTripsALeaderElect() {
+        final EngineLifecycle lf = lifecycle();
+        final RejoinWatchdog w = leaderElectIn(lf, ElectionState.LEADER_LOG_REPLICATION);
+        quorum.set(false);
+        for (long t = 0; t <= 100 * LE_WAIT_NS; t += WAIT_NS / 4) {
+            assertFalse("t=" + t, w.poll(t));
+        }
+        assertFalse(lf.stopRequested());
+        assertEquals(0, criticalLines());
+        assertEquals("said once per stretch: " + logs, 1, logs.stream()
+                .filter(l -> l.contains("leader elect") && l.contains("no quorum of members is reachable")
+                        && l.contains("not exiting") && l.contains("ENGINE_LEADER_ELECT_WAIT_MS")).count());
+    }
+
+    /** The peers die after the member became leader elect: time after the last positive answer never counts. */
+    @Test
+    public void unconfirmedTimeDoesNotCountForALeaderElect() {
+        final EngineLifecycle lf = lifecycle();
+        final RejoinWatchdog w = new RejoinWatchdog(lf, state::get, elections::get, WAIT_MS, LE_WAIT_MS, quorum::get,
+                EngineLifecycle.DEFAULT_REJOIN_PEER_WINDOW_MS, null);
+        assertFalse(w.poll(0));
+        elections.set(2);
+        state.set(ElectionState.LEADER_LOG_REPLICATION.code());
+        quorum.set(true);
+        assertFalse(w.poll(0));
+        assertFalse(w.poll(LE_WAIT_NS / 2));
+        quorum.set(false);
+        for (long t = LE_WAIT_NS / 2 + WAIT_NS / 4; t <= 20 * LE_WAIT_NS; t += WAIT_NS / 4) {
+            assertFalse("tripped at " + t + " ns during a quorum loss: " + logs, w.poll(t));
+        }
+        assertFalse(lf.stopRequested());
+    }
+
+    /** Peers that come back after a quorum loss give the leader elect a full wait from their return. */
+    @Test
+    public void theLeaderElectWaitStartsWhenTheQuorumBecomesReachable() {
+        final EngineLifecycle lf = lifecycle();
+        final RejoinWatchdog w = leaderElectIn(lf, ElectionState.LEADER_READY);
+        quorum.set(false);
+        assertFalse(w.poll(0));
+        assertFalse(w.poll(10 * LE_WAIT_NS));
+        quorum.set(true);
+        final long back = 10 * LE_WAIT_NS + 1;
+        assertFalse(w.poll(back));
+        assertFalse(w.poll(back + LE_WAIT_NS - 1));
+        assertTrue(w.poll(back + LE_WAIT_NS));
+    }
+
+    @Test
+    public void theLeaderElectWaitIsARangedSettingThatMustExceedThePeerWindow() {
+        assertEquals("ENGINE_LEADER_ELECT_WAIT_MS", EngineLifecycle.LEADER_ELECT_WAIT_ENV);
+        assertEquals("engine.leader.elect.wait.ms", EngineLifecycle.LEADER_ELECT_WAIT_PROP);
+        assertEquals(300_000L, EngineLifecycle.DEFAULT_LEADER_ELECT_WAIT_MS);
+        assertEquals(10_000L, EngineLifecycle.MIN_LEADER_ELECT_WAIT_MS);
+        assertEquals(3_600_000L, EngineLifecycle.MAX_LEADER_ELECT_WAIT_MS);
+        for (final String bad : new String[] {"9999", "3600001", "0", "-1", "5m"}) {
+            try {
+                EngineLifecycle.parseRanged(EngineLifecycle.LEADER_ELECT_WAIT_ENV, bad, "p", null, 300_000,
+                        EngineLifecycle.MIN_LEADER_ELECT_WAIT_MS, EngineLifecycle.MAX_LEADER_ELECT_WAIT_MS);
+                fail("accepted " + bad);
+            } catch (final IllegalArgumentException expected) {
+                assertTrue(expected.getMessage(), expected.getMessage().contains("ENGINE_LEADER_ELECT_WAIT_MS")
+                        && expected.getMessage().contains("10000..3600000"));
+            }
+        }
+        assertEquals(null, EngineLifecycle.leaderElectSettingsRefusal(EngineLifecycle.DEFAULT_LEADER_ELECT_WAIT_MS,
+                EngineLifecycle.DEFAULT_REJOIN_PEER_WINDOW_MS));
+        assertEquals(null, EngineLifecycle.leaderElectSettingsRefusal(10_001, 10_000));
+        for (final long wait : new long[] {10_000, 9_000}) {
+            final String refusal = EngineLifecycle.leaderElectSettingsRefusal(wait, 10_000);
+            assertTrue(String.valueOf(refusal), refusal != null
+                    && refusal.startsWith("ENGINE_LEADER_ELECT_WAIT_MS (" + wait + " ms) must exceed"
+                    + " ENGINE_REJOIN_PEER_WINDOW_MS (10000 ms)"));
+        }
+        try {
+            new RejoinWatchdog(lifecycle(), state::get, elections::get, WAIT_MS, 0, quorum::get, WINDOW_MS, null);
+            fail("accepted a zero leader elect wait");
+        } catch (final IllegalArgumentException e) {
+            assertEquals("leader elect wait must be positive", e.getMessage());
+        }
+    }
+
+    /** The boot refuses a leader elect wait out of range, or one that does not exceed the peer window. */
+    @Test
+    public void theBootRefusesABadLeaderElectWait() {
+        org.junit.Assume.assumeTrue("the settings come from the environment here",
+                System.getenv(EngineLifecycle.LEADER_ELECT_WAIT_ENV) == null
+                        && System.getenv(EngineLifecycle.REJOIN_WAIT_ENV) == null
+                        && System.getenv(EngineLifecycle.REJOIN_PEER_WINDOW_ENV) == null
+                        && System.getProperty(EngineLifecycle.REJOIN_WAIT_PROP) == null
+                        && System.getProperty(EngineLifecycle.REJOIN_PEER_WINDOW_PROP) == null);
+        final String saved = System.getProperty(EngineLifecycle.LEADER_ELECT_WAIT_PROP);
+        try {
+            // equal to the default peer window (10000 ms): in range, refused by the rule
+            System.setProperty(EngineLifecycle.LEADER_ELECT_WAIT_PROP, "10000");
+            IllegalArgumentException e = org.junit.Assert.assertThrows(IllegalArgumentException.class,
+                    () -> EngineLifecycle.install("test-node", line -> { }));
+            assertTrue(e.getMessage(), e.getMessage().startsWith(
+                    "ENGINE_LEADER_ELECT_WAIT_MS (10000 ms) must exceed ENGINE_REJOIN_PEER_WINDOW_MS (10000 ms)"));
+            System.setProperty(EngineLifecycle.LEADER_ELECT_WAIT_PROP, "3600001");
+            e = org.junit.Assert.assertThrows(IllegalArgumentException.class,
+                    () -> EngineLifecycle.install("test-node", line -> { }));
+            assertTrue(e.getMessage(), e.getMessage().contains(EngineLifecycle.LEADER_ELECT_WAIT_PROP)
+                    && e.getMessage().contains("10000..3600000"));
+        } finally {
+            if (saved == null) {
+                System.clearProperty(EngineLifecycle.LEADER_ELECT_WAIT_PROP);
+            } else {
+                System.setProperty(EngineLifecycle.LEADER_ELECT_WAIT_PROP, saved);
+            }
+        }
+    }
 }

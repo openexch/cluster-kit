@@ -58,7 +58,8 @@ public class RejoinReachabilityClusterTest {
         // the survivor still has a peer. Stopping the leader first starts an election the survivor can win with the
         // other peer's vote; when that peer stops before it acknowledges the new term, the survivor stays a leader
         // elect (LEADER_LOG_REPLICATION or LEADER_READY, which Aeron never leaves without a quorum of followers)
-        // instead of reaching the no-leader election this class is about.
+        // instead of reaching the no-leader election this class is about; LeaderElectWaitClusterTest covers that
+        // case.
         final int first = leader.id == 1 ? 2 : 1;
         cluster.stop(first);
         cluster.stop(3 - first);

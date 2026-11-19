@@ -6,7 +6,7 @@
 
     <groupId>com.openexchange</groupId>
     <artifactId>cluster-kit</artifactId>
-    <version>0.1.24-runtime.20261119.retention.g8bd0e32</version>
+    <version>0.1.25-runtime.20261119.driverloss.gbd3da1b</version>
     <packaging>jar</packaging>
 
     <name>Cluster Kit</name>

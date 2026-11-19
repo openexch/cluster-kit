@@ -403,4 +403,44 @@ public class EngineLifecycleTest {
             assertTrue(expected.getMessage().contains("never 0, 1 or 143"));
         }
     }
+
+    /**
+     * After a driver loss another client of the same driver stops its conductor with an unexpected agent termination
+     * and then closes itself (unmapping the CnC). Its error handler must not return while the halt is under way: the
+     * thread joins the halt instead.
+     */
+    @Test
+    public void unexpectedAgentTerminationAfterADriverLossJoinsTheHaltInsteadOfReturning() throws Exception {
+        final CountDownLatch inHalter = new CountDownLatch(1);
+        final CountDownLatch releaseHalter = new CountDownLatch(1);
+        final EngineLifecycle lf = new EngineLifecycle("test-node", logs::add, status -> {
+            halts.add(status);
+            inHalter.countDown();
+            try {
+                releaseHalter.await(10, TimeUnit.SECONDS);
+            } catch (final InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, 1_000, 60_000);
+        final Thread reporter = new Thread(() -> lf.onError(
+                new DriverTimeoutException("MediaDriver keepalive: age=10090ms > timeout=10000ms"), true));
+        reporter.start();
+        assertTrue("the driver loss reached the halter", inHalter.await(5, TimeUnit.SECONDS));
+
+        final CountDownLatch conductorReturned = new CountDownLatch(1);
+        final Thread conductor = new Thread(() -> {
+            lf.onError(new AgentTerminationException(), true);
+            conductorReturned.countDown();
+        });
+        conductor.start();
+        assertFalse("the terminating client's thread stays in the halt, it never gets to close its client",
+                conductorReturned.await(500, TimeUnit.MILLISECONDS));
+
+        releaseHalter.countDown();
+        assertTrue(conductorReturned.await(5, TimeUnit.SECONDS));
+        reporter.join(5_000);
+        assertEquals("one halt per process", List.of(1), halts);
+        assertFalse(logs.toString(), logs.stream().anyMatch(l -> l.contains("agent terminated unexpectedly")));
+        assertTrue(logs.toString(), logs.stream().anyMatch(l -> l.contains("media driver lost in EXTERNAL driver mode")));
+    }
 }

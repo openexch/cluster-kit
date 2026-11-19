@@ -126,16 +126,18 @@ public class MemberRetentionClusterTest {
         cluster.standAloneDriver = true;
         final long[] downPosition = new long[1];
         final int down = downAcrossASnapshotAndPurge(downPosition);
+        // read while the member is still down: once it has caught up nothing holds the floor, and the survivors
+        // purge on their re-check without waiting for the next snapshot
+        for (final int id : others(down)) {
+            assertTrue("member " + id + " kept the log the down member needed: " + diagnosis(down, downPosition[0]),
+                    cluster.logExtent(id)[0] <= downPosition[0]);
+        }
         cluster.start(down);
         try {
             awaitApplied(450, 30_000, down);
         } catch (final AssertionError stranded) {
             throw new AssertionError("the returning member never caught up: " + diagnosis(down, downPosition[0]),
                     stranded);
-        }
-        for (final int id : others(down)) {
-            assertTrue("member " + id + " kept the log the down member needed: " + diagnosis(down, downPosition[0]),
-                    cluster.logExtent(id)[0] <= downPosition[0]);
         }
     }
 

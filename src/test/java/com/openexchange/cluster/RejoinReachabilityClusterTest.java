@@ -50,12 +50,20 @@ public class RejoinReachabilityClusterTest {
         for (int i = 0; i < ThreeMemberCluster.MEMBERS; i++) {
             cluster.start(i, lifecycle(cluster.node(i)));
         }
-        cluster.awaitLeader(30_000);
+        final ThreeMemberCluster.Node leader = cluster.awaitLeader(30_000);
         final ThreeMemberCluster.Node survivor = cluster.node(0);
         ThreeMemberCluster.await("the survivor to know the leader", 20_000,
                 () -> survivor.lifecycle.rejoinWatchdog().leaderKnown());
-        cluster.stop(1);
-        cluster.stop(2);
+        // The follower goes first and the leader last, so the quorum is lost in one step and no election runs while
+        // the survivor still has a peer. Stopping the leader first starts an election the survivor can win with the
+        // other peer's vote; when that peer stops before it acknowledges the new term, the survivor stays a leader
+        // elect (LEADER_LOG_REPLICATION or LEADER_READY, which Aeron never leaves without a quorum of followers)
+        // instead of reaching the no-leader election this class is about.
+        final int first = leader.id == 1 ? 2 : 1;
+        cluster.stop(first);
+        cluster.stop(3 - first);
+        ThreeMemberCluster.await("the survivor to be in an election without a leader", 20_000,
+                () -> QuorumWatchdog.isNoLeader(survivor.electionState()));
         return survivor;
     }
 

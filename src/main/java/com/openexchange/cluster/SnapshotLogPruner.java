@@ -67,6 +67,11 @@ import java.util.function.BooleanSupplier;
  * snapshot again; while the floor is unknown {@link #lastError()} says so. The time half runs on the local clock and restarts when leadership moves, which only makes it more
  * patient; the byte half does not depend on a clock.</p>
  *
+ * <p>A purge pass runs after a snapshot. A pass the retention floor stopped (below this node's own floor and its
+ * newest snapshot) is not the last word until the next snapshot: the floor is read again one poll interval later, then
+ * on a doubling backoff up to {@link #RECHECK_MAX_MS_ENV} (default 60 s), and a floor that rose starts a purge pass at
+ * once. So a follower follows its leader's log start within that bound, not a snapshot interval later.</p>
+ *
  * <p>{@link #FLOOR_MODE_ENV}{@code =report} computes and logs the floor without applying it (the purge then goes to
  * this node's own snapshot, as before the floor existed).</p>
  *
@@ -103,6 +108,17 @@ public final class SnapshotLogPruner {
     public static final long MIN_MEMBER_WAIT_BYTES = 1L << 20;
     public static final long MAX_MEMBER_WAIT_BYTES = 1L << 40;
 
+    /**
+     * The longest wait between two re-checks of a retention floor that limited the last purge pass (1000..3600000 ms,
+     * default 60 s). After such a pass the floor is read again without a new snapshot: first one poll interval
+     * later, then doubling up to this bound, and a floor that rose starts a purge pass at once.
+     */
+    public static final String RECHECK_MAX_MS_ENV = "RETENTION_RECHECK_MAX_MS";
+    public static final String RECHECK_MAX_MS_PROP = "retention.recheck.max.ms";
+    public static final long DEFAULT_RECHECK_MAX_MS = 60_000;
+    public static final long MIN_RECHECK_MAX_MS = 1_000;
+    public static final long MAX_RECHECK_MAX_MS = 3_600_000;
+
     /** What the pruner does with the retention floor. */
     public enum FloorMode { APPLY, REPORT }
 
@@ -124,7 +140,15 @@ public final class SnapshotLogPruner {
     private volatile java.util.function.LongSupplier watermark = () -> Long.MAX_VALUE;
 
     // The retention floor. Null until reportWatermark() wires it.
-    private ClusterMemberPositions positions;
+    private java.util.function.LongFunction<ClusterMemberPositions.Snapshot> positions;
+    private long recheckMaxMs = DEFAULT_RECHECK_MAX_MS;
+    /** The last pass was limited by the retention floor: the floor is read again on a backoff (pruner thread). */
+    private boolean recheckPending;
+    private long recheckDelayMs;
+    private long nextRecheckMs;
+    private volatile long wakesByRecheck;
+    /** Test seam (the re-check's negative control): a limited pass leaves nothing pending. */
+    boolean recheckOff;
     private java.util.function.BooleanSupplier isLeader;
     private RetentionWatermark retention;
     private volatile String lastWatermarkReport;
@@ -235,7 +259,9 @@ public final class SnapshotLogPruner {
         final long waitBytes = EngineLifecycle.rangedSetting(MEMBER_WAIT_BYTES_ENV, MEMBER_WAIT_BYTES_PROP,
             DEFAULT_MEMBER_WAIT_BYTES, MIN_MEMBER_WAIT_BYTES, MAX_MEMBER_WAIT_BYTES);
         this.probeTimeoutMs = LogExtent.probeTimeoutMs();
-        this.positions = positions;
+        this.recheckMaxMs = EngineLifecycle.rangedSetting(RECHECK_MAX_MS_ENV, RECHECK_MAX_MS_PROP,
+            DEFAULT_RECHECK_MAX_MS, MIN_RECHECK_MAX_MS, MAX_RECHECK_MAX_MS);
+        this.positions = positions::query;
         this.isLeader = isLeader;
         return retentionFloor(mode, waitMs, waitBytes);
     }
@@ -253,6 +279,8 @@ public final class SnapshotLogPruner {
         EngineLifecycle.rangedSetting(MEMBER_WAIT_BYTES_ENV, MEMBER_WAIT_BYTES_PROP,
             DEFAULT_MEMBER_WAIT_BYTES, MIN_MEMBER_WAIT_BYTES, MAX_MEMBER_WAIT_BYTES);
         LogExtent.probeTimeoutMs();
+        EngineLifecycle.rangedSetting(RECHECK_MAX_MS_ENV, RECHECK_MAX_MS_PROP,
+            DEFAULT_RECHECK_MAX_MS, MIN_RECHECK_MAX_MS, MAX_RECHECK_MAX_MS);
     }
 
     /** The floor's mode and bound, set directly (tests; a host that parses the settings itself). */
@@ -266,6 +294,23 @@ public final class SnapshotLogPruner {
         this.memberWaitBytes = memberWaitBytes;
         this.retention = new RetentionWatermark(memberWaitBytes, memberWaitMs,
             RetentionWatermark.DEFAULT_STALE_APPEND_MS);
+        return this;
+    }
+
+    /** The members query and the role, set directly (tests: no consensus module behind the pruner). */
+    SnapshotLogPruner membersQuery(final java.util.function.LongFunction<ClusterMemberPositions.Snapshot> query,
+                                   final java.util.function.BooleanSupplier isLeader) {
+        this.positions = java.util.Objects.requireNonNull(query, "query");
+        this.isLeader = java.util.Objects.requireNonNull(isLeader, "isLeader");
+        return this;
+    }
+
+    /** The bound of the re-check backoff, set directly (tests). */
+    SnapshotLogPruner recheckMaxMs(final long recheckMaxMs) {
+        if (recheckMaxMs <= 0) {
+            throw new IllegalArgumentException("recheck bound must be positive");
+        }
+        this.recheckMaxMs = recheckMaxMs;
         return this;
     }
 
@@ -348,7 +393,15 @@ public final class SnapshotLogPruner {
 
                 final long count = snapshotCount();
                 final boolean newSnapshot = count > seenSnapshots;
-                if (!newSnapshot && !shadowRequested) {
+                // a pass the retention floor limited is looked at again without a snapshot: the floor (the leader's
+                // log start for a follower, the slowest member for a leader) moves on its own schedule
+                final boolean recheck = !newSnapshot && !shadowRequested && recheckPending
+                    && System.currentTimeMillis() - nextRecheckMs >= 0;
+                if (!newSnapshot && !shadowRequested && !recheck) {
+                    continue;
+                }
+                if (recheck && !caughtUp.getAsBoolean()) {
+                    nextRecheckMs = System.currentTimeMillis() + Math.max(pollIntervalMs, recheckDelayMs);
                     continue;
                 }
                 if (!caughtUp.getAsBoolean()) {
@@ -364,23 +417,42 @@ public final class SnapshotLogPruner {
                     archive = AeronArchive.connect(archiveContext);
                 }
 
+                long recheckedFloor = Long.MIN_VALUE;
+                if (recheck) {
+                    recheckedFloor = retentionFloor(archive);
+                    if (recheckedFloor <= lastAppliedFloor) {
+                        // still where the last pass left it: nothing to purge, look again later
+                        recheckDelayMs = Math.min(recheckMaxMs, Math.max(pollIntervalMs, recheckDelayMs * 2));
+                        nextRecheckMs = System.currentTimeMillis() + recheckDelayMs;
+                        continue;
+                    }
+                    System.out.println("[RETENTION] the retention floor rose from " + describe(lastAppliedFloor)
+                        + " to " + describe(recheckedFloor) + " since the last purge pass: purging again");
+                }
+
                 // the node's own floor is read exactly once per pass: the shadow floor consumes its request there
                 final long ownFloor = watermark.getAsLong();
-                final long retentionFloor = retentionFloor(archive);
+                final long retentionFloor = recheck ? recheckedFloor : retentionFloor(archive);
                 lastAppliedFloor = retentionFloor;
 
                 final ArchiveHousekeeping.Result result =
                     ArchiveHousekeeping.purgeBelow(clusterDir, archive, Math.min(ownFloor, retentionFloor));
                 seenSnapshots = Math.max(seenSnapshots, count);
-                if (!newSnapshot) {
+                if (recheck) {
+                    wakesByRecheck++;
+                } else if (!newSnapshot) {
                     wakesByShadow++;
                 }
+                recheckPending = !recheckOff && limitedByRetention(retentionFloor, ownFloor);
+                recheckDelayMs = pollIntervalMs;
+                nextRecheckMs = System.currentTimeMillis() + recheckDelayMs;
                 prunesRun++;
                 bytesReclaimed += Math.max(0, result.logBytesReclaimed);
                 lastError = result.errors > 0
                     ? result.errors + " snapshot recording(s) missing from the archive"
                     : floorMode == FloorMode.APPLY ? floorProblem : null;
-                System.out.println("[PRUNE] after " + (newSnapshot ? "snapshot " + count : "shadow wake")
+                System.out.println("[PRUNE] after " + (newSnapshot ? "snapshot " + count
+                    : recheck ? "the retention floor rose" : "shadow wake")
                     + ": " + result);
             }
         } catch (final InterruptedException e) {
@@ -403,6 +475,21 @@ public final class SnapshotLogPruner {
     }
 
     /**
+     * Whether the pass that just ran stopped at the retention floor: below this node's own floor and below its newest
+     * snapshot, so more log goes as soon as the floor rises. A snapshot position that cannot be read answers no.
+     */
+    private boolean limitedByRetention(final long retentionFloor, final long ownFloor) {
+        if (retentionFloor == Long.MAX_VALUE || retentionFloor >= ownFloor) {
+            return false;
+        }
+        try {
+            return retentionFloor < latestSnapshotPosition();
+        } catch (final RuntimeException unreadable) {
+            return false;
+        }
+    }
+
+    /**
      * Between purge passes, on the leader: note every member's position while it is still reporting, so a member
      * that dies is held at a position seen moments before, not at one from the last snapshot.
      */
@@ -412,7 +499,7 @@ public final class SnapshotLogPruner {
         }
         try {
             if (isLeader.getAsBoolean()) {
-                retention.observe(positions.query(QUERY_TIMEOUT_MS), leadershipTermId(),
+                retention.observe(positions.apply(QUERY_TIMEOUT_MS), leadershipTermId(),
                     System.currentTimeMillis());
             }
         } catch (final RuntimeException e) {
@@ -441,7 +528,7 @@ public final class SnapshotLogPruner {
                 return Long.MAX_VALUE; // no snapshot: nothing is purged anyway
             }
             ownStart = LogExtent.local(archive, clusterDir).startPosition;
-            final ClusterMemberPositions.Snapshot answer = positions.query(QUERY_TIMEOUT_MS);
+            final ClusterMemberPositions.Snapshot answer = positions.apply(QUERY_TIMEOUT_MS);
             if (answer == null) {
                 floor = floorUnknown("this node's consensus module did not answer the members query",
                     snapshotPosition, ownStart, nowMs);
@@ -666,6 +753,11 @@ public final class SnapshotLogPruner {
     /** {@code pruner_wakes_by_shadow_total}: purge passes run because a shadow requested one, not a CM snapshot. */
     public long wakesByShadow() {
         return wakesByShadow;
+    }
+
+    /** Purge passes run because a retention floor that limited the last pass rose, not a snapshot or a shadow. */
+    public long wakesByRecheck() {
+        return wakesByRecheck;
     }
 
     /** Total log bytes reclaimed on this node since start. */

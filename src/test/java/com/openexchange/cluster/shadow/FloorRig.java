@@ -74,11 +74,16 @@ final class FloorRig implements AutoCloseable {
     }
 
     FloorRig(final Service service) {
+        this(service, 0);
+    }
+
+    /** @param controlPort 0: IPC only; else the archive also answers control requests on {@code localhost:<port>} */
+    FloorRig(final Service service, final int controlPort) {
         final String key = "aeron.archive.segment.file.length";
         final String before = System.getProperty(key);
         System.setProperty(key, String.valueOf(SEGMENT));
         try {
-            rig = new ShadowRig();
+            rig = new ShadowRig(controlPort);
         } finally {
             if (before == null) {
                 System.clearProperty(key);

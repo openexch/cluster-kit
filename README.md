@@ -97,6 +97,7 @@ system property:
 | `RETENTION_MEMBER_WAIT_MS` / `-Dretention.member.wait.ms` | `SnapshotLogPruner`, `RetentionWatermark` | `1800000` (1000..604800000). How long the retention floor waits for a member that does not move before the purge proceeds without it. |
 | `RETENTION_MEMBER_WAIT_BYTES` / `-Dretention.member.wait.bytes` | `SnapshotLogPruner`, `RetentionWatermark` | `2147483648` (1048576..1099511627776). How far behind the newest snapshot a member may be before the floor stops waiting for it. |
 | `RETENTION_PROBE_TIMEOUT_MS` / `-Dretention.probe.timeout.ms` | `SnapshotLogPruner`, `CatchupWatchdog`, `LogExtent` | `5000` (100..60000). How long one read of the leader's log start from the leader's archive may take. |
+| `RETENTION_RECHECK_MAX_MS` / `-Dretention.recheck.max.ms` | `SnapshotLogPruner` | `60000` (1000..3600000). After a purge pass the retention floor stopped, the floor is read again without a new snapshot: one poll interval later, then doubling up to this bound; a floor that rose starts a purge pass at once (a follower follows its leader's log start). |
 
 A value outside its range refuses the start: `EngineLifecycle.install` parses
 every row above before any thread starts.

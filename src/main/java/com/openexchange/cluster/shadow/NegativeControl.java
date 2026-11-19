@@ -94,5 +94,32 @@ enum NegativeControl {
     /** Pull settings: a source spelled differently from a member's archive endpoint passes the boot check. */
     SOURCE_SPELLING_CHECK_OFF,
     /** Witness alarm: no floor-side line and no gauge, whatever the witnesses. */
-    WITNESS_ALARM_OFF
+    WITNESS_ALARM_OFF,
+    /** Leader floor: the remote floor applies whatever the role (a follower purges behind shadows it does not hold). */
+    REMOTE_FLOOR_ANY_ROLE,
+    /**
+     * Leader floor: the remote floor applies whatever the local evaluation says (no snapshot, a newest group whose
+     * kind is unreadable, a local scan that cannot answer).
+     */
+    REMOTE_FLOOR_PRECONDITION_OFF,
+    /** Leader floor: one attested producer anchors under {@code two-producers}. */
+    REMOTE_FLOOR_ONE_WITNESS,
+    /** Leader floor: the margin is ignored (the remote floor is the attested anchor). */
+    REMOTE_FLOOR_MARGIN_IGNORED,
+    /** Leader floor: an attested anchor above this node's P_cm is accepted (a restore would need SKIP). */
+    REMOTE_FLOOR_ANCHOR_ABOVE_PCM,
+    /** Leader floor: a view older than the age bound still feeds the floor. */
+    REMOTE_FLOOR_STALE_VIEW,
+    /** Leader floor: a marker of another cluster, another genesis or of this member itself is accepted. */
+    REMOTE_FLOOR_FOREIGN_ACCEPTED,
+    /** Attestor: a scan that cannot answer (errors, startup pass not done) is attested from. */
+    ATTEST_UNKNOWN_SCAN,
+    /** Attestor: COMPLETE copies count like VERIFIED ones. */
+    ATTEST_READS_USABLE,
+    /** Leader floor: a marker counts whatever member's archive it was listed from (a copied peer marker counts). */
+    REMOTE_FLOOR_SOURCE_UNBOUND,
+    /** Leader floor: a marker whose recording is not stopped counts. */
+    REMOTE_FLOOR_ACTIVE_ACCEPTED,
+    /** Attestor: a marker found at arming (written by an earlier process) is kept until the first known scan. */
+    ATTEST_KEEPS_STALE
 }

@@ -24,7 +24,14 @@ import static org.junit.Assert.assertTrue;
  */
 public class RejoinReachabilityClusterTest {
 
-    private static final long REJOIN_WAIT_MS = 3_000;
+    /**
+     * Above Aeron's publication connection timeout (5 s): a stopped peer's publication still reads connected for up
+     * to that long, so a shorter wait can trip on that stale evidence alone. Production keeps the same order through
+     * the boot rule (the wait exceeds the evidence window, the window is at least the connection timeout).
+     */
+    private static final long REJOIN_WAIT_MS = 8_000;
+    /** The evidence window: at least the publication connection timeout, below the wait. */
+    private static final long PEER_WINDOW_MS = 6_000;
 
     private File baseDir;
     private ThreeMemberCluster cluster;
@@ -43,7 +50,8 @@ public class RejoinReachabilityClusterTest {
     }
 
     private EngineLifecycle lifecycle(final ThreeMemberCluster.Node n) {
-        return RejoinTestSetup.lifecycle("member" + n.id, n, REJOIN_WAIT_MS);
+        return RejoinTestSetup.leaderElectLifecycle("member" + n.id, n, REJOIN_WAIT_MS, PEER_WINDOW_MS,
+                EngineLifecycle.DEFAULT_LEADER_ELECT_WAIT_MS);
     }
 
     private ThreeMemberCluster.Node survivorAfterQuorumLoss() {
@@ -58,7 +66,8 @@ public class RejoinReachabilityClusterTest {
         // the survivor still has a peer. Stopping the leader first starts an election the survivor can win with the
         // other peer's vote; when that peer stops before it acknowledges the new term, the survivor stays a leader
         // elect (LEADER_LOG_REPLICATION or LEADER_READY, which Aeron never leaves without a quorum of followers)
-        // instead of reaching the no-leader election this class is about.
+        // instead of reaching the no-leader election this class is about; LeaderElectWaitClusterTest covers that
+        // case.
         final int first = leader.id == 1 ? 2 : 1;
         cluster.stop(first);
         cluster.stop(3 - first);

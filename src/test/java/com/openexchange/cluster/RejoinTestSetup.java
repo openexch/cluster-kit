@@ -15,4 +15,12 @@ final class RejoinTestSetup {
         return new EngineLifecycle(name, n.log::add, n.halts::add, 4_000, 2_000, 120_000, rejoinWaitMs,
                 EngineLifecycle.DEFAULT_REJOIN_PEER_WINDOW_MS, catchupRefusals, catchupRefusalWaitMs);
     }
+
+    static EngineLifecycle leaderElectLifecycle(final String name, final ThreeMemberCluster.Node n,
+                                                final long rejoinWaitMs, final long peerWindowMs,
+                                                final long leaderElectWaitMs) {
+        return new EngineLifecycle(name, n.log::add, n.halts::add, 4_000, 2_000, 120_000, rejoinWaitMs, peerWindowMs,
+                leaderElectWaitMs, EngineLifecycle.DEFAULT_CATCHUP_REFUSALS,
+                EngineLifecycle.DEFAULT_CATCHUP_REFUSAL_WAIT_MS);
+    }
 }

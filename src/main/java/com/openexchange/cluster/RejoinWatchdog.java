@@ -25,9 +25,20 @@ import java.util.function.LongSupplier;
  * earlier election closed between two polls). The watchdog trips when one election has been open for the rejoin
  * wait and its current state is a no-leader state ({@link QuorumWatchdog#NO_LEADER_STATES}: CANVASS, NOMINATE,
  * CANDIDATE_BALLOT, FOLLOWER_BALLOT) or INIT (an election's opening state, which a running member leaves at once). A
- * member in a leader-known state (catch-up, log replication, replay, ready) is progressing and never trips, however
- * long that takes; if it falls back to canvass after the wait it trips at the next poll. A counter value outside
+ * follower in a leader-known state (catch-up, log replication, replay, ready) is progressing and never trips, however
+ * long that takes (Aeron times those states out back to canvass); if it falls back to canvass after the wait it trips
+ * at the next poll. A leader elect has its own rule, below. A counter value outside
  * every known state (not readable) never trips and keeps the clock.
+ *
+ * <p>Leader elect: in Aeron 1.53 a leader elect leaves LEADER_LOG_REPLICATION and LEADER_READY only once a quorum of
+ * followers reports its append position ({@code Election.leaderLogReplication}, {@code Election.leaderReady}); there
+ * is no timeout. A member whose voter vanished after the ballot, or whose followers cannot hear it, stays there for
+ * ever. Those two states are leader-known (they arm the watchdog) and are timed on a clock of their own, against the
+ * longer leader elect wait ({@link EngineLifecycle#LEADER_ELECT_WAIT_ENV}): one continuous stretch in one of the two
+ * states within one election. Any other state (LEADER_REPLAY, LEADER_INIT, CLOSED, a no-leader state), a move from one
+ * of the two to the other (it passed LEADER_INIT between two polls) or a moved election counter starts a new stretch;
+ * a fall back to a no-leader state is timed against the rejoin wait from there. The same reachability gate applies,
+ * with its own evidence for each stretch.
  *
  * <p>Reachability gate: a restart only helps when the peers are there. The watchdog trips only when it has evidence
  * that a quorum of members is reachable ({@link PeerReachability}: this member plus the peers that answer its
@@ -42,12 +53,13 @@ import java.util.function.LongSupplier;
  * members gone) the survivor therefore stays up without a bound, not ready, and may serve a recovering peer's
  * restore; one line says so when the wait passes. When the peers return it gets a full wait to finish the election.
  *
- * <p>On a trip it logs one {@code CRITICAL} line naming the election state, the elapsed time and the setting, then
- * records {@link EngineLifecycle#fatal} with {@link EngineLifecycle#EXIT_FATAL} (exit 1): the supervisor restarts the
- * member, which rejoins through its own log and the leader's catch-up.
+ * <p>On a trip it logs one {@code CRITICAL} line naming the election state, the elapsed time, the time a quorum was
+ * reachable and the setting, then records {@link EngineLifecycle#fatal} with {@link EngineLifecycle#EXIT_FATAL}
+ * (exit 1): the supervisor restarts the member, which rejoins through its own log and the leader's catch-up.
  *
- * <p>The wait is a process setting ({@link EngineLifecycle#REJOIN_WAIT_ENV}, default
- * {@link EngineLifecycle#DEFAULT_REJOIN_WAIT_MS}), never replicated state. The poller stops before the components
+ * <p>The waits are process settings ({@link EngineLifecycle#REJOIN_WAIT_ENV}, default
+ * {@link EngineLifecycle#DEFAULT_REJOIN_WAIT_MS}; {@link EngineLifecycle#LEADER_ELECT_WAIT_ENV}, default
+ * {@link EngineLifecycle#DEFAULT_LEADER_ELECT_WAIT_MS}), never replicated state. The poller stops before the components
  * close, like the quorum watchdog's ({@link EngineLifecycle#awaitStop}).
  */
 public final class RejoinWatchdog {
@@ -56,6 +68,8 @@ public final class RejoinWatchdog {
     private final LongSupplier elections;
     private final long waitMs;
     private final long waitNs;
+    private final long leaderElectWaitMs;
+    private final long leaderElectWaitNs;
     private final BooleanSupplier quorumReachable;
     private final long windowNs;
     private final AutoCloseable onStop;
@@ -64,6 +78,10 @@ public final class RejoinWatchdog {
     private volatile boolean stopped;
     private volatile Thread poller;
     private boolean open;
+    /** Whether the open stretch is a leader elect's wait (else an election without a leader). */
+    private boolean openLeaderElect;
+    /** The leader elect state the open stretch is in: a move between the two passed LEADER_INIT, a new stretch. */
+    private long openCode;
     private long openedNs;
     private long openElection;
     /** Whether quorum evidence has been seen in this stretch and is not older than the window. */
@@ -79,17 +97,31 @@ public final class RejoinWatchdog {
                 null);
     }
 
+    /** The leader elect wait at its default ({@link EngineLifecycle#DEFAULT_LEADER_ELECT_WAIT_MS}). */
+    RejoinWatchdog(final EngineLifecycle lifecycle, final LongSupplier electionState, final LongSupplier elections,
+                   final long waitMs, final BooleanSupplier quorumReachable, final long windowMs,
+                   final AutoCloseable onStop) {
+        this(lifecycle, electionState, elections, waitMs, EngineLifecycle.DEFAULT_LEADER_ELECT_WAIT_MS,
+                quorumReachable, windowMs, onStop);
+    }
+
     /**
-     * @param quorumReachable asked once per poll while an election is open without a leader, under the poll lock:
-     *                        true when a quorum of members is reachable right now
+     * @param leaderElectWaitMs how long a leader elect may stay in LEADER_LOG_REPLICATION or LEADER_READY while a
+     *                        quorum of members is reachable
+     * @param quorumReachable asked once per poll while a watched stretch is open (an election without a leader, or
+     *                        a waiting leader elect), under the poll lock: true when a quorum of members is
+     *                        reachable right now
      * @param windowMs        how long one positive answer keeps counting as evidence
      * @param onStop          closed by {@link #stop} under the poll lock (the probe behind the supplier), or null
      */
     RejoinWatchdog(final EngineLifecycle lifecycle, final LongSupplier electionState, final LongSupplier elections,
-                   final long waitMs, final BooleanSupplier quorumReachable, final long windowMs,
-                   final AutoCloseable onStop) {
+                   final long waitMs, final long leaderElectWaitMs, final BooleanSupplier quorumReachable,
+                   final long windowMs, final AutoCloseable onStop) {
         if (waitMs <= 0) {
             throw new IllegalArgumentException("rejoin wait must be positive");
+        }
+        if (leaderElectWaitMs <= 0) {
+            throw new IllegalArgumentException("leader elect wait must be positive");
         }
         if (windowMs <= 0) {
             throw new IllegalArgumentException("rejoin peer window must be positive");
@@ -99,24 +131,34 @@ public final class RejoinWatchdog {
         this.elections = elections;
         this.waitMs = waitMs;
         this.waitNs = TimeUnit.MILLISECONDS.toNanos(waitMs);
+        this.leaderElectWaitMs = leaderElectWaitMs;
+        this.leaderElectWaitNs = TimeUnit.MILLISECONDS.toNanos(leaderElectWaitMs);
         this.quorumReachable = java.util.Objects.requireNonNull(quorumReachable, "quorumReachable");
         this.windowNs = TimeUnit.MILLISECONDS.toNanos(windowMs);
         this.onStop = onStop;
     }
 
     static RejoinWatchdog of(final EngineLifecycle lifecycle, final ConsensusModule.Context context,
-                             final long waitMs, final long windowMs) {
+                             final long waitMs, final long leaderElectWaitMs, final long windowMs) {
         final PeerReachability peers = PeerReachability.of(context, lifecycle::log);
         // A closed election-state counter means the consensus module closed: it reads CLOSED and never trips.
         return new RejoinWatchdog(lifecycle,
                 QuorumWatchdog.counterValue(context.electionStateCounter(), ElectionState.CLOSED.code()),
                 QuorumWatchdog.counterValue(context.electionCounter(), QuorumWatchdog.STATE_UNAVAILABLE), waitMs,
-                peers, windowMs, peers);
+                leaderElectWaitMs, peers, windowMs, peers);
     }
 
     /** The states in which an election open for the wait trips the watchdog (once a leader was known). */
     static boolean isRejoinWait(final long code) {
         return code == ElectionState.INIT.code() || QuorumWatchdog.isNoLeader(code);
+    }
+
+    /**
+     * The leader elect states Aeron leaves only once a quorum of followers reports its append position, with no
+     * timeout (1.53 {@code Election.leaderLogReplication}, {@code Election.leaderReady}).
+     */
+    static boolean isLeaderElectWait(final long code) {
+        return code == ElectionState.LEADER_LOG_REPLICATION.code() || code == ElectionState.LEADER_READY.code();
     }
 
     public boolean leaderKnown() {
@@ -171,20 +213,27 @@ public final class RejoinWatchdog {
             }
             leaderKnown = true;
         }
-        if (!isRejoinWait(code)) {
-            open = false; // closed, or a state with a leader (catch-up, leader states): the clock restarts
-            reachable = false;
-            quorumLossLogged = false;
+        final boolean leaderElect = isLeaderElectWait(code);
+        if (!leaderElect && !isRejoinWait(code)) {
+            // closed, or a state with a leader that is progressing (catch-up, replay, LEADER_INIT): the clock restarts
+            clear();
             return false;
         }
+        if (open && leaderElect != openLeaderElect) {
+            clear(); // the other kind of stretch: its own clock and its own evidence
+        }
         final long election = elections.getAsLong();
-        if (!open || election != openElection) {
-            // the continuous stretch without a leader starts here: a catch-up that falls back to canvass inside
-            // the same election gets the full wait for a normal re-election
+        if (!open || election != openElection || (leaderElect && code != openCode)) {
+            // the continuous stretch starts here: a catch-up that falls back to canvass inside the same election gets
+            // the full wait for a normal re-election, and a leader elect that reached LEADER_READY through
+            // LEADER_INIT gets the full wait again
             open = true;
+            openLeaderElect = leaderElect;
+            openCode = code;
             openedNs = nowNs;
             openElection = election;
         }
+        final long limitNs = leaderElect ? leaderElectWaitNs : waitNs;
         final boolean evidence;
         try {
             evidence = quorumReachable.getAsBoolean();
@@ -203,25 +252,44 @@ public final class RejoinWatchdog {
         }
         final long openNs = nowNs - openedNs;
         if (!reachable) {
-            if (openNs >= waitNs && !quorumLossLogged) {
+            if (openNs >= limitNs && !quorumLossLogged) {
                 quorumLossLogged = true;
-                lifecycle.log("rejoin watchdog: election " + election + " open for "
-                        + TimeUnit.NANOSECONDS.toMillis(openNs) + " ms without a leader, and no quorum of members is"
-                        + " reachable; not exiting, a restart cannot repair a quorum loss. The wait ("
-                        + EngineLifecycle.REJOIN_WAIT_ENV + ") starts when a quorum is reachable again");
+                if (leaderElect) {
+                    lifecycle.log("rejoin watchdog: leader elect in election " + election + ", election state "
+                            + stateName(code) + " for " + TimeUnit.NANOSECONDS.toMillis(openNs) + " ms, and no"
+                            + " quorum of members is reachable; not exiting, a restart cannot repair a quorum loss."
+                            + " The wait (" + EngineLifecycle.LEADER_ELECT_WAIT_ENV + ") starts when a quorum is"
+                            + " reachable again");
+                } else {
+                    lifecycle.log("rejoin watchdog: election " + election + " open for "
+                            + TimeUnit.NANOSECONDS.toMillis(openNs) + " ms without a leader, and no quorum of members"
+                            + " is reachable; not exiting, a restart cannot repair a quorum loss. The wait ("
+                            + EngineLifecycle.REJOIN_WAIT_ENV + ") starts when a quorum is reachable again");
+                }
             }
             return false;
         }
         // the wait counts only time with the quorum reachable, up to the last positive answer: peers that return
         // get a full wait to elect, and the window after the last answer is not evidence
         final long stuckNs = lastEvidenceNs - Math.max(openedNs, reachableSinceNs);
-        if (stuckNs < waitNs) {
+        if (stuckNs < limitNs) {
             return false;
         }
         tripped = true;
         final String state = stateName(code);
         final long openMs = TimeUnit.NANOSECONDS.toMillis(openNs);
         final long stuckMs = TimeUnit.NANOSECONDS.toMillis(stuckNs);
+        if (leaderElect) {
+            lifecycle.log("CRITICAL rejoin watchdog: leader elect in election " + election + " still in election state "
+                    + state + " for " + openMs + " ms, no quorum of followers has reported its position, with a"
+                    + " quorum of members reachable for " + stuckMs + " ms (wait " + leaderElectWaitMs + " ms, "
+                    + EngineLifecycle.LEADER_ELECT_WAIT_ENV + "); exiting " + EngineLifecycle.EXIT_FATAL
+                    + " for a supervised restart");
+            lifecycle.fatal(EngineLifecycle.EXIT_FATAL, "leader elect did not complete election " + election
+                    + ": election state " + state + " for " + openMs + " ms, a quorum of members reachable for "
+                    + stuckMs + " ms");
+            return true;
+        }
         lifecycle.log("CRITICAL rejoin watchdog: election " + election + " open for " + openMs
                 + " ms after a leader was known, still in election state " + state + " with a quorum of members"
                 + " reachable for " + stuckMs + " ms (wait " + waitMs + " ms, "
@@ -230,6 +298,12 @@ public final class RejoinWatchdog {
         lifecycle.fatal(EngineLifecycle.EXIT_FATAL, "member did not rejoin: election state " + state + " for "
                 + openMs + " ms after a leader was known, a quorum of members reachable for " + stuckMs + " ms");
         return true;
+    }
+
+    private void clear() {
+        open = false;
+        reachable = false;
+        quorumLossLogged = false;
     }
 
     private static String stateName(final long code) {
@@ -249,7 +323,8 @@ public final class RejoinWatchdog {
                     return;
                 }
                 try {
-                    Thread.sleep(Math.min(QuorumWatchdog.POLL_INTERVAL_MS, Math.max(1, waitMs / 4)));
+                    Thread.sleep(Math.min(QuorumWatchdog.POLL_INTERVAL_MS,
+                            Math.max(1, Math.min(waitMs, leaderElectWaitMs) / 4)));
                 } catch (final InterruptedException e) {
                     return;
                 }

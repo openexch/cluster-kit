@@ -23,6 +23,7 @@ import io.aeron.logbuffer.Header;
 import org.agrona.CloseHelper;
 import org.agrona.DirectBuffer;
 import org.agrona.concurrent.BackoffIdleStrategy;
+import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.status.AtomicCounter;
 
@@ -33,6 +34,7 @@ import java.net.DatagramSocket;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.BooleanSupplier;
 
 /**
@@ -88,6 +90,15 @@ final class ThreeMemberCluster implements AutoCloseable {
         final List<String> log = new CopyOnWriteArrayList<>();
         final List<Integer> halts = new CopyOnWriteArrayList<>();
         final List<Throwable> errors = new CopyOnWriteArrayList<>();
+        /**
+         * True: the consensus agent stops at the end of the duty cycle in which it voted (Aeron places the vote and
+         * enters FOLLOWER_BALLOT in one call) and stays there: its driver keeps answering, its consensus module never
+         * acts again. A candidate it voted for becomes leader elect and never hears from it.
+         */
+        volatile boolean holdAfterVote;
+        /** Set once the consensus agent is held. */
+        volatile boolean held;
+        volatile boolean releaseForClose;
 
         Node(final int id) {
             this.id = id;
@@ -111,6 +122,49 @@ final class ThreeMemberCluster implements AutoCloseable {
 
         boolean logged(final String text) {
             return log.stream().anyMatch(l -> l.contains(text));
+        }
+    }
+
+    /** The consensus module's idle strategy, with the {@link Node#holdAfterVote} hold. */
+    static final class HoldingIdleStrategy implements IdleStrategy {
+        private final Node node;
+        private final BackoffIdleStrategy delegate = new BackoffIdleStrategy();
+
+        HoldingIdleStrategy(final Node node) {
+            this.node = node;
+        }
+
+        @Override
+        public void idle(final int workCount) {
+            delegate.idle(workCount);
+            hold();
+        }
+
+        @Override
+        public void idle() {
+            delegate.idle();
+            hold();
+        }
+
+        @Override
+        public void reset() {
+            delegate.reset();
+        }
+
+        private void hold() {
+            while (node.holdAfterVote && node.module != null
+                    && node.electionState() == ElectionState.FOLLOWER_BALLOT.code()) {
+                node.held = true;
+                if (node.releaseForClose) {
+                    // the close has already told the agent runner to stop: give it time to, so no duty cycle runs
+                    LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(200));
+                    return;
+                }
+                if (Thread.currentThread().isInterrupted()) {
+                    return;
+                }
+                LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
+            }
         }
     }
 
@@ -239,6 +293,9 @@ final class ThreeMemberCluster implements AutoCloseable {
     Node start(final int id, final EngineLifecycle lifecycle) {
         final Node n = nodes[id];
         n.lifecycle = lifecycle;
+        n.holdAfterVote = false;
+        n.held = false;
+        n.releaseForClose = false;
         n.service = new CountingService();
         final File clusterDir = clusterDir(id);
         final MediaDriver.Context driverContext = new MediaDriver.Context()
@@ -269,7 +326,7 @@ final class ThreeMemberCluster implements AutoCloseable {
                 .ingressChannel("aeron:udp")
                 .replicationChannel("aeron:udp?endpoint=localhost:0")
                 .serviceCount(1)
-                .idleStrategySupplier(BackoffIdleStrategy::new)
+                .idleStrategySupplier(() -> new HoldingIdleStrategy(n))
                 .electionTimeoutNs(TimeUnit.SECONDS.toNanos(1))
                 .startupCanvassTimeoutNs(TimeUnit.SECONDS.toNanos(2))
                 .leaderHeartbeatIntervalNs(TimeUnit.MILLISECONDS.toNanos(100))
@@ -322,6 +379,16 @@ final class ThreeMemberCluster implements AutoCloseable {
         if (n.lifecycle != null) {
             n.lifecycle.onClusterTermination();
             n.lifecycle.awaitStop();
+        }
+        if (n.held && n.module != null) {
+            // a held consensus agent is released only once its runner was told to stop (see HoldingIdleStrategy)
+            final ConsensusModule module = n.module;
+            final Thread release = new Thread(() -> {
+                LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(100));
+                n.releaseForClose = true;
+            }, "release-member" + id);
+            release.start();
+            CloseHelper.close(module);
         }
         CloseHelper.closeAll(n.container, n.module, n.archive, n.mediaDriver, n.driver);
         n.container = null;

@@ -53,7 +53,9 @@ import java.util.function.IntConsumer;
  *       quorum wait after its launch; {@link QuorumWatchdog} records a fatal fault, exit 1.</li>
  *   <li>No rejoin after a leader was known: one election stays open for the rejoin wait and is in a no-leader
  *       state (or INIT) while a quorum of members is reachable; {@link RejoinWatchdog} logs one CRITICAL line and
- *       records a fatal fault, exit 1. During a genuine quorum loss it does not trip.</li>
+ *       records a fatal fault, exit 1. The same for a leader elect that stays in LEADER_LOG_REPLICATION or
+ *       LEADER_READY for the leader elect wait while a quorum of members is reachable. During a genuine quorum loss
+ *       it does not trip.</li>
  *   <li>No catch-up possible: catch-up attempts keep failing and this member's log position is below the leader's
  *       log start; {@link CatchupWatchdog} logs one CRITICAL line naming both positions and records a fatal fault,
  *       exit 1.</li>
@@ -108,6 +110,19 @@ public final class EngineLifecycle {
     public static final long MIN_REJOIN_PEER_WINDOW_MS = 1_000;
     public static final long MAX_REJOIN_PEER_WINDOW_MS = 600_000;
     /**
+     * How long a leader elect may stay in LEADER_LOG_REPLICATION or LEADER_READY, counted only while a quorum of
+     * members is reachable, before it exits 1 ({@link RejoinWatchdog}) (10000..3600000). Aeron leaves those states
+     * only once a quorum of followers reports its append position, without a timeout: a leader elect whose voter
+     * vanished, or whose followers cannot hear it, waits there for ever. Size it above the time followers need to
+     * replicate the longest log a new leader may have to send them; it must exceed {@link #REJOIN_PEER_WINDOW_ENV}
+     * ({@link #leaderElectSettingsRefusal}).
+     */
+    public static final String LEADER_ELECT_WAIT_ENV = "ENGINE_LEADER_ELECT_WAIT_MS";
+    public static final String LEADER_ELECT_WAIT_PROP = "engine.leader.elect.wait.ms";
+    public static final long DEFAULT_LEADER_ELECT_WAIT_MS = 300_000;
+    public static final long MIN_LEADER_ELECT_WAIT_MS = 10_000;
+    public static final long MAX_LEADER_ELECT_WAIT_MS = 3_600_000;
+    /**
      * How many catch-up attempts in a row may fail before the {@link CatchupWatchdog} reads the leader's log start
      * (1..1000): a member whose own log position is below it can never catch up and exits 1.
      */
@@ -153,6 +168,7 @@ public final class EngineLifecycle {
     private final long quorumWaitMs;
     private final long rejoinWaitMs;
     private final long rejoinPeerWindowMs;
+    private final long leaderElectWaitMs;
     private final long catchupRefusals;
     private final long catchupRefusalWaitMs;
     private final AtomicReference<Stop> stop = new AtomicReference<>(RUNNING);
@@ -191,11 +207,21 @@ public final class EngineLifecycle {
                     final long shutdownTimeoutMs, final long fatalExitGraceMs, final long quorumWaitMs,
                     final long rejoinWaitMs, final long rejoinPeerWindowMs, final long catchupRefusals,
                     final long catchupRefusalWaitMs) {
+        this(name, log, halter, shutdownTimeoutMs, fatalExitGraceMs, quorumWaitMs, rejoinWaitMs, rejoinPeerWindowMs,
+                DEFAULT_LEADER_ELECT_WAIT_MS, catchupRefusals, catchupRefusalWaitMs);
+    }
+
+    EngineLifecycle(final String name, final Consumer<String> log, final IntConsumer halter,
+                    final long shutdownTimeoutMs, final long fatalExitGraceMs, final long quorumWaitMs,
+                    final long rejoinWaitMs, final long rejoinPeerWindowMs, final long leaderElectWaitMs,
+                    final long catchupRefusals, final long catchupRefusalWaitMs) {
         if (shutdownTimeoutMs <= 0 || fatalExitGraceMs <= 0 || quorumWaitMs <= 0 || rejoinWaitMs <= 0
-                || rejoinPeerWindowMs <= 0 || catchupRefusals <= 0 || catchupRefusalWaitMs <= 0) {
+                || rejoinPeerWindowMs <= 0 || leaderElectWaitMs <= 0 || catchupRefusals <= 0
+                || catchupRefusalWaitMs <= 0) {
             throw new IllegalArgumentException("lifecycle bounds must be positive");
         }
         this.rejoinPeerWindowMs = rejoinPeerWindowMs;
+        this.leaderElectWaitMs = leaderElectWaitMs;
         this.catchupRefusals = catchupRefusals;
         this.catchupRefusalWaitMs = catchupRefusalWaitMs;
         this.name = name;
@@ -223,11 +249,16 @@ public final class EngineLifecycle {
         if (rejoinRefusal != null) {
             throw new IllegalArgumentException(rejoinRefusal);
         }
+        final long leaderElectMs = leaderElectWaitMs();
+        final String leaderElectRefusal = leaderElectSettingsRefusal(leaderElectMs, rejoinWindowMs);
+        if (leaderElectRefusal != null) {
+            throw new IllegalArgumentException(leaderElectRefusal);
+        }
         // the retention floor's settings are read again where the pruner is wired, inside the service's start, where
         // a refusal would be too late to stop the boot: check them here
         SnapshotLogPruner.checkSettings();
         final EngineLifecycle lifecycle = new EngineLifecycle(name, log, status -> Runtime.getRuntime().halt(status),
-                shutdownMs, graceMs, quorumMs, rejoinMs, rejoinWindowMs, catchupRefusals(),
+                shutdownMs, graceMs, quorumMs, rejoinMs, rejoinWindowMs, leaderElectMs, catchupRefusals(),
                 catchupRefusalWaitMs());
         Runtime.getRuntime().addShutdownHook(new Thread(lifecycle::onJvmShutdown, name + "-shutdown"));
         return lifecycle;
@@ -273,6 +304,25 @@ public final class EngineLifecycle {
         return null;
     }
 
+    public static long leaderElectWaitMs() {
+        return rangedSetting(LEADER_ELECT_WAIT_ENV, LEADER_ELECT_WAIT_PROP, DEFAULT_LEADER_ELECT_WAIT_MS,
+                MIN_LEADER_ELECT_WAIT_MS, MAX_LEADER_ELECT_WAIT_MS);
+    }
+
+    /**
+     * Why this leader elect wait refuses the boot next to this peer window, or null when it is fine: the same rule
+     * as {@link #rejoinSettingsRefusal}, for the same reason (a peer that just died still reads reachable for the
+     * window).
+     */
+    public static String leaderElectSettingsRefusal(final long leaderElectWaitMs, final long rejoinPeerWindowMs) {
+        if (leaderElectWaitMs <= rejoinPeerWindowMs) {
+            return LEADER_ELECT_WAIT_ENV + " (" + leaderElectWaitMs + " ms) must exceed " + REJOIN_PEER_WINDOW_ENV
+                    + " (" + rejoinPeerWindowMs + " ms): a peer that just died still counts as reachable for the media"
+                    + " driver's publication connection timeout, which the window has to cover";
+        }
+        return null;
+    }
+
     public static long catchupRefusals() {
         return rangedSetting(CATCHUP_REFUSALS_ENV, CATCHUP_REFUSALS_PROP, DEFAULT_CATCHUP_REFUSALS,
                 MIN_CATCHUP_REFUSALS, MAX_CATCHUP_REFUSALS);
@@ -301,7 +351,7 @@ public final class EngineLifecycle {
         final QuorumWatchdog quorum = QuorumWatchdog.of(this, context, quorumWaitMs);
         watchdogs.add(quorum::stop);
         quorum.startDaemon(name);
-        watchRejoin(RejoinWatchdog.of(this, context, rejoinWaitMs, rejoinPeerWindowMs));
+        watchRejoin(RejoinWatchdog.of(this, context, rejoinWaitMs, leaderElectWaitMs, rejoinPeerWindowMs));
         watchCatchup(CatchupWatchdog.of(this, context, catchupRefusals, catchupRefusalWaitMs));
         return quorum;
     }
@@ -323,8 +373,8 @@ public final class EngineLifecycle {
         final QuorumWatchdog quorum = new QuorumWatchdog(this, electionState, elections, quorumWaitMs);
         watchdogs.add(quorum::stop);
         quorum.startDaemon(name);
-        watchRejoin(new RejoinWatchdog(this, electionState, elections, rejoinWaitMs, quorumReachable,
-                rejoinPeerWindowMs, null));
+        watchRejoin(new RejoinWatchdog(this, electionState, elections, rejoinWaitMs, leaderElectWaitMs,
+                quorumReachable, rejoinPeerWindowMs, null));
         return quorum;
     }
 
@@ -338,7 +388,9 @@ public final class EngineLifecycle {
     private void watchRejoin(final RejoinWatchdog w) {
         log.accept(name + " rejoin watchdog armed: exit 1 if, after a leader was known, one election stays open "
                 + "without a leader for " + rejoinWaitMs + " ms (" + REJOIN_WAIT_ENV + ") while a quorum of members"
-                + " is reachable (evidence window " + rejoinPeerWindowMs + " ms, " + REJOIN_PEER_WINDOW_ENV + ")");
+                + " is reachable (evidence window " + rejoinPeerWindowMs + " ms, " + REJOIN_PEER_WINDOW_ENV + "), or a"
+                + " leader elect stays in LEADER_LOG_REPLICATION or LEADER_READY for " + leaderElectWaitMs + " ms ("
+                + LEADER_ELECT_WAIT_ENV + ") under the same condition");
         watchdogs.add(w::stop);
         rejoin = w;
         w.startDaemon(name);

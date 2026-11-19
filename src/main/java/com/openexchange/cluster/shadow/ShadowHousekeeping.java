@@ -29,8 +29,11 @@ import java.util.concurrent.atomic.AtomicLongArray;
  *       replay open at a time: every read is synchronous on this thread;</li>
  *   <li>the host's {@code refresh} (the journal tail behind {@code skipSafe});</li>
  *   <li>{@link ShadowRetention#apply} (the one purge owner), then a fresh scan for the floor;</li>
+ *   <li>the member's {@link FloorAttestor} (what this archive holds VERIFIED, published for the leader of the day)
+ *       and, on a leader, the {@link RemoteFloor}'s listing of the other members' attestations (control traffic
+ *       only);</li>
  *   <li>{@link ShadowFloor#requestPurge} when a VERIFIED position appeared that the last poll did not see, or the
- *       floor rose above what the last purge pass applied (C3: "requested" means a VERIFIED shadow appeared or the
+ *       floor (on a leader: the higher of the local and the remote floor) rose above what the last purge pass applied (C3: "requested" means a VERIFIED shadow appeared or the
  *       floor rose, not that a scan ran). A shadow VERIFIED elsewhere (a restore's own deep read in {@code onStart})
  *       is new to this hook on its first poll (C2).</li>
  * </ol>
@@ -59,7 +62,22 @@ public final class ShadowHousekeeping implements Runnable {
         /** Cumulative milliseconds due deep reads waited for the pace. */
         DEEP_READ_PACED_MS("shadow_deep_read_paced_ms"),
         HOUSEKEEPING_POLLS_TOTAL("shadow_housekeeping_polls_total"),
-        PURGE_REQUESTS_TOTAL("shadow_purge_requests_total");
+        PURGE_REQUESTS_TOTAL("shadow_purge_requests_total"),
+        /** The remote floor of the last evaluation on a leader (0: none, or this node does not lead). */
+        LEADER_REMOTE_FLOOR_POSITION("shadow_leader_remote_floor_position"),
+        /** The members whose attestation the last evaluation on a leader accepted. */
+        LEADER_REMOTE_HOLDERS("shadow_leader_remote_holders"),
+        /** Purge passes whose floor came from remote shadows (above the local floor), on a leader. */
+        LEADER_REMOTE_FLOOR_APPLIED_TOTAL("shadow_leader_remote_floor_applied_total"),
+        /** Attestation listings a leader ran (one per period, every source). */
+        LEADER_REMOTE_LISTINGS_TOTAL("shadow_leader_remote_listings_total"),
+        /** Sources that did not answer an attestation listing. */
+        LEADER_REMOTE_SOURCE_UNREACHABLE_TOTAL("shadow_leader_remote_source_unreachable_total"),
+        /** The anchor this member attests in its own archive (-1: none). */
+        ATTESTED_ANCHOR_POSITION("shadow_attested_anchor_position"),
+        ATTESTATIONS_TOTAL("shadow_attestations_total"),
+        ATTESTATIONS_RETRACTED_TOTAL("shadow_attestations_retracted_total"),
+        ATTEST_ERRORS_TOTAL("shadow_attest_errors_total");
 
         private final String metricName;
 
@@ -80,6 +98,7 @@ public final class ShadowHousekeeping implements Runnable {
         public Counters() {
             values.set(Counter.ANCHOR_POSITION.ordinal(), -1);
             values.set(Counter.MARGIN_POSITION.ordinal(), -1);
+            values.set(Counter.ATTESTED_ANCHOR_POSITION.ordinal(), -1);
         }
 
         public long get(final Counter c) {
@@ -136,6 +155,7 @@ public final class ShadowHousekeeping implements Runnable {
     private boolean startupPassDone;
     private boolean passClean = true;
     private Set<Long> seenVerified = new HashSet<>();
+    private FloorAttestor attestor;
 
     /**
      * @param scanPeriodMs    {@code SHADOW_SCAN_PERIOD_MS}, 100..3600000
@@ -161,6 +181,15 @@ public final class ShadowHousekeeping implements Runnable {
         this.deepReadPaceNs = TimeUnit.MILLISECONDS.toNanos(deepReadPaceMs);
         this.refresh = Objects.requireNonNull(refresh, "refresh");
         this.counters = Objects.requireNonNull(counters, "counters");
+    }
+
+    /**
+     * The member's attestor: after every scan of a poll it publishes what this archive holds VERIFIED (the leader of
+     * the day reads it, {@link RemoteFloor}). Set before the first poll; null (the default): nothing is attested.
+     */
+    public ShadowHousekeeping attestor(final FloorAttestor attestor) {
+        this.attestor = attestor;
+        return this;
     }
 
     /** {@code SnapshotLogPruner.onWake(housekeeping)}. */
@@ -224,6 +253,10 @@ public final class ShadowHousekeeping implements Runnable {
             }
         }
         floor.observe(scan);
+        if (attestor != null) {
+            attestor.observe(scan);
+        }
+        floor.pollRemote();
 
         if (scan.known()) {
             boolean appeared = false;
@@ -235,7 +268,7 @@ public final class ShadowHousekeeping implements Runnable {
             seenVerified = verifiedNow;
             final ShadowFloor.Evaluation e = floor.evaluate(scan);
             floor.publish(e);
-            if (appeared || e.floor() > Math.max(0, floor.lastApplied())) {
+            if (appeared || floor.effectiveFloor(e) > Math.max(0, floor.lastApplied())) {
                 if (!floor.purgeRequested()) {
                     counters.increment(Counter.PURGE_REQUESTS_TOTAL);
                 }

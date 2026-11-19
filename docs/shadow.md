@@ -226,6 +226,62 @@ host, and keep the retry backoff at or above 5 s, the source's replay linger).
 A LEADER never pulls: while the role is LEADER a pass lists and starts nothing,
 and every in-flight pull is stopped and its partial copy purged.
 
+### The leader's floor behind shadows it does not hold
+
+A leader neither pulls nor produces, so its own floor stays where it was when
+it was elected, and a follower never purges past the leader's log start: with
+stable leadership no member would purge. For the current leader only, the
+local-shadow rule is relaxed (`ShadowFloor.leaderRemote`):
+
+- Every member publishes what its archive holds VERIFIED, after each catalog
+  scan that can answer: one marker recording on stream 4305 whose alias is the
+  whole content (`FloorAttestation`:
+  `oxf.v1.<engine>.c<cluster>.g<genesis>.m<member>.a<anchor>.w<witnesses>.v<margin + 1>.s<seq>`).
+  `a` is the newest position with VERIFIED ALIGNED copies of `w` distinct
+  producers (none in CONFLICT), `v` the newest VERIFIED position below it.
+  `FloorAttestor` keeps one marker per archive and retracts it when the facts
+  stop holding. A listing of shadow recordings can not stand in for it: a
+  listing carries no digest and no verdict, and two producers at one position
+  in a listing is also what a CONFLICT looks like.
+- A marker never outlives the process that verified it: at arming the
+  attestor purges every marker it finds, and a host that does not build one
+  calls `FloorAttestor.retractAll`.
+- While it leads, `RemoteFloor` lists the markers of the other members
+  (`SHADOW_PULL_SOURCES`) over their archive control channels once per pull
+  period: control traffic only, nothing replicated, replayed or recorded on
+  the leader. The listing never waits on the pruner thread: a source that is
+  down costs one poll of its connect per wake. A marker counts only when it is
+  stopped and names the member whose archive it was listed from (a marker
+  that came with a copied archive directory is refused). It accepts a marker whose anchor is at or below its own P_cm
+  with two witnesses under `two-producers` (one under `any-verified`); the
+  floor of a marker is the anchor under margin `none`, else
+  `min(anchor, margin)` (no margin shadow: 0); the remote floor is the
+  holders-th largest, capped at P_cm.
+- The purge pass applies `max(local floor, remote floor)` while this node
+  leads, the newest group is a STUB and the local scan can answer. A view
+  older than its age bound, or taken in an earlier leadership, feeds nothing.
+
+The verdict is the attesting member's own (its deep reads); the leader does
+not read the bytes. A leader that purged so and restarts comes back as a
+follower with a stub, a log that starts above 0 and no shadow: the host's
+restore pulls a shadow first and deep-reads it locally, or halts. Followers
+and the replica keep the local rule.
+
+Runbook, an old leader that was down for long: the holders keep the newest
+`SHADOW_RETAIN_N` positions, so every shadow they still hold may be ABOVE the
+old leader's own P_cm (it missed the snapshots taken while it was down). Its
+restore then has only SKIP, which needs its money journal to reach the
+shadow's journal seq; when the journal is behind, the restore halts with the
+FATAL text (it never replays the purged log). Bring it back as a wiped member:
+restore its cluster and archive directories from a peer (the runbook line of
+the halt text), or wipe and reseed it; do not lower the snapshot with
+`invalidate-latest-snapshot`, its log below the purge is gone. Counters: `shadow_leader_remote_floor_position`,
+`shadow_leader_remote_holders`, `shadow_leader_remote_floor_applied_total`,
+`shadow_leader_remote_listings_total`,
+`shadow_leader_remote_source_unreachable_total`,
+`shadow_attested_anchor_position`, `shadow_attestations_total`,
+`shadow_attestations_retracted_total`, `shadow_attest_errors_total`.
+
 Nobody pulls from the leader either. A host may pass the current leader's
 archive control endpoint (`ShadowPuller.deferredSource`; a member derives it
 from the leader id in the leader's own `CommitPosition` and the members table):

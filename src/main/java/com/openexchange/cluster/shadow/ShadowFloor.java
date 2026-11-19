@@ -8,6 +8,7 @@ import java.util.EnumSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
@@ -49,7 +50,12 @@ import java.util.function.Supplier;
  * candidate ({@code localDurableSeq >= candidate.journalSeq}), so an older shadow can be safe while the newest is not;
  * counting it would let {@code SHADOW_FLOOR_MARGIN=none} purge to P_cm with no way back.</p>
  *
- * <p>Only VERIFIED shadows this node can restore from feed it (hard rule 12.7); UNKNOWN means purge nothing. It is
+ * <p>Only VERIFIED shadows this node can restore from feed it (hard rule 12.7); UNKNOWN means purge nothing. One
+ * exception, for the CURRENT LEADER only ({@link #leaderRemote}): a leader never pulls and never produces, so it also
+ * purges behind VERIFIED ALIGNED shadows the other members attest they hold ({@link RemoteFloor}, the same anchor
+ * rule and margin); the purge pass applies {@code max(table above, remote floor)} while this node leads, the newest
+ * group is a STUB and the local scan can answer. A leader that purged so and restarts comes back as a follower with
+ * no local shadow: its restore pulls one first or halts, it never replays a purged log. It is
  * recomputed on every call; a lower answer than the log's current start (the last applied purge point, read from the
  * archive through {@code logStartPosition}, never from memory, C4) is counted {@code shadow_floor_regressed_total}
  * and changes nothing on disk, since nothing can un-purge.</p>
@@ -199,6 +205,9 @@ public final class ShadowFloor implements LongSupplier {
     private volatile Evaluation lastEvaluation;
     private volatile long lastApplied = -1;
     private volatile boolean purgeRequested;
+    private volatile RemoteFloor remote;
+    private volatile BooleanSupplier leaderNow = () -> false;
+    private volatile String lastRemoteLine;
 
     /**
      * @param latestSnapshotPosition P_cm: this node's newest valid CM snapshot position, or -1 (the host reads its
@@ -240,6 +249,58 @@ public final class ShadowFloor implements LongSupplier {
 
     public Margin margin() {
         return margin;
+    }
+
+    /**
+     * Wires the leader's remote floor (class Javadoc). Without it, or while {@code leaderNow} reads false, this floor
+     * is the local table alone, exactly as before.
+     *
+     * @param leaderNow the service's role: true while LEADER (a replica never wires this)
+     * @param remote    the listing of the other members' attestations
+     */
+    public ShadowFloor leaderRemote(final BooleanSupplier leaderNow, final RemoteFloor remote) {
+        this.leaderNow = Objects.requireNonNull(leaderNow, "leaderNow");
+        this.remote = Objects.requireNonNull(remote, "remote");
+        return this;
+    }
+
+    /** The housekeeping step of the remote floor: a listing when one is due and this node leads. Never throws. */
+    public void pollRemote() {
+        final RemoteFloor r = remote;
+        if (r != null) {
+            r.poll(leads());
+        }
+    }
+
+    private boolean leads() {
+        return off.contains(NegativeControl.REMOTE_FLOOR_ANY_ROLE) || leaderNow.getAsBoolean();
+    }
+
+    /**
+     * The remote floor that may stand beside {@code local}, or null when it does not apply: not wired, this node does
+     * not lead, or the local evaluation is not one of the STUB table's answers (no snapshot, a FULL newest group whose
+     * floor is P_cm already, an unreadable kind, a scan that cannot answer: all of those keep their own answer).
+     */
+    public RemoteFloor.Result remoteResult(final Evaluation local) {
+        final RemoteFloor r = remote;
+        if (r == null || !leads()) {
+            return null;
+        }
+        final boolean stubTable = switch (local.kind()) {
+            case NO_COVERING, NO_MARGIN, NO_WITNESS, FLOOR -> true;
+            default -> false;
+        };
+        if (!stubTable && !(off.contains(NegativeControl.REMOTE_FLOOR_PRECONDITION_OFF)
+                && local.latestSnapshotPosition() >= 0)) {
+            return null;
+        }
+        return r.evaluate(local.latestSnapshotPosition(), margin, rule);
+    }
+
+    /** The floor a purge pass applies for {@code local}: on a leader the higher of the local and the remote floor. */
+    public long effectiveFloor(final Evaluation local) {
+        final RemoteFloor.Result r = remoteResult(local);
+        return r == null ? local.floor() : Math.max(local.floor(), r.floor());
     }
 
     public AnchorRule rule() {
@@ -425,9 +486,26 @@ public final class ShadowFloor implements LongSupplier {
         purgeRequested = false;
         final Evaluation e = evaluate();
         lastEvaluation = e;
-        lastApplied = e.floor();
-        publish(e);
-        if (e.kind() == Evaluation.Kind.NO_WITNESS) {
+        final RemoteFloor.Result r = remoteResult(e);
+        final long floor = r == null ? e.floor() : Math.max(e.floor(), r.floor());
+        lastApplied = floor;
+        publish(e, r);
+        if (r != null) {
+            final String line = r.floor() > e.floor()
+                    ? "purge floor " + floor + " behind shadows the other members hold (local floor " + e.floor()
+                    + ", margin=" + margin.text() + ", anchorRule=" + rule.text() + "): " + r
+                    : "no purge behind remote shadows (local floor " + e.floor() + "): " + r;
+            if (!line.equals(lastRemoteLine)) {
+                lastRemoteLine = line;
+                System.out.println("[SHADOW-FLOOR] leader: " + line);
+            }
+            if (r.floor() > e.floor()) {
+                counters.increment(ShadowHousekeeping.Counter.LEADER_REMOTE_FLOOR_APPLIED_TOTAL);
+            }
+        } else {
+            lastRemoteLine = null;
+        }
+        if (e.kind() == Evaluation.Kind.NO_WITNESS && floor <= 0) {
             counters.increment(ShadowHousekeeping.Counter.FLOOR_NO_WITNESS_TOTAL);
         }
         long logStart;
@@ -436,12 +514,12 @@ public final class ShadowFloor implements LongSupplier {
         } catch (final RuntimeException unreadable) {
             logStart = -1;
         }
-        if (logStart > 0 && e.floor() < logStart) {
+        if (logStart > 0 && floor < logStart) {
             counters.increment(ShadowHousekeeping.Counter.FLOOR_REGRESSED_TOTAL);
-            System.out.println("[SHADOW-FLOOR] floor " + e.floor() + " is below the log start " + logStart
+            System.out.println("[SHADOW-FLOOR] floor " + floor + " is below the log start " + logStart
                     + " (already purged; nothing can un-purge): " + e);
         }
-        return e.floor();
+        return floor;
     }
 
     /** Housekeeping: a VERIFIED shadow appeared or the floor rose; the next pruner wake runs a purge pass. */
@@ -465,11 +543,19 @@ public final class ShadowFloor implements LongSupplier {
     }
 
     void publish(final Evaluation e) {
+        publish(e, remoteResult(e));
+    }
+
+    /** {@code r}: the remote floor beside {@code e} on a leader, or null. */
+    private void publish(final Evaluation e, final RemoteFloor.Result r) {
+        final long floor = r == null ? e.floor() : Math.max(e.floor(), r.floor());
+        counters.set(ShadowHousekeeping.Counter.LEADER_REMOTE_FLOOR_POSITION, r == null ? 0 : r.floor());
+        counters.set(ShadowHousekeeping.Counter.LEADER_REMOTE_HOLDERS, r == null ? 0 : r.holders().size());
         counters.set(ShadowHousekeeping.Counter.FLOOR_UNKNOWN,
                 e.kind() == Evaluation.Kind.UNKNOWN || e.kind() == Evaluation.Kind.IMAGE_UNKNOWN ? 1 : 0);
-        counters.set(ShadowHousekeeping.Counter.FLOOR_POSITION, e.floor());
+        counters.set(ShadowHousekeeping.Counter.FLOOR_POSITION, floor);
         counters.set(ShadowHousekeeping.Counter.FLOOR_LAG_BYTES,
-                e.latestSnapshotPosition() < 0 ? 0 : Math.max(0, e.latestSnapshotPosition() - e.floor()));
+                e.latestSnapshotPosition() < 0 ? 0 : Math.max(0, e.latestSnapshotPosition() - floor));
         counters.set(ShadowHousekeeping.Counter.ANCHOR_POSITION, e.anchorPosition());
         counters.set(ShadowHousekeeping.Counter.MARGIN_POSITION, e.marginPosition());
         counters.set(ShadowHousekeeping.Counter.ANCHOR_WITNESSES, Math.max(0, e.witnesses()));

@@ -22,7 +22,9 @@ import static org.junit.Assert.assertTrue;
  * {@code replica.RetrievedSetTrim} (the retrieved member snapshot set trim, allow-listed by class name; it purges
  * member CM/service snapshot recordings, never a shadow), plus {@link ShadowPuller} (only the local recordings it
  * created by a pull in this process: a partial, timed-out, aborted or content-refused copy, through
- * {@code ShadowCatalog.purge(id, force)}). Exactly these six; anything else in {@code cluster}, {@code cluster.shadow}
+ * {@code ShadowCatalog.purge(id, force)}), plus {@link FloorAttestor} (the attestation markers of its own archive
+ * on {@code FloorAttestation.STREAM_ID}, by id from a listing of that stream; never a shadow). Exactly these seven;
+ * anything else in {@code cluster}, {@code cluster.shadow}
  * or {@code cluster.replica} fails.
  */
 public class ShadowPurgeCallSiteTest {
@@ -34,7 +36,8 @@ public class ShadowPurgeCallSiteTest {
             PKG + "shadow/ShadowWriter",
             PKG + "StagingArchive",
             PKG + "replica/RetrievedSetTrim",
-            PKG + "shadow/ShadowPuller");
+            PKG + "shadow/ShadowPuller",
+            PKG + "shadow/FloorAttestor");
 
     static NeverSchedulesScan.Rules purgeRules() {
         return new NeverSchedulesScan.Rules(Set.of(), List.of(), Set.of(),
@@ -87,8 +90,10 @@ public class ShadowPurgeCallSiteTest {
                 + "io/aeron/archive/client/AeronArchive.purgeRecording"));
         assertTrue(callers.toString(), callers.contains(PKG + "shadow/ShadowPuller -> "
                 + "com/openexchange/cluster/shadow/ShadowCatalog.purge"));
-        assertEquals(callers.toString(), 6, callers.size());
-        assertEquals(6, ALLOWED.size());
+        assertTrue(callers.toString(), callers.contains(PKG + "shadow/FloorAttestor -> "
+                + "io/aeron/archive/client/AeronArchive.purgeRecording"));
+        assertEquals(callers.toString(), 7, callers.size());
+        assertEquals(7, ALLOWED.size());
         ShadowRig.green("purge call sites: " + callers);
     }
 

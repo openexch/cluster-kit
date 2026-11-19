@@ -117,8 +117,9 @@ public final class ReplicaContexts {
                 .sharedIdleStrategy(idle(c))
                 .dirDeleteOnShutdown(true)
                 .timerIntervalNs(TimeUnit.MICROSECONDS.toNanos(500))
-                .clientLivenessTimeoutNs(TimeUnit.SECONDS.toNanos(5))
-                .publicationUnblockTimeoutNs(TimeUnit.SECONDS.toNanos(10))
+                // settings: the liveness is also the longest whole-process pause the replica survives
+                .clientLivenessTimeoutNs(TimeUnit.MILLISECONDS.toNanos(c.driverClientLivenessMs))
+                .publicationUnblockTimeoutNs(TimeUnit.MILLISECONDS.toNanos(c.driverPublicationUnblockMs))
                 .imageLivenessTimeoutNs(TimeUnit.MILLISECONDS.toNanos(c.imageLivenessMs))
                 .socketSndbufLength(c.socketBufferLength)
                 .socketRcvbufLength(c.socketBufferLength)

@@ -41,14 +41,17 @@ import java.util.List;
  * never as current, which is why the freshness travels with the position.</p>
  *
  * <p>Answered by whichever node is asked, about what IT believes. Only the
- * leader maintains real follower positions, so only the leader's answer means
- * anything, and callers must not ask on a follower.</p>
+ * leader maintains real follower positions, so member positions are read from
+ * the leader's answer alone. A follower's answer is still asked for, at each
+ * purge pass, for the two things it does know: who leads, and every member's
+ * archive endpoint.</p>
  *
  * <h2>Where it runs</h2>
  *
  * <p>Not on the duty cycle. This sends a request and polls for a reply, and the
  * thread that matches orders must never wait for anything. It is built for a
- * background thread and it says so by blocking.</p>
+ * background thread and it says so by blocking. The pruner asks from its own
+ * thread: every wake on the leader, every purge pass on a follower.</p>
  */
 public final class ClusterMemberPositions implements AutoCloseable {
 
@@ -58,11 +61,19 @@ public final class ClusterMemberPositions implements AutoCloseable {
         public final long logPosition;
         /** Nanos, on the consensus module's clock, of the last append seen from this member. */
         public final long timeOfLastAppendNs;
+        /** The member's archive control endpoint ({@code host:port}), or null when the answer did not carry it. */
+        public final String archiveEndpoint;
 
         Member(final int memberId, final long logPosition, final long timeOfLastAppendNs) {
+            this(memberId, logPosition, timeOfLastAppendNs, null);
+        }
+
+        Member(final int memberId, final long logPosition, final long timeOfLastAppendNs,
+               final String archiveEndpoint) {
             this.memberId = memberId;
             this.logPosition = logPosition;
             this.timeOfLastAppendNs = timeOfLastAppendNs;
+            this.archiveEndpoint = archiveEndpoint;
         }
 
         @Override
@@ -76,11 +87,29 @@ public final class ClusterMemberPositions implements AutoCloseable {
         public final long currentTimeNs;
         public final int leaderMemberId;
         public final List<Member> members;
+        /** The member that answered, or -1 when not known. */
+        public final int memberId;
 
         Snapshot(final long currentTimeNs, final int leaderMemberId, final List<Member> members) {
+            this(currentTimeNs, leaderMemberId, -1, members);
+        }
+
+        Snapshot(final long currentTimeNs, final int leaderMemberId, final int memberId,
+                 final List<Member> members) {
             this.currentTimeNs = currentTimeNs;
             this.leaderMemberId = leaderMemberId;
+            this.memberId = memberId;
             this.members = members;
+        }
+
+        /** The entry of {@code id}, or null. */
+        public Member member(final int id) {
+            for (final Member m : members) {
+                if (m.memberId == id) {
+                    return m;
+                }
+            }
+            return null;
         }
     }
 
@@ -180,25 +209,27 @@ public final class ClusterMemberPositions implements AutoCloseable {
 
         final long currentTimeNs = extendedDecoder.currentTimeNs();
         final int leaderMemberId = extendedDecoder.leaderMemberId();
+        final int responderId = extendedDecoder.memberId();
 
         final List<Member> members = new ArrayList<>(3);
         for (final ClusterMembersExtendedResponseDecoder.ActiveMembersDecoder active
                 : extendedDecoder.activeMembers()) {
-            members.add(new Member(active.memberId(), active.logPosition(),
-                active.timeOfLastAppendNs()));
+            final int id = active.memberId();
+            final long logPosition = active.logPosition();
+            final long timeOfLastAppendNs = active.timeOfLastAppendNs();
             // Each group entry ends with five variable-length endpoint strings. SBE only
             // advances to the next entry past the ones that were READ (or skipped); leaving
             // them unread made every entry after the first decode the previous entry's
-            // endpoint bytes as its ids and positions (found 2026-10-25 by the R03 fixture:
-            // member ids 1818321775 / 808857650, positions in the 10^18 range).
+            // endpoint bytes as its ids and positions (member ids 1818321775 / 808857650,
+            // positions in the 10^18 range).
             active.skipIngressEndpoint();
             active.skipConsensusEndpoint();
             active.skipLogEndpoint();
             active.skipCatchupEndpoint();
-            active.skipArchiveEndpoint();
+            members.add(new Member(id, logPosition, timeOfLastAppendNs, active.archiveEndpoint()));
         }
 
-        received = new Snapshot(currentTimeNs, leaderMemberId,
+        received = new Snapshot(currentTimeNs, leaderMemberId, responderId,
             Collections.unmodifiableList(members));
     }
 

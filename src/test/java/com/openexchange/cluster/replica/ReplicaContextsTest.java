@@ -141,6 +141,38 @@ public class ReplicaContextsTest {
     }
 
     /**
+     * {@code TRANSPORT_DRIVER_CLIENT_LIVENESS_MS} and {@code TRANSPORT_DRIVER_PUBLICATION_UNBLOCK_MS}: defaults, both
+     * ends of each range, one step outside, the unblock-above-liveness rule, and the driver context.
+     */
+    @Test
+    public void driverClientTimeoutsAreSettingsWithRanges() {
+        final ReplicaConfig d = base().build();
+        assertEquals(5_000, d.driverClientLivenessMs());
+        assertEquals(10_000, d.driverPublicationUnblockMs());
+        assertEquals(TimeUnit.MILLISECONDS.toNanos(5_000), ReplicaContexts.driver(d).clientLivenessTimeoutNs());
+        assertEquals(TimeUnit.MILLISECONDS.toNanos(10_000), ReplicaContexts.driver(d).publicationUnblockTimeoutNs());
+        final io.aeron.driver.MediaDriver.Context low = ReplicaContexts.driver(
+                base().driverClientLivenessMs(1_000).driverPublicationUnblockMs(2_000).build());
+        assertEquals(TimeUnit.MILLISECONDS.toNanos(1_000), low.clientLivenessTimeoutNs());
+        assertEquals(TimeUnit.MILLISECONDS.toNanos(2_000), low.publicationUnblockTimeoutNs());
+        final io.aeron.driver.MediaDriver.Context high = ReplicaContexts.driver(
+                base().driverClientLivenessMs(600_000).driverPublicationUnblockMs(1_200_000).build());
+        assertEquals(TimeUnit.MILLISECONDS.toNanos(600_000), high.clientLivenessTimeoutNs());
+        assertEquals(TimeUnit.MILLISECONDS.toNanos(1_200_000), high.publicationUnblockTimeoutNs());
+        ReplicaOracleSettingsTest.refused(base().driverClientLivenessMs(999),
+                "TRANSPORT_DRIVER_CLIENT_LIVENESS_MS must be 1000..600000 ms: 999");
+        ReplicaOracleSettingsTest.refused(base().driverClientLivenessMs(600_001).driverPublicationUnblockMs(1_200_000),
+                "TRANSPORT_DRIVER_CLIENT_LIVENESS_MS must be 1000..600000 ms: 600001");
+        ReplicaOracleSettingsTest.refused(base().driverPublicationUnblockMs(1_999).driverClientLivenessMs(1_000),
+                "TRANSPORT_DRIVER_PUBLICATION_UNBLOCK_MS must be 2000..1200000 ms: 1999");
+        ReplicaOracleSettingsTest.refused(base().driverPublicationUnblockMs(1_200_001),
+                "TRANSPORT_DRIVER_PUBLICATION_UNBLOCK_MS must be 2000..1200000 ms: 1200001");
+        ReplicaOracleSettingsTest.refused(base().driverClientLivenessMs(10_000),
+                "TRANSPORT_DRIVER_PUBLICATION_UNBLOCK_MS 10000 must exceed TRANSPORT_DRIVER_CLIENT_LIVENESS_MS 10000"
+                        + " (Aeron refuses the driver otherwise)");
+    }
+
+    /**
      * The local control channel's term length follows {@code REPLICA_DRIVER_TERM_LENGTH} (no
      * 16m literal), and the backup records L on {@code REPLICA_LOG_STREAM_ID}.
      */

@@ -300,4 +300,207 @@ public class RetentionWatermarkTest {
         assertEquals(Long.valueOf(9_500), r.detail.get("slowestMember"));
         assertEquals(9_500, r.position);
     }
+
+    // ---- the floor on a leader: what a member with no fresh report counts as ----
+
+    private static ClusterMemberPositions.Snapshot answerFrom(final int responder, final long currentTimeNs,
+                                                              final ClusterMemberPositions.Member... members)
+            throws Exception {
+        final Constructor<ClusterMemberPositions.Snapshot> c = ClusterMemberPositions.Snapshot.class
+            .getDeclaredConstructor(long.class, int.class, int.class, List.class);
+        c.setAccessible(true);
+        return c.newInstance(currentTimeNs, responder, responder, new ArrayList<>(List.of(members)));
+    }
+
+    /**
+     * The measured failure: a member was caught up at the last snapshot, then died. At the next snapshot it is
+     * silent; it must be held at the position it was last seen at, not skipped.
+     */
+    @Test
+    public void aMemberThatWentSilentIsHeldWhereItWasLastSeen() throws Exception {
+        final RetentionWatermark w = new RetentionWatermark();
+        final long t = TimeUnit.MINUTES.toNanos(10);
+
+        final RetentionWatermark.Result first = w.compute(3_000_000,
+            answerFrom(0, t, member(0, 3_100_000, fresh(t)), member(1, 3_105_056, fresh(t)),
+                member(2, 3_105_056, fresh(t))), -1, -1, NOW, 0, 7);
+        assertEquals(3_000_000, first.position);
+
+        final long later = t + TimeUnit.MINUTES.toNanos(1);
+        final RetentionWatermark.Result r = w.compute(3_327_392,
+            answerFrom(0, later, member(0, 3_400_000, fresh(later)), member(1, 3_105_056, t),
+                member(2, 3_400_000, fresh(later))), -1, -1, NOW + 60_000, 0, 7);
+        assertEquals(3_105_056, r.position);
+        assertEquals("member1", r.limiter);
+    }
+
+    /** Positions noted between two snapshots count: the member died seconds after it was last seen. */
+    @Test
+    public void positionsNotedBetweenSnapshotsAreRemembered() throws Exception {
+        final RetentionWatermark w = new RetentionWatermark();
+        final long t = TimeUnit.MINUTES.toNanos(10);
+        w.observe(answerFrom(0, t, member(0, 5_000, fresh(t)), member(1, 4_200, fresh(t))), 7, NOW);
+        w.observe(null, 7, NOW + 1);
+
+        final long later = t + TimeUnit.MINUTES.toNanos(1);
+        final RetentionWatermark.Result r = w.compute(SNAPSHOT,
+            answerFrom(0, later, member(0, 20_000, fresh(later)), member(1, 4_200, t)), -1, -1, NOW + 60_000, 0, 7);
+        assertEquals(4_200, r.position);
+        assertEquals("member1", r.limiter);
+    }
+
+    /**
+     * A new leader has not heard from a member that was down before the election: Aeron reports it with no
+     * position. It counts at the hold position (the leader's own log start), so nothing more is purged.
+     */
+    @Test
+    public void aMemberNeverHeardFromIsHeldAtTheHoldPosition() throws Exception {
+        final RetentionWatermark w = new RetentionWatermark();
+        final long t = TimeUnit.MINUTES.toNanos(10);
+        // a freshly elected leader stamps every member "now" and resets its position to none
+        final RetentionWatermark.Result r = w.compute(SNAPSHOT,
+            answerFrom(0, t, member(0, 12_000, fresh(t)), member(1, -1, fresh(t)), member(2, 12_000, fresh(t))),
+            -1, -1, NOW, 2_048, 8);
+        assertEquals(2_048, r.position);
+        assertEquals("member1", r.limiter);
+    }
+
+    /** The member that answered is the one purging: its own entry never limits and is never stranded. */
+    @Test
+    public void theAnsweringMemberIsNotAConstraint() throws Exception {
+        final RetentionWatermark w = new RetentionWatermark(GIB, 1_000, 5_000);
+        final long t = TimeUnit.MINUTES.toNanos(10);
+        final RetentionWatermark.Result r = w.compute(SNAPSHOT,
+            answerFrom(0, t, member(0, 100, stale(t)), member(1, SNAPSHOT, fresh(t))), -1, -1, NOW, 0, 7);
+        assertEquals(SNAPSHOT, r.position);
+        final RetentionWatermark.Result r2 = w.compute(SNAPSHOT,
+            answerFrom(0, t, member(0, 100, stale(t)), member(1, SNAPSHOT, fresh(t))), -1, -1, NOW + 60_000, 0, 7);
+        assertTrue(r2.stranded.isEmpty());
+    }
+
+    /** A new leadership term forgets what was remembered: those positions were another leader's view. */
+    @Test
+    public void aNewTermForgetsRememberedPositions() throws Exception {
+        final RetentionWatermark w = new RetentionWatermark();
+        final long t = TimeUnit.MINUTES.toNanos(10);
+        w.observe(answerFrom(0, t, member(0, 9_000, fresh(t)), member(1, 9_000, fresh(t))), 7, NOW);
+
+        final RetentionWatermark.Result r = w.compute(SNAPSHOT,
+            answerFrom(0, t, member(0, 12_000, fresh(t)), member(1, 9_000, stale(t))), -1, -1, NOW + 1, 512, 8);
+        assertEquals("held at the hold position, not at the position of the term before", 512, r.position);
+    }
+
+    /** The bound applies to a member held at the hold position too: it is written off, loudly, and purge proceeds. */
+    @Test
+    public void aMemberThatNeverReportsIsWrittenOffAfterTheBound() throws Exception {
+        final RetentionWatermark w = new RetentionWatermark(GIB, 60_000, 5_000);
+        final long t = TimeUnit.MINUTES.toNanos(10);
+        final RetentionWatermark.Result held = w.compute(SNAPSHOT,
+            answerFrom(0, t, member(0, 12_000, fresh(t)), member(1, -1, fresh(t))), -1, -1, NOW, 0, 8);
+        assertEquals(0, held.position);
+        assertTrue(held.stranded.isEmpty());
+
+        final RetentionWatermark.Result stillHeld = w.compute(SNAPSHOT,
+            answerFrom(0, t, member(0, 12_000, fresh(t)), member(1, -1, fresh(t))), -1, -1, NOW + 59_999, 0, 8);
+        assertEquals(0, stillHeld.position);
+
+        final RetentionWatermark.Result writtenOff = w.compute(SNAPSHOT,
+            answerFrom(0, t, member(0, 12_000, fresh(t)), member(1, -1, fresh(t))), -1, -1, NOW + 60_000, 0, 8);
+        assertEquals(SNAPSHOT, writtenOff.position);
+        assertEquals(List.of(1), writtenOff.stranded);
+
+        // it returns and reports: taken back, and it holds the floor again
+        final RetentionWatermark.Result back = w.compute(SNAPSHOT,
+            answerFrom(0, t, member(0, 12_000, fresh(t)), member(1, 300, fresh(t))), -1, -1, NOW + 61_000, 0, 8);
+        assertEquals(300, back.position);
+        assertTrue(back.stranded.isEmpty());
+    }
+
+    /** The byte half of the bound, with no clock involved. */
+    @Test
+    public void aSilentMemberTooFarBehindIsWrittenOffByBytes() throws Exception {
+        final RetentionWatermark w = new RetentionWatermark(1_000, TimeUnit.DAYS.toMillis(1), 5_000);
+        final long t = TimeUnit.MINUTES.toNanos(10);
+        w.observe(answerFrom(0, t, member(0, 9_500, fresh(t)), member(1, 9_500, fresh(t))), 7, NOW);
+        final RetentionWatermark.Result near = w.compute(10_499,
+            answerFrom(0, t, member(0, 11_000, fresh(t)), member(1, 9_500, stale(t))), -1, -1, NOW + 1, 0, 7);
+        assertEquals(9_500, near.position);
+        final RetentionWatermark.Result far = w.compute(10_500,
+            answerFrom(0, t, member(0, 11_000, fresh(t)), member(1, 9_500, stale(t))), -1, -1, NOW + 2, 0, 7);
+        assertEquals(10_500, far.position);
+        assertEquals(List.of(1), far.stranded);
+    }
+
+    @Test
+    public void theFloorSettingsHaveDefaultsAndRanges() {
+        assertEquals("RETENTION_FLOOR", SnapshotLogPruner.FLOOR_MODE_ENV);
+        assertEquals(SnapshotLogPruner.FloorMode.APPLY, SnapshotLogPruner.parseFloorMode(null, null));
+        assertEquals(SnapshotLogPruner.FloorMode.APPLY, SnapshotLogPruner.parseFloorMode("apply", "report"));
+        assertEquals(SnapshotLogPruner.FloorMode.REPORT, SnapshotLogPruner.parseFloorMode("", "report"));
+        try {
+            SnapshotLogPruner.parseFloorMode("off", null);
+            org.junit.Assert.fail("accepted");
+        } catch (final IllegalArgumentException expected) {
+            assertEquals("RETENTION_FLOOR must be apply or report, got 'off'", expected.getMessage());
+        }
+        assertEquals("RETENTION_MEMBER_WAIT_MS", SnapshotLogPruner.MEMBER_WAIT_MS_ENV);
+        assertEquals(1_800_000L, SnapshotLogPruner.DEFAULT_MEMBER_WAIT_MS);
+        assertEquals(1_000L, SnapshotLogPruner.MIN_MEMBER_WAIT_MS);
+        assertEquals(604_800_000L, SnapshotLogPruner.MAX_MEMBER_WAIT_MS);
+        assertEquals("RETENTION_MEMBER_WAIT_BYTES", SnapshotLogPruner.MEMBER_WAIT_BYTES_ENV);
+        assertEquals(2L << 30, SnapshotLogPruner.DEFAULT_MEMBER_WAIT_BYTES);
+        assertEquals(1L << 20, SnapshotLogPruner.MIN_MEMBER_WAIT_BYTES);
+        assertEquals(1L << 40, SnapshotLogPruner.MAX_MEMBER_WAIT_BYTES);
+    }
+
+    /**
+     * A quiet cluster: every member alive and level with the leader for longer than the bound, no snapshot in
+     * between. One member then stops, traffic resumes and a snapshot follows. It was alive seconds ago, so its wait
+     * starts when it stopped answering, not when its position last changed.
+     */
+    @Test
+    public void aMemberThatDiedSecondsAgoAfterAnIdleStretchIsNotWrittenOff() throws Exception {
+        final RetentionWatermark w = new RetentionWatermark();
+        long ms = NOW;
+        long ns = TimeUnit.MINUTES.toNanos(10);
+        RetentionWatermark.Result r = w.compute(4_000, answerFrom(0, ns, member(0, 5_000, fresh(ns)),
+            member(1, 5_000, fresh(ns)), member(2, 5_000, fresh(ns))), -1, -1, ms, 0, 7);
+        assertEquals(4_000, r.position);
+        for (int i = 0; i < 31 * 12; i++) {
+            ms += 5_000;
+            ns += TimeUnit.SECONDS.toNanos(5);
+            w.observe(answerFrom(0, ns, member(0, 5_000, fresh(ns)), member(1, 5_000, fresh(ns)),
+                member(2, 5_000, fresh(ns))), 7, ms);
+        }
+        final long lastSeenNs = fresh(ns);
+        ms += 10_000;
+        ns += TimeUnit.SECONDS.toNanos(10);
+        r = w.compute(9_000, answerFrom(0, ns, member(0, 9_500, fresh(ns)), member(1, 5_000, lastSeenNs),
+            member(2, 9_500, fresh(ns))), -1, -1, ms, 0, 7);
+        assertTrue("member 1 was alive 10 s ago: " + r, r.stranded.isEmpty());
+        assertEquals(5_000, r.position);
+        assertEquals("member1", r.limiter);
+
+        // from there it gets the whole wait, and no more
+        r = w.compute(9_000, answerFrom(0, ns, member(0, 9_500, fresh(ns)), member(1, 5_000, lastSeenNs),
+            member(2, 9_500, fresh(ns))), -1, -1, ms + RetentionWatermark.DEFAULT_MAX_LAG_MS, 0, 7);
+        assertEquals(List.of(1), r.stranded);
+        assertEquals(9_000, r.position);
+    }
+
+    /** Alive and answering, but behind the leader and not moving: that member is not catching up, the wait runs. */
+    @Test
+    public void anAnsweringMemberThatStaysBehindTheLeaderStillRunsOutOfWait() throws Exception {
+        final RetentionWatermark w = new RetentionWatermark();
+        long ms = NOW;
+        long ns = TimeUnit.MINUTES.toNanos(10);
+        for (int i = 0; i <= 30 * 12; i++) {
+            w.observe(answerFrom(0, ns, member(0, 20_000, fresh(ns)), member(1, 9_000, fresh(ns))), 7, ms);
+            ms += 5_000;
+            ns += TimeUnit.SECONDS.toNanos(5);
+        }
+        final RetentionWatermark.Result r = w.compute(SNAPSHOT,
+            answerFrom(0, ns, member(0, 20_000, fresh(ns)), member(1, 9_000, fresh(ns))), -1, -1, ms, 0, 7);
+        assertEquals(List.of(1), r.stranded);
+    }
 }

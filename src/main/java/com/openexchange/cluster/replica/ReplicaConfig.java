@@ -46,6 +46,25 @@ public final class ReplicaConfig {
     /** A live driver heartbeats once per timer tick (Aeron's default 1 s); a shorter bound reads it as stale. */
     public static final long MIN_DRIVER_DIR_ACTIVE_MS = com.openexchange.cluster.EmbeddedDriverDir.MIN_ACTIVE_MS;
     public static final long MAX_DRIVER_DIR_ACTIVE_MS = com.openexchange.cluster.EmbeddedDriverDir.MAX_ACTIVE_MS;
+    /**
+     * {@code TRANSPORT_DRIVER_CLIENT_LIVENESS_MS}: the embedded driver's client liveness timeout, the same setting
+     * name the members read. It is also the longest whole-process pause the replica survives: past it the replica's
+     * own Aeron clients close themselves. The kit reads no environment here: the host passes the value through
+     * {@link Builder#driverClientLivenessMs}. External mode takes {@code aeron.client.liveness.timeout} from the
+     * aeronmd's properties instead.
+     */
+    public static final String DRIVER_CLIENT_LIVENESS_SETTING = "TRANSPORT_DRIVER_CLIENT_LIVENESS_MS";
+    public static final long DEFAULT_DRIVER_CLIENT_LIVENESS_MS = 5_000;
+    public static final long MIN_DRIVER_CLIENT_LIVENESS_MS = 1_000;
+    public static final long MAX_DRIVER_CLIENT_LIVENESS_MS = 600_000;
+    /**
+     * {@code TRANSPORT_DRIVER_PUBLICATION_UNBLOCK_MS}: the embedded driver's publication unblock timeout. Aeron
+     * refuses a driver whose unblock timeout does not exceed the client liveness, so the two are checked together.
+     */
+    public static final String DRIVER_PUBLICATION_UNBLOCK_SETTING = "TRANSPORT_DRIVER_PUBLICATION_UNBLOCK_MS";
+    public static final long DEFAULT_DRIVER_PUBLICATION_UNBLOCK_MS = 10_000;
+    public static final long MIN_DRIVER_PUBLICATION_UNBLOCK_MS = 2_000;
+    public static final long MAX_DRIVER_PUBLICATION_UNBLOCK_MS = 1_200_000;
     public static final int DEFAULT_SHADOW_BUFFER_MB = 512;
     /** H14: a shadow payload plus its header fits an int-sized buffer, so one image buffer holds at most this. */
     public static final int MAX_SHADOW_BUFFER_MB = 2047;
@@ -146,6 +165,8 @@ public final class ReplicaConfig {
     final int driverMtu;
     final int driverTermLength;
     final long driverDirActiveMs;
+    final long driverClientLivenessMs;
+    final long driverPublicationUnblockMs;
     final int socketBufferLength;
     final int archiveSegmentLength;
     final int shadowBufferMb;
@@ -215,6 +236,8 @@ public final class ReplicaConfig {
         this.driverMtu = b.driverMtu;
         this.driverTermLength = b.driverTermLength;
         this.driverDirActiveMs = b.driverDirActiveMs;
+        this.driverClientLivenessMs = b.driverClientLivenessMs;
+        this.driverPublicationUnblockMs = b.driverPublicationUnblockMs;
         this.socketBufferLength = b.socketBufferLength;
         this.archiveSegmentLength = b.archiveSegmentLength;
         this.shadowBufferMb = b.shadowBufferMb;
@@ -373,6 +396,16 @@ public final class ReplicaConfig {
         return driverDirActiveMs;
     }
 
+    /** {@code TRANSPORT_DRIVER_CLIENT_LIVENESS_MS} (embedded driver only). */
+    public long driverClientLivenessMs() {
+        return driverClientLivenessMs;
+    }
+
+    /** {@code TRANSPORT_DRIVER_PUBLICATION_UNBLOCK_MS} (embedded driver only). */
+    public long driverPublicationUnblockMs() {
+        return driverPublicationUnblockMs;
+    }
+
     /** {@code REPLICA_VERIFY_WAIT_MS}. */
     public long verifyWaitMs() {
         return verifyWaitMs;
@@ -525,6 +558,26 @@ public final class ReplicaConfig {
         return com.openexchange.cluster.EmbeddedDriverDir.rangeRefusal("REPLICA_DRIVER_DIR_ACTIVE_MS", v);
     }
 
+    /**
+     * Null when valid, else the refusal text: each value in its range, and the unblock timeout above the liveness
+     * (Aeron refuses the driver otherwise).
+     */
+    public static String driverClientTimeoutsRefusal(final long livenessMs, final long unblockMs) {
+        if (livenessMs < MIN_DRIVER_CLIENT_LIVENESS_MS || livenessMs > MAX_DRIVER_CLIENT_LIVENESS_MS) {
+            return DRIVER_CLIENT_LIVENESS_SETTING + " must be " + MIN_DRIVER_CLIENT_LIVENESS_MS + ".."
+                    + MAX_DRIVER_CLIENT_LIVENESS_MS + " ms: " + livenessMs;
+        }
+        if (unblockMs < MIN_DRIVER_PUBLICATION_UNBLOCK_MS || unblockMs > MAX_DRIVER_PUBLICATION_UNBLOCK_MS) {
+            return DRIVER_PUBLICATION_UNBLOCK_SETTING + " must be " + MIN_DRIVER_PUBLICATION_UNBLOCK_MS + ".."
+                    + MAX_DRIVER_PUBLICATION_UNBLOCK_MS + " ms: " + unblockMs;
+        }
+        if (unblockMs <= livenessMs) {
+            return DRIVER_PUBLICATION_UNBLOCK_SETTING + " " + unblockMs + " must exceed "
+                    + DRIVER_CLIENT_LIVENESS_SETTING + " " + livenessMs + " (Aeron refuses the driver otherwise)";
+        }
+        return null;
+    }
+
     /** Null when valid, else the refusal text. */
     public static String memberCadenceRefusal(final long v) {
         return v < 0 || v > MAX_MEMBER_CADENCE_MS ? "REPLICA_MEMBER_CADENCE_MS must be 0 (not checked) or 1.."
@@ -559,6 +612,8 @@ public final class ReplicaConfig {
         private int driverMtu = DEFAULT_DRIVER_MTU;
         private int driverTermLength = DEFAULT_DRIVER_TERM_LENGTH;
         private long driverDirActiveMs = DEFAULT_DRIVER_DIR_ACTIVE_MS;
+        private long driverClientLivenessMs = DEFAULT_DRIVER_CLIENT_LIVENESS_MS;
+        private long driverPublicationUnblockMs = DEFAULT_DRIVER_PUBLICATION_UNBLOCK_MS;
         private int socketBufferLength = DEFAULT_SOCKET_BUFFER;
         private int archiveSegmentLength = DEFAULT_ARCHIVE_SEGMENT_LENGTH;
         private int shadowBufferMb = DEFAULT_SHADOW_BUFFER_MB;
@@ -735,6 +790,21 @@ public final class ReplicaConfig {
         /** {@code REPLICA_DRIVER_DIR_ACTIVE_MS} (embedded driver only). */
         public Builder driverDirActiveMs(final long v) {
             this.driverDirActiveMs = v;
+            return this;
+        }
+
+        /** {@code TRANSPORT_DRIVER_CLIENT_LIVENESS_MS} (embedded driver only; 1000..600000, default 5000). */
+        public Builder driverClientLivenessMs(final long v) {
+            this.driverClientLivenessMs = v;
+            return this;
+        }
+
+        /**
+         * {@code TRANSPORT_DRIVER_PUBLICATION_UNBLOCK_MS} (embedded driver only; 2000..1200000, default 10000, above
+         * the client liveness).
+         */
+        public Builder driverPublicationUnblockMs(final long v) {
+            this.driverPublicationUnblockMs = v;
             return this;
         }
 
@@ -1071,6 +1141,11 @@ public final class ReplicaConfig {
             final String dirActive = driverDirActiveRefusal(driverDirActiveMs);
             if (dirActive != null) {
                 throw new IllegalArgumentException(dirActive);
+            }
+            final String clientTimeouts = driverClientTimeoutsRefusal(driverClientLivenessMs,
+                    driverPublicationUnblockMs);
+            if (clientTimeouts != null) {
+                throw new IllegalArgumentException(clientTimeouts);
             }
             Objects.requireNonNull(catchupSndbuf, "REPLICA_CATCHUP_SNDBUF");
             positive("archiveSegmentLength", archiveSegmentLength);

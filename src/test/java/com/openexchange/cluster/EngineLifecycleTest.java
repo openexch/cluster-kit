@@ -254,6 +254,37 @@ public class EngineLifecycleTest {
         assertEquals(EngineLifecycle.DEFAULT_DRIVER_WAIT_MS, 30_000);
     }
 
+    /** A rejoin wait no longer than the peer window would restart the survivor of a quorum loss once. */
+    @Test
+    public void theRejoinWaitMustExceedThePeerWindow() {
+        assertEquals(null, EngineLifecycle.rejoinSettingsRefusal(EngineLifecycle.DEFAULT_REJOIN_WAIT_MS,
+                EngineLifecycle.DEFAULT_REJOIN_PEER_WINDOW_MS));
+        assertEquals(null, EngineLifecycle.rejoinSettingsRefusal(10_001, 10_000));
+        for (final long wait : new long[] {1, 5_000, 10_000}) {
+            final String refusal = EngineLifecycle.rejoinSettingsRefusal(wait, 10_000);
+            assertTrue(String.valueOf(refusal), refusal != null
+                    && refusal.startsWith("ENGINE_REJOIN_WAIT_MS (" + wait + " ms) must exceed"
+                    + " ENGINE_REJOIN_PEER_WINDOW_MS (10000 ms)"));
+        }
+        final String wait = System.getProperty(EngineLifecycle.REJOIN_WAIT_PROP);
+        System.setProperty(EngineLifecycle.REJOIN_WAIT_PROP, "5000");
+        try {
+            if (System.getenv(EngineLifecycle.REJOIN_WAIT_ENV) == null
+                    && System.getenv(EngineLifecycle.REJOIN_PEER_WINDOW_ENV) == null
+                    && System.getProperty(EngineLifecycle.REJOIN_PEER_WINDOW_PROP) == null) {
+                final IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                        () -> EngineLifecycle.install("test-node", line -> { }));
+                assertTrue(e.getMessage(), e.getMessage().startsWith("ENGINE_REJOIN_WAIT_MS (5000 ms) must exceed"));
+            }
+        } finally {
+            if (wait == null) {
+                System.clearProperty(EngineLifecycle.REJOIN_WAIT_PROP);
+            } else {
+                System.setProperty(EngineLifecycle.REJOIN_WAIT_PROP, wait);
+            }
+        }
+    }
+
     @Test
     public void mainThreadInterruptIsAFaultNotASignalStop() throws Exception {
         final EngineLifecycle lf = lifecycle(1_000, 60_000);

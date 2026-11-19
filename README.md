@@ -87,7 +87,106 @@ system property:
 | `ENGINE_FATAL_EXIT_GRACE_MS` / `-Dengine.fatal.exit.grace.ms` | `EngineLifecycle` | `5000` |
 | `TRANSPORT_EXTERNAL_DRIVER_TIMEOUT_MS` / `-Dtransport.external.driver.timeout.ms` | `EngineLifecycle` | `30000` |
 | `ENGINE_QUORUM_WAIT_MS` / `-Dengine.quorum.wait.ms` | `EngineLifecycle`, `QuorumWatchdog` | `120000` |
-| `ENGINE_REJOIN_WAIT_MS` / `-Dengine.rejoin.wait.ms` | `EngineLifecycle`, `RejoinWatchdog` | `60000`. After this process has known a leader, a stretch without a leader (election state INIT, CANVASS, NOMINATE, CANDIDATE_BALLOT or FOLLOWER_BALLOT) that lasts this long logs one CRITICAL line and exits 1 for a supervised restart. Size it above the election timeouts. |
+| `ENGINE_REJOIN_WAIT_MS` / `-Dengine.rejoin.wait.ms` | `EngineLifecycle`, `RejoinWatchdog` | `60000`. After this process has known a leader, a stretch without a leader (election state INIT, CANVASS, NOMINATE, CANDIDATE_BALLOT or FOLLOWER_BALLOT) that lasts this long **while a quorum of members is reachable** logs one CRITICAL line and exits 1 for a supervised restart. Size it above the election timeouts. It must exceed `ENGINE_REJOIN_PEER_WINDOW_MS`, or the boot is refused. |
+| `ENGINE_REJOIN_PEER_WINDOW_MS` / `-Dengine.rejoin.peer.window.ms` | `EngineLifecycle`, `RejoinWatchdog`, `PeerReachability` | `10000` (1000..600000). How long a gap in the evidence of a reachable quorum is bridged before the rejoin watchdog's clock is cleared. Set it no shorter than the media driver's publication connection timeout. See [Rejoin and peer reachability](#rejoin-and-peer-reachability). |
+| `ENGINE_CATCHUP_REFUSALS` / `-Dengine.catchup.refusals` | `EngineLifecycle`, `CatchupWatchdog` | `3` (1..1000). Failed catch-up attempts in a row after which a member reads the leader's log start; a member below it exits 1. See [Log retention](#log-retention-and-a-member-that-was-away). |
+| `ENGINE_CATCHUP_REFUSAL_WAIT_MS` / `-Dengine.catchup.refusal.wait.ms` | `EngineLifecycle`, `CatchupWatchdog` | `30000` (1000..3600000). The time bound next to the count: catch-up attempts failing for this long trigger the same read. |
+| `RETENTION_FLOOR` / `-Dretention.floor` | `SnapshotLogPruner` | `apply`. `report` computes and logs the retention floor without applying it. |
+| `RETENTION_MEMBER_WAIT_MS` / `-Dretention.member.wait.ms` | `SnapshotLogPruner`, `RetentionWatermark` | `1800000` (1000..604800000). How long the retention floor waits for a member that does not move before the purge proceeds without it. |
+| `RETENTION_MEMBER_WAIT_BYTES` / `-Dretention.member.wait.bytes` | `SnapshotLogPruner`, `RetentionWatermark` | `2147483648` (1048576..1099511627776). How far behind the newest snapshot a member may be before the floor stops waiting for it. |
+| `RETENTION_PROBE_TIMEOUT_MS` / `-Dretention.probe.timeout.ms` | `SnapshotLogPruner`, `CatchupWatchdog`, `LogExtent` | `5000` (100..60000). How long one read of the leader's log start from the leader's archive may take. |
+
+A value outside its range refuses the start: `EngineLifecycle.install` parses
+every row above before any thread starts.
+
+One more setting is named by the kit and passed in by the host, because the kit
+reads no environment for the replica: `TRANSPORT_DRIVER_CLIENT_LIVENESS_MS`
+(default `5000`, 1000..600000) and `TRANSPORT_DRIVER_PUBLICATION_UNBLOCK_MS`
+(default `10000`, 2000..1200000, above the liveness) are the embedded replica
+driver's client liveness and publication unblock timeouts
+(`ReplicaConfig.Builder.driverClientLivenessMs`, `driverPublicationUnblockMs`;
+`ReplicaConfig.driverClientTimeoutsRefusal` is the range check). They are the
+same names the members read for their own embedded driver. With an external
+driver the aeronmd's `aeron.client.liveness.timeout` and
+`aeron.publication.unblock.timeout` apply instead.
+
+### Log retention and a member that was away
+
+Every member purges its own log after a snapshot (`SnapshotLogPruner`). A
+member that is down while the others snapshot and purge comes back at its old
+position and asks the leader for the log from there, so no member may purge
+past what a member still needs. The rule is the same whoever leads:
+
+- The **leader** holds its purge at the lowest position of any member. It asks
+  its own consensus module every few seconds and remembers what it hears, so a
+  member that goes silent is held at the position the leader last saw.
+- A **follower** never purges past the leader's log start position, which it
+  reads from the leader's archive (the archive endpoint of the cluster member
+  string; the response comes back to a free port on the follower's own archive
+  host). That position is in the archive catalog on disk, not in one node's
+  memory.
+- A **new leader** therefore starts with a log that reaches at least as far
+  back as the old leader's. A member it has not heard from in its term counts
+  at the new leader's own log start: nothing more is purged until that member
+  reports or the bound passes.
+
+The floor does not hold the log for ever. A member that has held it for
+`RETENTION_MEMBER_WAIT_MS`, or that is `RETENTION_MEMBER_WAIT_BYTES` behind the
+newest snapshot, is written off: the leader logs
+`[RETENTION] CRITICAL: member N STRANDED` and purges past it. The wait runs
+from the last time the member's position moved, or the last time it answered
+while level with the leader: on a quiet log a member that is alive and has
+everything is not waiting, and its wait starts when it stops answering. A
+node that cannot work out its floor (its consensus module does not answer, a
+follower cannot reach the leader's archive) holds its whole log for the same
+wait, then logs a CRITICAL line and purges to its own snapshot again; while
+the floor is unknown the pruner's `lastError()` says so. The time half of
+the bound runs on the local clock and restarts when leadership moves; the byte
+half needs no clock.
+
+A member that returns below the leader's log start cannot catch up: the leader
+refuses every catch-up replay and the member times out and tries again. After
+`ENGINE_CATCHUP_REFUSALS` failed attempts in a row (or
+`ENGINE_CATCHUP_REFUSAL_WAIT_MS` of failing) the member's `CatchupWatchdog`
+reads its own log position and the leader's log start. A member with no log
+recording at all (its directories were wiped) counts at its newest snapshot's
+position, or 0. Below the log start it logs one line and exits 1:
+
+```
+CRITICAL catch-up watchdog: 3 catch-up attempt(s) in a row failed over 2006 ms: this member's log position 16256 is below the log start position 393216 of the leader (member 2). ...
+```
+
+A supervisor that restarts it gets the same exit again: the member is loud
+until it is reseeded. When the positions say the log is there, or the leader's
+archive cannot be read, the member does not exit; it logs what it found and
+checks again after the same number of further failures.
+
+Both the pruner and the watchdogs open their own Aeron clients on the member's
+driver directory, so they behave the same with an embedded driver and an
+external one. The pruner takes that directory from the live Aeron client of
+the archive context it is given, not from the context's directory name.
+
+### Rejoin and peer reachability
+
+The rejoin watchdog restarts a member whose election is stuck although its
+peers are up. A restart cannot repair a quorum loss, and the survivor of one
+may be the restore source of a recovering peer, so the watchdog trips only
+with evidence that a quorum of members is reachable.
+
+The evidence is outbound: the member holds one idle publication of its own to
+every peer's consensus endpoint, and a peer counts as reachable while its
+driver answers that publication with status messages. The member counts
+itself, so in a three member cluster one answering peer makes a quorum. The
+wait (`ENGINE_REJOIN_WAIT_MS`) is counted over the time the quorum has been
+reachable: peers that return after a long outage get a full wait to finish the
+election. A gap in the evidence shorter than `ENGINE_REJOIN_PEER_WINDOW_MS`
+does not restart the clock, and time after the last positive observation is
+never counted. A peer that just died still reads reachable until the media
+driver's publication connection timeout passes (Aeron's default is 5 s): keep
+the window at or above that timeout. `ENGINE_REJOIN_WAIT_MS` must exceed the
+window, and a pair that does not refuses the boot.
+While no quorum is reachable the member stays up, not ready, and says so once
+per election when the wait passes.
 
 Other settings are read by the engines and validated by the kit: the auth key
 table and client credential (names per engine, see [docs/auth.md](docs/auth.md)),

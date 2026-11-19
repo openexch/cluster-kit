@@ -89,7 +89,10 @@ public final class RetentionWatermark {
         }
     }
 
-    /** How long one member has been holding the watermark down, and at what position. */
+    /**
+     * The last position one member was seen at, and since when it has neither moved nor been seen alive and level
+     * with the answering member: the start of its wait.
+     */
     private static final class Laggard {
         long sinceMs;
         long position;
@@ -104,8 +107,13 @@ public final class RetentionWatermark {
     private final long maxLagMs;
     private final long staleAppendMs;
 
+    /**
+     * The last position each member was seen at, and since when it has been there. A fresh answer updates it; a
+     * member that goes silent keeps the entry, so the floor holds at the last position this leader really saw.
+     */
     private final Map<Integer, Laggard> laggards = new HashMap<>();
     private final Map<Integer, Boolean> stranded = new HashMap<>();
+    private long leadershipTermId = Long.MIN_VALUE;
 
     public RetentionWatermark() {
         this(DEFAULT_MAX_LAG_BYTES, DEFAULT_MAX_LAG_MS, DEFAULT_STALE_APPEND_MS);
@@ -119,7 +127,8 @@ public final class RetentionWatermark {
     }
 
     /**
-     * Compute the watermark for one cluster.
+     * Compute the watermark for one cluster, parking a member that has never reported at the snapshot (it gets the
+     * whole bound from there and holds nothing until the snapshot moves on).
      *
      * @param snapshotPosition the ceiling. Recovery on each node needs everything above its
      *                         newest snapshot, so nothing above it is reclaimable whatever
@@ -135,6 +144,56 @@ public final class RetentionWatermark {
     public Result compute(final long snapshotPosition,
                           final ClusterMemberPositions.Snapshot positions,
                           final long s3Verified, final long backupPosition, final long nowMs) {
+        return compute(snapshotPosition, positions, s3Verified, backupPosition, nowMs, snapshotPosition, 0);
+    }
+
+    /**
+     * Remember what a fresh answer says, between two computations. A member that stops reporting is then held at a
+     * position this leader saw moments before it went silent, not at one from the last snapshot.
+     *
+     * @param leadershipTermId the term the answer belongs to; a new term forgets every remembered position (they
+     *                         were another leader's log, or this node's view from an earlier term)
+     */
+    public void observe(final ClusterMemberPositions.Snapshot positions, final long leadershipTermId,
+                        final long nowMs) {
+        onTerm(leadershipTermId);
+        if (positions == null) {
+            return;
+        }
+        final long head = headOf(positions);
+        for (final ClusterMemberPositions.Member member : positions.members) {
+            if (member.memberId != positions.memberId && isFresh(member, positions.currentTimeNs)) {
+                remember(member, head, nowMs);
+            }
+        }
+    }
+
+    /** The log position of the member that answered (the leader's own), or -1 when the answer does not carry it. */
+    private static long headOf(final ClusterMemberPositions.Snapshot positions) {
+        final ClusterMemberPositions.Member self = positions.member(positions.memberId);
+        return self == null ? -1 : self.logPosition;
+    }
+
+    /**
+     * Compute the watermark for one cluster on its leader.
+     *
+     * <p>Every member counts, whether it answers or not. A member heard from recently counts at the position it
+     * reports. A member that has gone silent counts at the last position this leader saw it at in this leadership
+     * term. A member this leader has never heard from in this term (it was already down when this node was elected)
+     * counts at {@code holdPosition}: this node's own log start, which holds everything this node still has. Each
+     * of them is subject to the bound: a member that has held the watermark for {@code maxLagMs}, or that is
+     * {@code maxLagBytes} behind the snapshot, is written off and reported as stranded. The time runs from the last
+     * moment the member moved, or was heard from while level with this leader or past the snapshot: a member that
+     * was alive and keeping up through a quiet stretch and then stops gets the whole wait from when it stopped.</p>
+     *
+     * @param holdPosition     what a member with no known position counts as
+     * @param leadershipTermId the current term; a change forgets the positions remembered in the term before
+     */
+    public Result compute(final long snapshotPosition,
+                          final ClusterMemberPositions.Snapshot positions,
+                          final long s3Verified, final long backupPosition, final long nowMs,
+                          final long holdPosition, final long leadershipTermId) {
+        onTerm(leadershipTermId);
 
         final Map<String, Long> detail = new LinkedHashMap<>();
         detail.put("snapshot", snapshotPosition);
@@ -164,7 +223,8 @@ public final class RetentionWatermark {
             // No answer. Every member we have been tracking still counts against
             // us at its last known position; the bound decides when to give up.
             for (final Map.Entry<Integer, Laggard> e : laggards.entrySet()) {
-                if (isStrandedByBound(e.getKey(), e.getValue(), snapshotPosition, nowMs)) {
+                if (e.getValue().position >= snapshotPosition
+                    || isStrandedByBound(e.getKey(), e.getValue(), snapshotPosition, nowMs)) {
                     continue;
                 }
                 if (slowest < 0 || e.getValue().position < slowest) {
@@ -173,49 +233,45 @@ public final class RetentionWatermark {
                 }
             }
         } else {
+            final long head = headOf(positions);
             for (final ClusterMemberPositions.Member member : positions.members) {
+                if (member.memberId == positions.memberId) {
+                    continue; // the member that answered: its own log is what is being purged
+                }
                 final boolean trusted = isFresh(member, positions.currentTimeNs);
-
-                if (!trusted) {
-                    // Unreadable is the dangerous case: it may be far behind and we
-                    // cannot see how far. Hold at what it last reported and let the
-                    // bound decide when to write it off.
-                    final Laggard known = laggards.get(member.memberId);
-                    if (known == null) {
-                        // Never seen it report: start its clock now, at the snapshot,
-                        // so it gets the whole bound before being given up on.
-                        laggards.put(member.memberId, new Laggard(nowMs, snapshotPosition));
-                    } else if (!isStrandedByBound(member.memberId, known, snapshotPosition, nowMs)
-                        && (slowest < 0 || known.position < slowest)) {
-                        slowest = known.position;
-                        slowestMember = member.memberId;
+                final Laggard laggard;
+                if (trusted) {
+                    laggard = remember(member, head, nowMs);
+                    if (member.logPosition >= snapshotPosition) {
+                        // Caught up. Its clock resets, so a member that falls behind
+                        // repeatedly gets the full bound each time instead of
+                        // accumulating toward being declared stranded.
+                        laggard.sinceMs = nowMs;
+                        stranded.remove(member.memberId);
+                        continue;
                     }
-                    continue;
+                } else {
+                    // Unreadable is the dangerous case: it may be far behind and we
+                    // cannot see how far. Hold at where it was last seen and let the
+                    // bound decide when to write it off.
+                    Laggard known = laggards.get(member.memberId);
+                    if (known == null) {
+                        // Never seen it report in this term: start its clock now.
+                        known = new Laggard(nowMs, holdPosition);
+                        laggards.put(member.memberId, known);
+                    }
+                    laggard = known;
+                    if (laggard.position >= snapshotPosition) {
+                        continue;
+                    }
                 }
 
-                if (member.logPosition >= snapshotPosition) {
-                    // Caught up. Its clock resets, so a member that falls behind
-                    // repeatedly gets the full bound each time instead of
-                    // accumulating toward being declared stranded.
-                    laggards.remove(member.memberId);
-                    stranded.remove(member.memberId);
-                    continue;
-                }
-
-                Laggard laggard = laggards.get(member.memberId);
-                if (laggard == null || laggard.position != member.logPosition) {
-                    // Progress, even slow progress, restarts the clock: the bound is
-                    // for a member that is not catching up, not one that is behind.
-                    laggard = new Laggard(nowMs, member.logPosition);
-                    laggards.put(member.memberId, laggard);
-                    stranded.remove(member.memberId);
-                }
-
+                detail.put("member" + member.memberId, laggard.position);
                 if (isStrandedByBound(member.memberId, laggard, snapshotPosition, nowMs)) {
                     continue;
                 }
-                if (slowest < 0 || member.logPosition < slowest) {
-                    slowest = member.logPosition;
+                if (slowest < 0 || laggard.position < slowest) {
+                    slowest = laggard.position;
                     slowestMember = member.memberId;
                 }
             }
@@ -237,12 +293,42 @@ public final class RetentionWatermark {
         return new Result(position, limiter, detail, strandedMembers);
     }
 
+    private void onTerm(final long termId) {
+        if (termId != leadershipTermId) {
+            leadershipTermId = termId;
+            laggards.clear();
+            stranded.clear();
+        }
+    }
+
+    /**
+     * Record a fresh report. Progress, even slow progress, restarts the clock: the bound is for a member that is
+     * not catching up, not one that is behind. So does a report from a member that is level with the answering
+     * member ({@code head}): on a quiet log nobody's position moves, and a member that is alive and has everything
+     * is not waiting for anything. Its wait starts when it stops answering or falls behind. A member that answers
+     * but stays behind the head without moving keeps its clock: that one is not catching up.
+     *
+     * @param head the answering member's own log position, or -1 when not known
+     */
+    private Laggard remember(final ClusterMemberPositions.Member member, final long head, final long nowMs) {
+        Laggard laggard = laggards.get(member.memberId);
+        if (laggard == null || laggard.position != member.logPosition) {
+            laggard = new Laggard(nowMs, member.logPosition);
+            laggards.put(member.memberId, laggard);
+            stranded.remove(member.memberId);
+        } else if (head >= 0 && member.logPosition >= head) {
+            laggard.sinceMs = nowMs;
+        }
+        return laggard;
+    }
+
     /**
      * A position is only current if the leader has heard from that member recently.
      * Both times come from the same answer, so this never compares two clocks.
      */
     private boolean isFresh(final ClusterMemberPositions.Member member, final long currentTimeNs) {
-        if (member.timeOfLastAppendNs <= 0) {
+        if (member.timeOfLastAppendNs <= 0 || member.logPosition < 0) {
+            // no position: a new leader resets every member to "none" until it hears an append position from it
             return false;
         }
         final long ageMs = TimeUnit.NANOSECONDS.toMillis(currentTimeNs - member.timeOfLastAppendNs);

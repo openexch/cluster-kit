@@ -226,4 +226,175 @@ public class RejoinWatchdogTest {
         lf.finish();
         assertEquals(List.of(1), halts);
     }
+
+    // ---- the reachability gate ----
+
+    private final java.util.concurrent.atomic.AtomicBoolean quorum = new java.util.concurrent.atomic.AtomicBoolean();
+    private static final long WINDOW_MS = 200;
+    private static final long WINDOW_NS = TimeUnit.MILLISECONDS.toNanos(WINDOW_MS);
+
+    private RejoinWatchdog gated(final EngineLifecycle lf) {
+        return new RejoinWatchdog(lf, state::get, elections::get, WAIT_MS, quorum::get, WINDOW_MS, null);
+    }
+
+    private RejoinWatchdog gatedInCanvass(final EngineLifecycle lf) {
+        final RejoinWatchdog w = gated(lf);
+        state.set(ElectionState.CLOSED.code());
+        assertFalse(w.poll(0)); // CLOSED: a leader is known
+        elections.set(2);
+        state.set(ElectionState.CANVASS.code());
+        return w;
+    }
+
+    /** Two of three members gone: no evidence of a reachable quorum, so the watchdog never trips. */
+    @Test
+    public void aGenuineQuorumLossNeverTrips() {
+        final EngineLifecycle lf = lifecycle();
+        final RejoinWatchdog w = gatedInCanvass(lf);
+        quorum.set(false);
+        for (long t = 0; t <= 100 * WAIT_NS; t += WAIT_NS / 4) {
+            assertFalse("t=" + t, w.poll(t));
+        }
+        assertFalse(lf.stopRequested());
+        assertFalse(w.tripped());
+        assertEquals(0, criticalLines());
+        assertEquals("said once per stretch: " + logs, 1, logs.stream()
+                .filter(l -> l.contains("no quorum of members is reachable") && l.contains("not exiting")).count());
+    }
+
+    /** The stuck election with reachable peers (the wedge): trips one wait after the election opened. */
+    @Test
+    public void aStuckElectionWithAReachableQuorumTrips() {
+        final EngineLifecycle lf = lifecycle();
+        final RejoinWatchdog w = gatedInCanvass(lf);
+        quorum.set(true);
+        assertFalse(w.poll(0));
+        assertFalse(w.poll(WAIT_NS - 1));
+        assertTrue(w.poll(WAIT_NS));
+        final String critical = logs.stream().filter(l -> l.contains("CRITICAL")).findFirst().orElseThrow();
+        assertTrue(critical, critical.contains("with a quorum of members reachable for 1000 ms"));
+    }
+
+    /** Peers that return after a long quorum loss get a full wait to finish the election. */
+    @Test
+    public void theWaitStartsWhenTheQuorumBecomesReachable() {
+        final EngineLifecycle lf = lifecycle();
+        final RejoinWatchdog w = gatedInCanvass(lf);
+        quorum.set(false);
+        assertFalse(w.poll(0));
+        assertFalse(w.poll(10 * WAIT_NS));
+        quorum.set(true);
+        final long back = 10 * WAIT_NS + 1;
+        assertFalse("the election has been open for ten waits, the quorum reachable for none", w.poll(back));
+        assertFalse(w.poll(back + WAIT_NS - 1));
+        assertFalse(lf.stopRequested());
+        assertTrue(w.poll(back + WAIT_NS));
+    }
+
+    /** One missed answer inside the window keeps the clock; evidence older than the window clears it. */
+    @Test
+    public void evidenceCountsForTheWindowAndNoLonger() {
+        final EngineLifecycle lf = lifecycle();
+        final RejoinWatchdog w = gatedInCanvass(lf);
+        quorum.set(true);
+        assertFalse(w.poll(0));
+        quorum.set(false);
+        assertFalse(w.poll(WINDOW_NS)); // the last evidence is exactly one window old: still counts
+        quorum.set(true);
+        assertFalse(w.poll(WAIT_NS - 1));
+        assertTrue("a blip inside the window did not restart the clock", w.poll(WAIT_NS));
+
+        final EngineLifecycle lf2 = lifecycle();
+        final RejoinWatchdog w2 = gatedInCanvass(lf2);
+        quorum.set(true);
+        assertFalse(w2.poll(0));
+        quorum.set(false);
+        assertFalse(w2.poll(WINDOW_NS + 1)); // older than the window: the peers are gone
+        quorum.set(true);
+        final long back = WAIT_NS / 2;
+        assertFalse(w2.poll(back));
+        assertFalse("the clock restarted when the quorum came back", w2.poll(WAIT_NS + 1));
+        assertFalse(w2.poll(back + WAIT_NS - 1));
+        assertTrue(w2.poll(back + WAIT_NS));
+    }
+
+    /** A new election stretch asks again: a closed election clears the evidence and the quorum-loss line. */
+    @Test
+    public void aClosedElectionClearsTheEvidence() {
+        final EngineLifecycle lf = lifecycle();
+        final RejoinWatchdog w = gatedInCanvass(lf);
+        quorum.set(true);
+        assertFalse(w.poll(0));
+        state.set(ElectionState.CLOSED.code());
+        assertFalse(w.poll(WAIT_NS / 2));
+        elections.set(3);
+        state.set(ElectionState.CANVASS.code());
+        quorum.set(false);
+        assertFalse(w.poll(WAIT_NS));
+        assertFalse(w.poll(3 * WAIT_NS));
+        assertFalse(lf.stopRequested());
+    }
+
+    /** A check that throws is no evidence; stop closes the probe behind the supplier. */
+    @Test
+    public void aFailingCheckIsNoEvidenceAndStopClosesTheProbe() {
+        final EngineLifecycle lf = lifecycle();
+        final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
+        final RejoinWatchdog w = new RejoinWatchdog(lf, state::get, elections::get, WAIT_MS, () -> {
+            throw new IllegalStateException("probe broken");
+        }, WINDOW_MS, () -> closed.set(true));
+        assertFalse(w.poll(0));
+        elections.set(2);
+        state.set(ElectionState.CANVASS.code());
+        assertFalse(w.poll(1));
+        assertFalse(w.poll(5 * WAIT_NS));
+        assertFalse(lf.stopRequested());
+        assertTrue(logs.toString(), logs.stream().anyMatch(l -> l.contains("peer reachability check failed")));
+        w.stop(10);
+        assertTrue(closed.get());
+    }
+
+    @Test
+    public void thePeerWindowIsARangedSetting() {
+        assertEquals("ENGINE_REJOIN_PEER_WINDOW_MS", EngineLifecycle.REJOIN_PEER_WINDOW_ENV);
+        assertEquals("engine.rejoin.peer.window.ms", EngineLifecycle.REJOIN_PEER_WINDOW_PROP);
+        assertEquals(10_000L, EngineLifecycle.DEFAULT_REJOIN_PEER_WINDOW_MS);
+        assertEquals(10_000L, EngineLifecycle.parseRanged("E", null, "p", null, 10_000, 1_000, 600_000));
+        assertEquals(1_000L, EngineLifecycle.parseRanged("E", "1000", "p", null, 10_000, 1_000, 600_000));
+        assertEquals(600_000L, EngineLifecycle.parseRanged("E", "", "p", "600000", 10_000, 1_000, 600_000));
+        for (final String bad : new String[] {"999", "600001", "0", "-1", "abc"}) {
+            try {
+                EngineLifecycle.parseRanged("ENGINE_REJOIN_PEER_WINDOW_MS", bad, "p", null, 10_000, 1_000, 600_000);
+                fail("accepted " + bad);
+            } catch (final IllegalArgumentException expected) {
+                assertTrue(expected.getMessage(), expected.getMessage().contains("ENGINE_REJOIN_PEER_WINDOW_MS")
+                        && expected.getMessage().contains("1000..600000"));
+            }
+        }
+    }
+
+    /**
+     * A genuine quorum loss with the probe already open: the peers still read reachable for a moment after they
+     * died, then never again. Time after the last positive answer is not evidence, whatever the window: with a wait
+     * shorter than the window the watchdog still does not trip.
+     */
+    @Test
+    public void unconfirmedTimeInsideTheWindowDoesNotCountTowardTheTrip() {
+        final EngineLifecycle lf = lifecycle();
+        final RejoinWatchdog w = new RejoinWatchdog(lf, state::get, elections::get, 5_000, quorum::get,
+                EngineLifecycle.DEFAULT_REJOIN_PEER_WINDOW_MS, null);
+        assertFalse(w.poll(0));
+        elections.set(2);
+        state.set(ElectionState.CANVASS.code());
+        quorum.set(true);
+        assertFalse(w.poll(0));
+        assertFalse(w.poll(TimeUnit.MILLISECONDS.toNanos(1_000)));
+        quorum.set(false); // the peers are gone for good
+        for (long ms = 1_050; ms <= 60_000; ms += 50) {
+            assertFalse("tripped at " + ms + " ms during a quorum loss: " + logs,
+                    w.poll(TimeUnit.MILLISECONDS.toNanos(ms)));
+        }
+        assertFalse(lf.stopRequested());
+        assertEquals(0, criticalLines());
+    }
 }

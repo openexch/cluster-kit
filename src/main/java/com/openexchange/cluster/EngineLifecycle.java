@@ -47,7 +47,11 @@ import java.util.function.IntConsumer;
  *   <li>No leader ever known: the consensus module's election stays in a no-leader state for the
  *       quorum wait after its launch; {@link QuorumWatchdog} records a fatal fault, exit 1.</li>
  *   <li>No rejoin after a leader was known: one election stays open for the rejoin wait and is in a no-leader
- *       state (or INIT); {@link RejoinWatchdog} logs one CRITICAL line and records a fatal fault, exit 1.</li>
+ *       state (or INIT) while a quorum of members is reachable; {@link RejoinWatchdog} logs one CRITICAL line and
+ *       records a fatal fault, exit 1. During a genuine quorum loss it does not trip.</li>
+ *   <li>No catch-up possible: catch-up attempts keep failing and this member's log position is below the leader's
+ *       log start; {@link CatchupWatchdog} logs one CRITICAL line naming both positions and records a fatal fault,
+ *       exit 1.</li>
  * </ul>
  *
  * <p>This replaces Agrona's {@code ShutdownSignalBarrier} in the engines. That barrier's static JVM hook waits,
@@ -87,6 +91,35 @@ public final class EngineLifecycle {
     public static final String REJOIN_WAIT_ENV = "ENGINE_REJOIN_WAIT_MS";
     public static final String REJOIN_WAIT_PROP = "engine.rejoin.wait.ms";
     public static final long DEFAULT_REJOIN_WAIT_MS = 60_000;
+    /**
+     * How long one observation of a reachable quorum keeps counting as evidence for the {@link RejoinWatchdog}
+     * (1000..600000). The watchdog trips only while such evidence holds; a genuine quorum loss never trips it.
+     * Set it no shorter than the media driver's publication connection timeout (a peer that died reads reachable
+     * for that long); {@link #REJOIN_WAIT_ENV} must exceed it ({@link #rejoinSettingsRefusal}).
+     */
+    public static final String REJOIN_PEER_WINDOW_ENV = "ENGINE_REJOIN_PEER_WINDOW_MS";
+    public static final String REJOIN_PEER_WINDOW_PROP = "engine.rejoin.peer.window.ms";
+    public static final long DEFAULT_REJOIN_PEER_WINDOW_MS = 10_000;
+    public static final long MIN_REJOIN_PEER_WINDOW_MS = 1_000;
+    public static final long MAX_REJOIN_PEER_WINDOW_MS = 600_000;
+    /**
+     * How many catch-up attempts in a row may fail before the {@link CatchupWatchdog} reads the leader's log start
+     * (1..1000): a member whose own log position is below it can never catch up and exits 1.
+     */
+    public static final String CATCHUP_REFUSALS_ENV = "ENGINE_CATCHUP_REFUSALS";
+    public static final String CATCHUP_REFUSALS_PROP = "engine.catchup.refusals";
+    public static final long DEFAULT_CATCHUP_REFUSALS = 3;
+    public static final long MIN_CATCHUP_REFUSALS = 1;
+    public static final long MAX_CATCHUP_REFUSALS = 1_000;
+    /**
+     * The time bound next to the count (1000..3600000): a member that has been failing its catch-up for this long
+     * reads the leader's log start even when fewer attempts were counted.
+     */
+    public static final String CATCHUP_REFUSAL_WAIT_ENV = "ENGINE_CATCHUP_REFUSAL_WAIT_MS";
+    public static final String CATCHUP_REFUSAL_WAIT_PROP = "engine.catchup.refusal.wait.ms";
+    public static final long DEFAULT_CATCHUP_REFUSAL_WAIT_MS = 30_000;
+    public static final long MIN_CATCHUP_REFUSAL_WAIT_MS = 1_000;
+    public static final long MAX_CATCHUP_REFUSAL_WAIT_MS = 3_600_000;
 
     /** Status of a fatal fault (driver death, unexpected agent termination, startup failure). */
     public static final int EXIT_FATAL = 1;
@@ -114,6 +147,9 @@ public final class EngineLifecycle {
     private final long fatalExitGraceMs;
     private final long quorumWaitMs;
     private final long rejoinWaitMs;
+    private final long rejoinPeerWindowMs;
+    private final long catchupRefusals;
+    private final long catchupRefusalWaitMs;
     private final AtomicReference<Stop> stop = new AtomicReference<>(RUNNING);
     private final CountDownLatch stopLatch = new CountDownLatch(1);
     private final CountDownLatch closedLatch = new CountDownLatch(1);
@@ -140,9 +176,21 @@ public final class EngineLifecycle {
     EngineLifecycle(final String name, final Consumer<String> log, final IntConsumer halter,
                     final long shutdownTimeoutMs, final long fatalExitGraceMs, final long quorumWaitMs,
                     final long rejoinWaitMs) {
-        if (shutdownTimeoutMs <= 0 || fatalExitGraceMs <= 0 || quorumWaitMs <= 0 || rejoinWaitMs <= 0) {
+        this(name, log, halter, shutdownTimeoutMs, fatalExitGraceMs, quorumWaitMs, rejoinWaitMs,
+                DEFAULT_REJOIN_PEER_WINDOW_MS, DEFAULT_CATCHUP_REFUSALS, DEFAULT_CATCHUP_REFUSAL_WAIT_MS);
+    }
+
+    EngineLifecycle(final String name, final Consumer<String> log, final IntConsumer halter,
+                    final long shutdownTimeoutMs, final long fatalExitGraceMs, final long quorumWaitMs,
+                    final long rejoinWaitMs, final long rejoinPeerWindowMs, final long catchupRefusals,
+                    final long catchupRefusalWaitMs) {
+        if (shutdownTimeoutMs <= 0 || fatalExitGraceMs <= 0 || quorumWaitMs <= 0 || rejoinWaitMs <= 0
+                || rejoinPeerWindowMs <= 0 || catchupRefusals <= 0 || catchupRefusalWaitMs <= 0) {
             throw new IllegalArgumentException("lifecycle bounds must be positive");
         }
+        this.rejoinPeerWindowMs = rejoinPeerWindowMs;
+        this.catchupRefusals = catchupRefusals;
+        this.catchupRefusalWaitMs = catchupRefusalWaitMs;
         this.name = name;
         this.log = log;
         this.halter = halter;
@@ -157,14 +205,23 @@ public final class EngineLifecycle {
      * hook registered for the signal stop. Call first in the node's bootstrap, before any thread starts.
      */
     public static EngineLifecycle install(final String name, final Consumer<String> log) {
-        // All five settings are parsed here, in every driver mode: a malformed one refuses the start.
+        // Every setting is parsed here, in every driver mode: a malformed or out-of-range one refuses the start.
         final long shutdownMs = shutdownTimeoutMs();
         final long graceMs = fatalExitGraceMs();
         driverWaitMs();
         final long quorumMs = quorumWaitMs();
         final long rejoinMs = rejoinWaitMs();
+        final long rejoinWindowMs = rejoinPeerWindowMs();
+        final String rejoinRefusal = rejoinSettingsRefusal(rejoinMs, rejoinWindowMs);
+        if (rejoinRefusal != null) {
+            throw new IllegalArgumentException(rejoinRefusal);
+        }
+        // the retention floor's settings are read again where the pruner is wired, inside the service's start, where
+        // a refusal would be too late to stop the boot: check them here
+        SnapshotLogPruner.checkSettings();
         final EngineLifecycle lifecycle = new EngineLifecycle(name, log, status -> Runtime.getRuntime().halt(status),
-                shutdownMs, graceMs, quorumMs, rejoinMs);
+                shutdownMs, graceMs, quorumMs, rejoinMs, rejoinWindowMs, catchupRefusals(),
+                catchupRefusalWaitMs());
         Runtime.getRuntime().addShutdownHook(new Thread(lifecycle::onJvmShutdown, name + "-shutdown"));
         return lifecycle;
     }
@@ -189,6 +246,36 @@ public final class EngineLifecycle {
         return positiveSetting(REJOIN_WAIT_ENV, REJOIN_WAIT_PROP, DEFAULT_REJOIN_WAIT_MS);
     }
 
+    public static long rejoinPeerWindowMs() {
+        return rangedSetting(REJOIN_PEER_WINDOW_ENV, REJOIN_PEER_WINDOW_PROP, DEFAULT_REJOIN_PEER_WINDOW_MS,
+                MIN_REJOIN_PEER_WINDOW_MS, MAX_REJOIN_PEER_WINDOW_MS);
+    }
+
+    /**
+     * Why this pair of rejoin settings refuses the boot, or null when it is fine. The rejoin wait has to exceed the
+     * peer window: a peer that just died still reads reachable for the driver's publication connection timeout,
+     * which the window is set to cover, and a wait no longer than that would restart the lone survivor of a quorum
+     * loss once.
+     */
+    public static String rejoinSettingsRefusal(final long rejoinWaitMs, final long rejoinPeerWindowMs) {
+        if (rejoinWaitMs <= rejoinPeerWindowMs) {
+            return REJOIN_WAIT_ENV + " (" + rejoinWaitMs + " ms) must exceed " + REJOIN_PEER_WINDOW_ENV + " ("
+                    + rejoinPeerWindowMs + " ms): a peer that just died still counts as reachable for the media"
+                    + " driver's publication connection timeout, which the window has to cover";
+        }
+        return null;
+    }
+
+    public static long catchupRefusals() {
+        return rangedSetting(CATCHUP_REFUSALS_ENV, CATCHUP_REFUSALS_PROP, DEFAULT_CATCHUP_REFUSALS,
+                MIN_CATCHUP_REFUSALS, MAX_CATCHUP_REFUSALS);
+    }
+
+    public static long catchupRefusalWaitMs() {
+        return rangedSetting(CATCHUP_REFUSAL_WAIT_ENV, CATCHUP_REFUSAL_WAIT_PROP, DEFAULT_CATCHUP_REFUSAL_WAIT_MS,
+                MIN_CATCHUP_REFUSAL_WAIT_MS, MAX_CATCHUP_REFUSAL_WAIT_MS);
+    }
+
     /** One line through the node's log (the watchdogs' CRITICAL line). */
     void log(final String line) {
         log.accept(name + " " + line);
@@ -197,8 +284,9 @@ public final class EngineLifecycle {
     /**
      * Call right after {@code ConsensusModule.launch} (or {@code ClusteredMediaDriver.launch})
      * returns, before the service container launches: starts the {@link QuorumWatchdog} clock now, on the context's
-     * election-state counter, with this lifecycle's quorum wait, and arms the {@link RejoinWatchdog} on the same
-     * counters with the rejoin wait. Both driver modes: the watchdogs read counters, not the driver.
+     * election-state counter, with this lifecycle's quorum wait, and arms the {@link RejoinWatchdog} (with its
+     * {@link PeerReachability} probe) and the {@link CatchupWatchdog} on the same counters. Both driver modes: the
+     * watchdogs read counters, and their probes open clients of their own on the context's driver directory.
      */
     public QuorumWatchdog watchQuorum(final io.aeron.cluster.ConsensusModule.Context context) {
         log.accept(name + " quorum watchdog armed: exit 1 if no leader is known within " + quorumWaitMs + " ms ("
@@ -206,17 +294,30 @@ public final class EngineLifecycle {
         final QuorumWatchdog quorum = QuorumWatchdog.of(this, context, quorumWaitMs);
         watchdogs.add(quorum::stop);
         quorum.startDaemon(name);
-        watchRejoin(RejoinWatchdog.of(this, context, rejoinWaitMs));
+        watchRejoin(RejoinWatchdog.of(this, context, rejoinWaitMs, rejoinPeerWindowMs));
+        watchCatchup(CatchupWatchdog.of(this, context, catchupRefusals, catchupRefusalWaitMs));
         return quorum;
     }
 
-    /** {@link #watchQuorum(io.aeron.cluster.ConsensusModule.Context)} on explicit suppliers (tests, other hosts). */
+    /**
+     * {@link #watchQuorum(io.aeron.cluster.ConsensusModule.Context)} on explicit suppliers (tests, other hosts).
+     * Without a consensus context there is no peer probe: the rejoin watchdog runs without the reachability gate and
+     * no catch-up watchdog is armed. A host that has its own evidence passes it to the overload below.
+     */
     public QuorumWatchdog watchQuorum(final java.util.function.LongSupplier electionState,
                                       final java.util.function.LongSupplier elections) {
+        return watchQuorum(electionState, elections, () -> true);
+    }
+
+    /** As above, with the host's own answer to "is a quorum of members reachable right now". */
+    public QuorumWatchdog watchQuorum(final java.util.function.LongSupplier electionState,
+                                      final java.util.function.LongSupplier elections,
+                                      final java.util.function.BooleanSupplier quorumReachable) {
         final QuorumWatchdog quorum = new QuorumWatchdog(this, electionState, elections, quorumWaitMs);
         watchdogs.add(quorum::stop);
         quorum.startDaemon(name);
-        watchRejoin(new RejoinWatchdog(this, electionState, elections, rejoinWaitMs));
+        watchRejoin(new RejoinWatchdog(this, electionState, elections, rejoinWaitMs, quorumReachable,
+                rejoinPeerWindowMs, null));
         return quorum;
     }
 
@@ -229,10 +330,59 @@ public final class EngineLifecycle {
 
     private void watchRejoin(final RejoinWatchdog w) {
         log.accept(name + " rejoin watchdog armed: exit 1 if, after a leader was known, one election stays open "
-                + "without a leader for " + rejoinWaitMs + " ms (" + REJOIN_WAIT_ENV + ")");
+                + "without a leader for " + rejoinWaitMs + " ms (" + REJOIN_WAIT_ENV + ") while a quorum of members"
+                + " is reachable (evidence window " + rejoinPeerWindowMs + " ms, " + REJOIN_PEER_WINDOW_ENV + ")");
         watchdogs.add(w::stop);
         rejoin = w;
         w.startDaemon(name);
+    }
+
+    /** The catch-up watchdog armed by the last {@code watchQuorum(context)} call, or null. */
+    private volatile CatchupWatchdog catchup;
+
+    CatchupWatchdog catchupWatchdog() {
+        return catchup;
+    }
+
+    private void watchCatchup(final CatchupWatchdog w) {
+        log.accept(name + " catch-up watchdog armed: exit 1 when " + catchupRefusals + " catch-up attempts in a row"
+                + " fail (" + CATCHUP_REFUSALS_ENV + ") or the catch-up has failed for " + catchupRefusalWaitMs
+                + " ms (" + CATCHUP_REFUSAL_WAIT_ENV + ") and this member's log position is below the leader's log"
+                + " start");
+        watchdogs.add(w::stop);
+        catchup = w;
+        w.startDaemon(name);
+    }
+
+    static long rangedSetting(final String env, final String prop, final long defaultValue, final long min,
+                              final long max) {
+        return parseRanged(env, System.getenv(env), prop, System.getProperty(prop), defaultValue, min, max);
+    }
+
+    static long parseRanged(final String env, final String envValue, final String prop, final String propValue,
+                            final long defaultValue, final long min, final long max) {
+        final String raw;
+        final String source;
+        if (envValue != null && !envValue.isEmpty()) {
+            raw = envValue;
+            source = env;
+        } else if (propValue != null && !propValue.isEmpty()) {
+            raw = propValue;
+            source = prop;
+        } else {
+            return defaultValue;
+        }
+        final long value;
+        try {
+            value = Long.parseLong(raw.trim());
+        } catch (final NumberFormatException e) {
+            throw new IllegalArgumentException(source + " must be a number in " + min + ".." + max + ", got '" + raw
+                    + "'");
+        }
+        if (value < min || value > max) {
+            throw new IllegalArgumentException(source + " must be " + min + ".." + max + ", got '" + raw + "'");
+        }
+        return value;
     }
 
     static long positiveSetting(final String env, final String prop, final long defaultValue) {

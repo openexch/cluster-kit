@@ -5,6 +5,7 @@ import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.ElectionState;
 
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
 
 /**
@@ -28,6 +29,19 @@ import java.util.function.LongSupplier;
  * long that takes; if it falls back to canvass after the wait it trips at the next poll. A counter value outside
  * every known state (not readable) never trips and keeps the clock.
  *
+ * <p>Reachability gate: a restart only helps when the peers are there. The watchdog trips only when it has evidence
+ * that a quorum of members is reachable ({@link PeerReachability}: this member plus the peers that answer its
+ * consensus publications), and the wait is counted over the time that evidence has held: the clock starts at the
+ * later of the election's opening and the moment the quorum became reachable, and it runs up to the last positive
+ * answer. A gap in the evidence shorter than the reachability window ({@link EngineLifecycle#REJOIN_PEER_WINDOW_ENV})
+ * does not restart the clock, and is counted once the evidence is back; time after the last positive answer is never
+ * counted, so the window cannot carry a member whose peers just died over the wait. Once the last evidence is older
+ * than the window the clock is cleared. A peer that died still reads reachable until the driver's publication
+ * connection timeout passes; the window is to be set no shorter than that timeout, and the wait has to exceed the
+ * window ({@link EngineLifecycle#rejoinSettingsRefusal}, checked at boot). During a genuine quorum loss (two of three
+ * members gone) the survivor therefore stays up without a bound, not ready, and may serve a recovering peer's
+ * restore; one line says so when the wait passes. When the peers return it gets a full wait to finish the election.
+ *
  * <p>On a trip it logs one {@code CRITICAL} line naming the election state, the elapsed time and the setting, then
  * records {@link EngineLifecycle#fatal} with {@link EngineLifecycle#EXIT_FATAL} (exit 1): the supervisor restarts the
  * member, which rejoins through its own log and the leader's catch-up.
@@ -42,6 +56,9 @@ public final class RejoinWatchdog {
     private final LongSupplier elections;
     private final long waitMs;
     private final long waitNs;
+    private final BooleanSupplier quorumReachable;
+    private final long windowNs;
+    private final AutoCloseable onStop;
     private volatile boolean leaderKnown;
     private volatile boolean tripped;
     private volatile boolean stopped;
@@ -49,25 +66,52 @@ public final class RejoinWatchdog {
     private boolean open;
     private long openedNs;
     private long openElection;
+    /** Whether quorum evidence has been seen in this stretch and is not older than the window. */
+    private boolean reachable;
+    private long reachableSinceNs;
+    private long lastEvidenceNs;
+    private boolean quorumLossLogged;
 
+    /** No reachability gate: every poll counts as evidence (the rule before the gate; explicit-supplier hosts). */
     RejoinWatchdog(final EngineLifecycle lifecycle, final LongSupplier electionState, final LongSupplier elections,
                    final long waitMs) {
+        this(lifecycle, electionState, elections, waitMs, () -> true, EngineLifecycle.DEFAULT_REJOIN_PEER_WINDOW_MS,
+                null);
+    }
+
+    /**
+     * @param quorumReachable asked once per poll while an election is open without a leader, under the poll lock:
+     *                        true when a quorum of members is reachable right now
+     * @param windowMs        how long one positive answer keeps counting as evidence
+     * @param onStop          closed by {@link #stop} under the poll lock (the probe behind the supplier), or null
+     */
+    RejoinWatchdog(final EngineLifecycle lifecycle, final LongSupplier electionState, final LongSupplier elections,
+                   final long waitMs, final BooleanSupplier quorumReachable, final long windowMs,
+                   final AutoCloseable onStop) {
         if (waitMs <= 0) {
             throw new IllegalArgumentException("rejoin wait must be positive");
+        }
+        if (windowMs <= 0) {
+            throw new IllegalArgumentException("rejoin peer window must be positive");
         }
         this.lifecycle = lifecycle;
         this.electionState = electionState;
         this.elections = elections;
         this.waitMs = waitMs;
         this.waitNs = TimeUnit.MILLISECONDS.toNanos(waitMs);
+        this.quorumReachable = java.util.Objects.requireNonNull(quorumReachable, "quorumReachable");
+        this.windowNs = TimeUnit.MILLISECONDS.toNanos(windowMs);
+        this.onStop = onStop;
     }
 
     static RejoinWatchdog of(final EngineLifecycle lifecycle, final ConsensusModule.Context context,
-                             final long waitMs) {
+                             final long waitMs, final long windowMs) {
+        final PeerReachability peers = PeerReachability.of(context, lifecycle::log);
         // A closed election-state counter means the consensus module closed: it reads CLOSED and never trips.
         return new RejoinWatchdog(lifecycle,
                 QuorumWatchdog.counterValue(context.electionStateCounter(), ElectionState.CLOSED.code()),
-                QuorumWatchdog.counterValue(context.electionCounter(), QuorumWatchdog.STATE_UNAVAILABLE), waitMs);
+                QuorumWatchdog.counterValue(context.electionCounter(), QuorumWatchdog.STATE_UNAVAILABLE), waitMs,
+                peers, windowMs, peers);
     }
 
     /** The states in which an election open for the wait trips the watchdog (once a leader was known). */
@@ -96,6 +140,13 @@ public final class RejoinWatchdog {
     public void stop(final long joinMs) {
         synchronized (this) {
             stopped = true;
+            if (onStop != null) {
+                try {
+                    onStop.close();
+                } catch (final Exception e) {
+                    lifecycle.log("rejoin watchdog: closing the peer reachability probe failed: " + e);
+                }
+            }
         }
         final Thread t = poller;
         if (t != null && t != Thread.currentThread()) {
@@ -122,6 +173,8 @@ public final class RejoinWatchdog {
         }
         if (!isRejoinWait(code)) {
             open = false; // closed, or a state with a leader (catch-up, leader states): the clock restarts
+            reachable = false;
+            quorumLossLogged = false;
             return false;
         }
         final long election = elections.getAsLong();
@@ -132,19 +185,50 @@ public final class RejoinWatchdog {
             openedNs = nowNs;
             openElection = election;
         }
+        final boolean evidence;
+        try {
+            evidence = quorumReachable.getAsBoolean();
+        } catch (final RuntimeException e) {
+            lifecycle.log("rejoin watchdog: the peer reachability check failed: " + e);
+            return false;
+        }
+        if (evidence) {
+            if (!reachable) {
+                reachable = true;
+                reachableSinceNs = nowNs;
+            }
+            lastEvidenceNs = nowNs;
+        } else if (reachable && nowNs - lastEvidenceNs > windowNs) {
+            reachable = false; // the last evidence left the window: the peers are gone, the clock is cleared
+        }
         final long openNs = nowNs - openedNs;
-        if (openNs < waitNs) {
+        if (!reachable) {
+            if (openNs >= waitNs && !quorumLossLogged) {
+                quorumLossLogged = true;
+                lifecycle.log("rejoin watchdog: election " + election + " open for "
+                        + TimeUnit.NANOSECONDS.toMillis(openNs) + " ms without a leader, and no quorum of members is"
+                        + " reachable; not exiting, a restart cannot repair a quorum loss. The wait ("
+                        + EngineLifecycle.REJOIN_WAIT_ENV + ") starts when a quorum is reachable again");
+            }
+            return false;
+        }
+        // the wait counts only time with the quorum reachable, up to the last positive answer: peers that return
+        // get a full wait to elect, and the window after the last answer is not evidence
+        final long stuckNs = lastEvidenceNs - Math.max(openedNs, reachableSinceNs);
+        if (stuckNs < waitNs) {
             return false;
         }
         tripped = true;
         final String state = stateName(code);
         final long openMs = TimeUnit.NANOSECONDS.toMillis(openNs);
+        final long stuckMs = TimeUnit.NANOSECONDS.toMillis(stuckNs);
         lifecycle.log("CRITICAL rejoin watchdog: election " + election + " open for " + openMs
-                + " ms after a leader was known, still in election state " + state + " (wait " + waitMs + " ms, "
+                + " ms after a leader was known, still in election state " + state + " with a quorum of members"
+                + " reachable for " + stuckMs + " ms (wait " + waitMs + " ms, "
                 + EngineLifecycle.REJOIN_WAIT_ENV + "); exiting " + EngineLifecycle.EXIT_FATAL
                 + " for a supervised restart");
         lifecycle.fatal(EngineLifecycle.EXIT_FATAL, "member did not rejoin: election state " + state + " for "
-                + openMs + " ms after a leader was known");
+                + openMs + " ms after a leader was known, a quorum of members reachable for " + stuckMs + " ms");
         return true;
     }
 

@@ -257,6 +257,8 @@ public final class EngineLifecycle {
         // the retention floor's settings are read again where the pruner is wired, inside the service's start, where
         // a refusal would be too late to stop the boot: check them here
         SnapshotLogPruner.checkSettings();
+        // the rejoin watchdog's probe reads its term length when the watchdog is armed, after the cluster starts
+        PeerReachability.probeTermLength();
         final EngineLifecycle lifecycle = new EngineLifecycle(name, log, status -> Runtime.getRuntime().halt(status),
                 shutdownMs, graceMs, quorumMs, rejoinMs, rejoinWindowMs, leaderElectMs, catchupRefusals(),
                 catchupRefusalWaitMs());

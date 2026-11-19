@@ -7,6 +7,7 @@ import io.aeron.CommonContext;
 import io.aeron.Publication;
 import io.aeron.cluster.ClusterMember;
 import io.aeron.cluster.ConsensusModule;
+import io.aeron.logbuffer.LogBufferDescriptor;
 import org.agrona.CloseHelper;
 
 import java.util.function.BooleanSupplier;
@@ -34,16 +35,28 @@ import java.util.function.Consumer;
  * and the publications are created on the first question and closed by {@link #close}. When they cannot be created
  * the answer is false (no evidence), said once through the log.</p>
  *
+ * <p>The probe publications carry no data, so they are opened on a small sparse term ({@link #PROBE_TERM_LENGTH_ENV},
+ * default 64 KiB) and not on the consensus channel's term: a driver default of 16 MiB costs three terms of log buffer
+ * on this member and as much again for the image it creates on each peer, for every peer, until the member stops.</p>
+ *
  * <p>Asked and closed by the rejoin watchdog under its poll lock; its own client's error handler runs on that
  * client's conductor thread, so the methods take this object's lock.</p>
  */
 final class PeerReachability implements BooleanSupplier, AutoCloseable {
+    /** Term length of the probe publications, bytes: a power of two in {@link #MIN_PROBE_TERM_LENGTH}..{@link #MAX_PROBE_TERM_LENGTH}. */
+    static final String PROBE_TERM_LENGTH_ENV = "ENGINE_REJOIN_PROBE_TERM_LENGTH";
+    static final String PROBE_TERM_LENGTH_PROP = "engine.rejoin.probe.term.length";
+    static final int DEFAULT_PROBE_TERM_LENGTH = 64 * 1024;
+    static final int MIN_PROBE_TERM_LENGTH = LogBufferDescriptor.TERM_MIN_LENGTH;
+    static final int MAX_PROBE_TERM_LENGTH = LogBufferDescriptor.TERM_MAX_LENGTH;
+
     private final String aeronDirectoryName;
     private final String consensusChannel;
     private final int consensusStreamId;
     private final ClusterMember[] members;
     private final int memberId;
     private final Consumer<String> log;
+    private final int probeTermLength;
     private Aeron aeron;
     private Publication[] publications;
     private boolean unavailable;
@@ -52,6 +65,15 @@ final class PeerReachability implements BooleanSupplier, AutoCloseable {
 
     PeerReachability(final String aeronDirectoryName, final String consensusChannel, final int consensusStreamId,
                      final String clusterMembers, final int memberId, final Consumer<String> log) {
+        this(aeronDirectoryName, consensusChannel, consensusStreamId, clusterMembers, memberId, log,
+                DEFAULT_PROBE_TERM_LENGTH);
+    }
+
+    PeerReachability(final String aeronDirectoryName, final String consensusChannel, final int consensusStreamId,
+                     final String clusterMembers, final int memberId, final Consumer<String> log,
+                     final int probeTermLength) {
+        LogBufferDescriptor.checkTermLength(probeTermLength);
+        this.probeTermLength = probeTermLength;
         this.aeronDirectoryName = aeronDirectoryName;
         this.consensusChannel = consensusChannel;
         this.consensusStreamId = consensusStreamId;
@@ -62,7 +84,32 @@ final class PeerReachability implements BooleanSupplier, AutoCloseable {
 
     static PeerReachability of(final ConsensusModule.Context context, final Consumer<String> log) {
         return new PeerReachability(context.aeronDirectoryName(), context.consensusChannel(),
-                context.consensusStreamId(), context.clusterMembers(), context.clusterMemberId(), log);
+                context.consensusStreamId(), context.clusterMembers(), context.clusterMemberId(), log,
+                probeTermLength());
+    }
+
+    /** {@link #PROBE_TERM_LENGTH_ENV}, else the default; a value that is not a power of two in range refuses boot. */
+    static int probeTermLength() {
+        return probeTermLength(System.getenv(PROBE_TERM_LENGTH_ENV), System.getProperty(PROBE_TERM_LENGTH_PROP));
+    }
+
+    static int probeTermLength(final String envValue, final String propValue) {
+        final int value = (int) EngineLifecycle.parseRanged(PROBE_TERM_LENGTH_ENV, envValue, PROBE_TERM_LENGTH_PROP,
+                propValue, DEFAULT_PROBE_TERM_LENGTH, MIN_PROBE_TERM_LENGTH, MAX_PROBE_TERM_LENGTH);
+        if (Integer.bitCount(value) != 1) {
+            throw new IllegalArgumentException(PROBE_TERM_LENGTH_ENV + " must be a power of two in "
+                    + MIN_PROBE_TERM_LENGTH + ".." + MAX_PROBE_TERM_LENGTH + ", got " + value);
+        }
+        return value;
+    }
+
+    /** The probe's channel: the consensus channel aimed at {@code endpoint}, on the probe's own small sparse term. */
+    static String probeChannel(final String consensusChannel, final String endpoint, final int termLength) {
+        final ChannelUri uri = ChannelUri.parse(consensusChannel);
+        uri.put(CommonContext.ENDPOINT_PARAM_NAME, endpoint);
+        uri.put(CommonContext.TERM_LENGTH_PARAM_NAME, Integer.toString(termLength));
+        uri.put(CommonContext.SPARSE_PARAM_NAME, "true");
+        return uri.toString();
     }
 
     /** Members a quorum needs: more than half. */
@@ -121,11 +168,11 @@ final class PeerReachability implements BooleanSupplier, AutoCloseable {
                 if (members[i].id() == memberId) {
                     continue;
                 }
-                final ChannelUri uri = ChannelUri.parse(consensusChannel);
-                uri.put(CommonContext.ENDPOINT_PARAM_NAME, members[i].consensusEndpoint());
                 // exclusive: a session of its own, so it never shares (and keeps alive) the consensus module's
                 // publication to the same endpoint in the same driver
-                opened[i] = aeron.addExclusivePublication(uri.toString(), consensusStreamId);
+                opened[i] = aeron.addExclusivePublication(
+                        probeChannel(consensusChannel, members[i].consensusEndpoint(), probeTermLength),
+                        consensusStreamId);
             }
             publications = opened;
             return true;

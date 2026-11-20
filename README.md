@@ -87,10 +87,11 @@ system property:
 | `ENGINE_FATAL_EXIT_GRACE_MS` / `-Dengine.fatal.exit.grace.ms` | `EngineLifecycle` | `5000` |
 | `TRANSPORT_EXTERNAL_DRIVER_TIMEOUT_MS` / `-Dtransport.external.driver.timeout.ms` | `EngineLifecycle` | `30000` |
 | `ENGINE_QUORUM_WAIT_MS` / `-Dengine.quorum.wait.ms` | `EngineLifecycle`, `QuorumWatchdog` | `120000` |
-| `ENGINE_REJOIN_WAIT_MS` / `-Dengine.rejoin.wait.ms` | `EngineLifecycle`, `RejoinWatchdog` | `60000`. After this process has known a leader, a stretch without a leader (election state INIT, CANVASS, NOMINATE, CANDIDATE_BALLOT or FOLLOWER_BALLOT) that lasts this long **while a quorum of members is reachable** logs one CRITICAL line and exits 1 for a supervised restart. Size it above the election timeouts. It must exceed `ENGINE_REJOIN_PEER_WINDOW_MS`, or the boot is refused. |
-| `ENGINE_REJOIN_PEER_WINDOW_MS` / `-Dengine.rejoin.peer.window.ms` | `EngineLifecycle`, `RejoinWatchdog`, `PeerReachability` | `10000` (1000..600000). How long a gap in the evidence of a reachable quorum is bridged before the rejoin watchdog's clock is cleared. Set it no shorter than the media driver's publication connection timeout. See [Rejoin and peer reachability](#rejoin-and-peer-reachability). |
+| `ENGINE_REJOIN_WAIT_MS` / `-Dengine.rejoin.wait.ms` | `EngineLifecycle`, `RejoinWatchdog` | `60000`. After this process has known a leader, a stretch without a leader (election state INIT, CANVASS, NOMINATE, CANDIDATE_BALLOT or FOLLOWER_BALLOT) that lasts this long **while a quorum of members is reachable** logs one CRITICAL line and exits 1 for a supervised restart. A peer counts as reachable only once its consensus module has left startup recovery, so a peer still loading its snapshot (a restore that may take minutes) never starts this wait. Size it above the election timeouts. It must exceed `ENGINE_REJOIN_PEER_WINDOW_MS`, or the boot is refused. |
+| `ENGINE_REJOIN_PEER_WINDOW_MS` / `-Dengine.rejoin.peer.window.ms` | `EngineLifecycle`, `RejoinWatchdog`, `PeerReachability` | `10000` (1000..600000). How long a gap in the evidence of a reachable quorum is bridged before the rejoin watchdog's clock is cleared. Set it no shorter than the media driver's publication connection timeout; with an external driver, no shorter than its client liveness timeout plus that connection timeout. See [Rejoin and peer reachability](#rejoin-and-peer-reachability). |
 | `ENGINE_LEADER_ELECT_WAIT_MS` / `-Dengine.leader.elect.wait.ms` | `EngineLifecycle`, `RejoinWatchdog` | `300000` (10000..3600000). How long a leader elect may stay in election state LEADER_LOG_REPLICATION or LEADER_READY, counted only **while a quorum of members is reachable**, before it logs one CRITICAL line and exits 1 for a supervised restart. Aeron leaves those states only once a quorum of followers reports its position, without a timeout. Size it above the time followers need to replicate the longest log a new leader may send them. It must exceed `ENGINE_REJOIN_PEER_WINDOW_MS`, or the boot is refused. |
 | `ENGINE_REJOIN_PROBE_TERM_LENGTH` / `-Dengine.rejoin.probe.term.length` | `EngineLifecycle`, `PeerReachability` | `65536` (bytes, a power of two in 65536..1073741824). Term length of the rejoin watchdog's peer probe publications, which carry no data and open on a sparse term of their own instead of the consensus channel's. Each probe costs three terms on this member and as much again for the image on each peer, for as long as the member runs. A value outside the range or not a power of two refuses the boot. |
+| `ENGINE_REJOIN_PROBE_STREAM_ID` / `-Dengine.rejoin.probe.stream.id` | `EngineLifecycle`, `PeerReachability` | `4306` (1..2147483647). Stream id of the participation subscription each member opens on its own consensus endpoint once its consensus module has left startup recovery, and of the peer probes aimed at it. Every member of a cluster must use the same value. A value outside the range refuses the boot; a value equal to the consensus stream id (`aeron.cluster.consensus.stream.id`) refuses to arm the watchdogs. |
 | `ENGINE_CATCHUP_REFUSALS` / `-Dengine.catchup.refusals` | `EngineLifecycle`, `CatchupWatchdog` | `3` (1..1000). Failed catch-up attempts in a row after which a member reads the leader's log start; a member below it exits 1. See [Log retention](#log-retention-and-a-member-that-was-away). |
 | `ENGINE_CATCHUP_REFUSAL_WAIT_MS` / `-Dengine.catchup.refusal.wait.ms` | `EngineLifecycle`, `CatchupWatchdog` | `30000` (1000..3600000). The time bound next to the count: catch-up attempts failing for this long trigger the same read. |
 | `RETENTION_FLOOR` / `-Dretention.floor` | `SnapshotLogPruner` | `apply`. `report` computes and logs the retention floor without applying it. |
@@ -177,17 +178,37 @@ may be the restore source of a recovering peer, so the watchdog trips only
 with evidence that a quorum of members is reachable.
 
 The evidence is outbound: the member holds one idle publication of its own to
-every peer's consensus endpoint, and a peer counts as reachable while its
+every peer's consensus endpoint, on the participation stream
+(`ENGINE_REJOIN_PROBE_STREAM_ID`), and a peer counts as reachable while its
 driver answers that publication with status messages. The member counts
-itself, so in a three member cluster one answering peer makes a quorum. The
+itself, so in a three member cluster one answering peer makes a quorum.
+
+A peer answers only once its consensus module has left startup recovery: each
+member opens one participation subscription on its own consensus endpoint when
+its module state leaves INIT, and keeps it until the member stops. Nothing
+reads it. Aeron's consensus module subscribes to the consensus stream as soon
+as it is constructed, but it cannot vote until its clustered services have
+loaded their snapshots, which can take minutes. A peer in that restore
+therefore reads unreachable, and the survivor of a quorum loss stays up while
+the peer restores, possibly from the survivor itself. A running peer reads
+reachable, including one in the stuck election the watchdog exists for. A peer
+on an older kit has no participation subscription and reads unreachable, so
+with mixed versions the watchdog does not trip. The
 wait (`ENGINE_REJOIN_WAIT_MS`) is counted over the time the quorum has been
 reachable: peers that return after a long outage get a full wait to finish the
 election. A gap in the evidence shorter than `ENGINE_REJOIN_PEER_WINDOW_MS`
 does not restart the clock, and time after the last positive observation is
 never counted. A peer that just died still reads reachable until the media
 driver's publication connection timeout passes (Aeron's default is 5 s): keep
-the window at or above that timeout. `ENGINE_REJOIN_WAIT_MS` must exceed the
-window, and a pair that does not refuses the boot.
+the window at or above that timeout. With an external driver the driver
+outlives a halted member process, and keeps that process's subscriptions,
+the participation subscription included, until its client liveness timeout
+(`aeron.client.liveness.timeout`, Aeron's default is 10 s) passes; only then
+do the status messages stop and the connection timeout start. There a peer
+that just died reads reachable for up to the sum of the two (15 s with
+Aeron's defaults), and the window has to be at or above that sum.
+`ENGINE_REJOIN_WAIT_MS` must exceed the window, and a pair that does not
+refuses the boot.
 While no quorum is reachable the member stays up, not ready, and says so once
 per election when the wait passes.
 

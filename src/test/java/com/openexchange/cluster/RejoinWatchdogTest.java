@@ -74,6 +74,35 @@ public class RejoinWatchdogTest {
         assertEquals(List.of(1), halts);
     }
 
+    /**
+     * The probe's tick runs on every poll, before a leader was ever known and with no election open, so a member's
+     * participation subscription opens as soon as its consensus module is running; a failing tick is logged, not fatal.
+     */
+    @Test
+    public void theTickRunsOnEveryPollWhateverTheElectionState() {
+        final EngineLifecycle lf = lifecycle();
+        final AtomicLong ticks = new AtomicLong();
+        final RejoinWatchdog w = new RejoinWatchdog(lf, state::get, elections::get, WAIT_MS,
+                EngineLifecycle.DEFAULT_LEADER_ELECT_WAIT_MS, () -> true, 500, null, () -> {
+                    if (ticks.incrementAndGet() == 3) {
+                        throw new IllegalStateException("boom");
+                    }
+                });
+        state.set(ElectionState.INIT.code());
+        assertFalse(w.poll(0)); // no leader known yet
+        assertEquals(1, ticks.get());
+        state.set(ElectionState.CLOSED.code());
+        assertFalse(w.poll(1));
+        assertFalse(w.poll(2));
+        assertFalse(w.poll(3));
+        assertEquals(4, ticks.get());
+        assertTrue(logs.toString(), logs.stream().anyMatch(l -> l.contains("tick failed")));
+        assertFalse(lf.stopRequested());
+        w.stop(0);
+        assertFalse(w.poll(4));
+        assertEquals("no tick once stopped", 4, ticks.get());
+    }
+
     @Test
     public void anElectionThatClosesInTimeNeverTrips() {
         final EngineLifecycle lf = lifecycle();

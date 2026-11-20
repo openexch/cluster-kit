@@ -42,16 +42,26 @@ import java.util.function.LongSupplier;
  *
  * <p>Reachability gate: a restart only helps when the peers are there. The watchdog trips only when it has evidence
  * that a quorum of members is reachable ({@link PeerReachability}: this member plus the peers that answer its
- * consensus publications), and the wait is counted over the time that evidence has held: the clock starts at the
- * later of the election's opening and the moment the quorum became reachable, and it runs up to the last positive
- * answer. A gap in the evidence shorter than the reachability window ({@link EngineLifecycle#REJOIN_PEER_WINDOW_ENV})
- * does not restart the clock, and is counted once the evidence is back; time after the last positive answer is never
- * counted, so the window cannot carry a member whose peers just died over the wait. Once the last evidence is older
+ * probes on their participation stream), and the wait is counted over the time that evidence has held: the clock
+ * starts at the later of the election's opening and the moment the quorum became reachable, and it runs up to the
+ * last positive answer. A gap in the evidence shorter than the reachability window
+ * ({@link EngineLifecycle#REJOIN_PEER_WINDOW_ENV}) does not restart the clock, and is counted once the evidence is
+ * back; time after the last positive answer is never counted, so the window cannot carry a member whose peers just
+ * died over the wait. Once the last evidence is older
  * than the window the clock is cleared. A peer that died still reads reachable until the driver's publication
  * connection timeout passes; the window is to be set no shorter than that timeout, and the wait has to exceed the
  * window ({@link EngineLifecycle#rejoinSettingsRefusal}, checked at boot). During a genuine quorum loss (two of three
  * members gone) the survivor therefore stays up without a bound, not ready, and may serve a recovering peer's
  * restore; one line says so when the wait passes. When the peers return it gets a full wait to finish the election.
+ *
+ * <p>A peer counts as reachable only once its consensus module has left startup recovery: each member opens its
+ * participation subscription when its own module state leaves INIT, from the poller's tick (every poll, whether or
+ * not an election is open). Aeron's consensus module subscribes to the consensus stream when it is constructed but
+ * cannot vote until its clustered services have loaded their snapshots, which can take minutes; a peer in that
+ * restore reads unreachable, so the survivor of a quorum loss stays up while the returning peer restores, possibly
+ * from it, and the wait starts when the peer is running. A running peer, including one in the stuck election above,
+ * reads reachable (its module state is ACTIVE). A peer on an older kit has no participation subscription and reads
+ * unreachable: with mixed versions the watchdog does not trip.
  *
  * <p>On a trip it logs one {@code CRITICAL} line naming the election state, the elapsed time, the time a quorum was
  * reachable and the setting, then records {@link EngineLifecycle#fatal} with {@link EngineLifecycle#EXIT_FATAL}
@@ -73,6 +83,8 @@ public final class RejoinWatchdog {
     private final BooleanSupplier quorumReachable;
     private final long windowNs;
     private final AutoCloseable onStop;
+    /** Run first in every poll under the poll lock, whatever the election state (the probe's tick), or null. */
+    private final Runnable tick;
     private volatile boolean leaderKnown;
     private volatile boolean tripped;
     private volatile boolean stopped;
@@ -117,6 +129,17 @@ public final class RejoinWatchdog {
     RejoinWatchdog(final EngineLifecycle lifecycle, final LongSupplier electionState, final LongSupplier elections,
                    final long waitMs, final long leaderElectWaitMs, final BooleanSupplier quorumReachable,
                    final long windowMs, final AutoCloseable onStop) {
+        this(lifecycle, electionState, elections, waitMs, leaderElectWaitMs, quorumReachable, windowMs, onStop, null);
+    }
+
+    /**
+     * As above, with {@code tick} run at the start of every poll under the poll lock, whether or not an election is
+     * open or a leader was ever known: the probe opens this member's participation subscription from it
+     * ({@link PeerReachability#tick}).
+     */
+    RejoinWatchdog(final EngineLifecycle lifecycle, final LongSupplier electionState, final LongSupplier elections,
+                   final long waitMs, final long leaderElectWaitMs, final BooleanSupplier quorumReachable,
+                   final long windowMs, final AutoCloseable onStop, final Runnable tick) {
         if (waitMs <= 0) {
             throw new IllegalArgumentException("rejoin wait must be positive");
         }
@@ -136,16 +159,18 @@ public final class RejoinWatchdog {
         this.quorumReachable = java.util.Objects.requireNonNull(quorumReachable, "quorumReachable");
         this.windowNs = TimeUnit.MILLISECONDS.toNanos(windowMs);
         this.onStop = onStop;
+        this.tick = tick;
     }
 
     static RejoinWatchdog of(final EngineLifecycle lifecycle, final ConsensusModule.Context context,
-                             final long waitMs, final long leaderElectWaitMs, final long windowMs) {
-        final PeerReachability peers = PeerReachability.of(context, lifecycle::log);
+                             final long waitMs, final long leaderElectWaitMs, final long windowMs,
+                             final int probeStreamId) {
+        final PeerReachability peers = PeerReachability.of(context, lifecycle::log, probeStreamId);
         // A closed election-state counter means the consensus module closed: it reads CLOSED and never trips.
         return new RejoinWatchdog(lifecycle,
                 QuorumWatchdog.counterValue(context.electionStateCounter(), ElectionState.CLOSED.code()),
                 QuorumWatchdog.counterValue(context.electionCounter(), QuorumWatchdog.STATE_UNAVAILABLE), waitMs,
-                leaderElectWaitMs, peers, windowMs, peers);
+                leaderElectWaitMs, peers, windowMs, peers, peers::tick);
     }
 
     /** The states in which an election open for the wait trips the watchdog (once a leader was known). */
@@ -159,6 +184,11 @@ public final class RejoinWatchdog {
      */
     static boolean isLeaderElectWait(final long code) {
         return code == ElectionState.LEADER_LOG_REPLICATION.code() || code == ElectionState.LEADER_READY.code();
+    }
+
+    /** The reachability evidence this watchdog asks (the production {@link PeerReachability} probe, tests). */
+    BooleanSupplier quorumReachable() {
+        return quorumReachable;
     }
 
     public boolean leaderKnown() {
@@ -205,6 +235,13 @@ public final class RejoinWatchdog {
     public synchronized boolean poll(final long nowNs) {
         if (tripped || stopped) {
             return false;
+        }
+        if (tick != null) {
+            try {
+                tick.run();
+            } catch (final RuntimeException e) {
+                lifecycle.log("rejoin watchdog: the peer reachability probe's tick failed: " + e);
+            }
         }
         final long code = electionState.getAsLong();
         if (!leaderKnown) {

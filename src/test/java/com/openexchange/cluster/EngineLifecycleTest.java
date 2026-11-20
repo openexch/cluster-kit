@@ -114,6 +114,52 @@ public class EngineLifecycleTest {
         assertEquals(List.of(1), halts);
     }
 
+    /** A bare AgentTerminationException thrown from ClientConductor.doWork: what aeron 1.53 throws after terminateConductor. */
+    private static AgentTerminationException clientConductorTermination() {
+        final AgentTerminationException e = new AgentTerminationException();
+        e.setStackTrace(new StackTraceElement[] {
+                new StackTraceElement("io.aeron.ClientConductor", "doWork", "ClientConductor.java", 233),
+                new StackTraceElement("org.agrona.concurrent.AgentRunner", "doWork", "AgentRunner.java", 304)});
+        return e;
+    }
+
+    @Test
+    public void onlyAClientConductorsBareTerminationIsAClientTimeoutTermination() {
+        assertTrue(EngineLifecycle.isClientTimeoutTermination(clientConductorTermination()));
+        assertFalse("a test thread's own throw", EngineLifecycle.isClientTimeoutTermination(new AgentTerminationException()));
+        final AgentTerminationException withMessage = new AgentTerminationException("unexpected Aeron close");
+        withMessage.setStackTrace(clientConductorTermination().getStackTrace());
+        assertFalse("a cluster agent's unexpected close names itself", EngineLifecycle.isClientTimeoutTermination(withMessage));
+        final AgentTerminationException expected = new AgentTerminationException((String) null, true);
+        expected.setStackTrace(clientConductorTermination().getStackTrace());
+        assertFalse(EngineLifecycle.isClientTimeoutTermination(expected));
+        assertFalse(EngineLifecycle.isClientTimeoutTermination(new DriverTimeoutException("x")));
+    }
+
+    /**
+     * A client call on another thread saw the driver timeout first, so the client's conductor stops with a bare
+     * AgentTerminationException before the timeout itself is reported: with an external driver that is already the
+     * driver loss, halted at once with no component close (closing would race the client's unmap of the CnC).
+     */
+    @Test
+    public void aClientConductorsTerminationReportedBeforeTheTimeoutHaltsAsADriverLoss() {
+        final EngineLifecycle lf = lifecycle(1_000, 60_000);
+        assertTrue(lf.onError(clientConductorTermination(), true));
+        assertEquals("halted at once, before any close", List.of(1), halts);
+        assertFalse(logs.toString(), logs.stream().anyMatch(l -> l.contains("agent terminated unexpectedly")));
+        assertTrue(logs.toString(), logs.stream().anyMatch(l -> l.contains("media driver lost in EXTERNAL driver mode")));
+    }
+
+    @Test
+    public void withAnEmbeddedDriverAClientConductorsTerminationStaysAFault() {
+        final EngineLifecycle lf = lifecycle(1_000, 60_000);
+        assertTrue(lf.onError(clientConductorTermination(), false));
+        assertTrue("no halt before the close", halts.isEmpty());
+        assertTrue(logs.toString(), logs.stream().anyMatch(l -> l.contains("agent terminated unexpectedly")));
+        lf.finish();
+        assertEquals(List.of(1), halts);
+    }
+
     @Test
     public void clusterTerminationAloneExitsZero() {
         final EngineLifecycle lf = lifecycle(1_000, 60_000);

@@ -48,7 +48,9 @@ import java.util.function.IntConsumer;
  *       terminating and its conductor later stops with an unexpected {@code AgentTerminationException} instead of
  *       reporting the loss. Such a caller hands the timeout to the client's error handler
  *       ({@link SnapshotLogPruner} does), and an unexpected agent termination after a driver loss joins the halt
- *       on its own thread instead of letting its client close.</li>
+ *       on its own thread instead of letting its client close. That conductor's termination can also reach the
+ *       error handler before the timeout does; a client conductor's bare termination is itself the loss
+ *       ({@link #isClientTimeoutTermination}) and halts the same way.</li>
  *   <li>No leader ever known: the consensus module's election stays in a no-leader state for the
  *       quorum wait after its launch; {@link QuorumWatchdog} records a fatal fault, exit 1.</li>
  *   <li>No rejoin after a leader was known: one election stays open for the rejoin wait and is in a no-leader
@@ -562,7 +564,7 @@ public final class EngineLifecycle {
      * the error, from the Aeron error handler itself, so the halt precedes that client's close.
      */
     public boolean onError(final Throwable t, final boolean externalDriver) {
-        if (externalDriver && isDriverLoss(t)) {
+        if (externalDriver && (isDriverLoss(t) || isClientTimeoutTermination(t))) {
             return driverLost(t);
         }
         if (externalDriver && t instanceof AeronException ae && ae.category() == AeronException.Category.FATAL) {
@@ -578,6 +580,22 @@ public final class EngineLifecycle {
             return fatal(EXIT_FATAL, "agent terminated unexpectedly: " + t);
         }
         return false;
+    }
+
+    /**
+     * An Aeron client's conductor stopping because its client timed out on the driver: aeron 1.53
+     * {@code ClientConductor.terminateConductor} marks the client terminating on a driver, client or service interval
+     * timeout, and the next {@code doWork} throws a bare {@code AgentTerminationException}. It can reach the error
+     * handler before the timeout itself does (the timeout is thrown to a client call on another thread, which reports
+     * it later), so on its own it already means the driver is lost for this process.
+     */
+    static boolean isClientTimeoutTermination(final Throwable t) {
+        if (!(t instanceof AgentTerminationException ate) || ate.isExpected() || ate.getMessage() != null) {
+            return false;
+        }
+        final StackTraceElement[] trace = ate.getStackTrace();
+        return trace.length > 0 && "io.aeron.ClientConductor".equals(trace[0].getClassName())
+                && "doWork".equals(trace[0].getMethodName());
     }
 
     /** The errors after which the reporting Aeron client closes itself and unmaps the CnC. */

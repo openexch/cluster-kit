@@ -3,7 +3,6 @@ package com.openexchange.cluster;
 
 import io.aeron.Aeron;
 import io.aeron.Subscription;
-import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.ElectionState;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
@@ -28,7 +27,7 @@ import static org.junit.Assert.assertTrue;
  * <p>The voter is held deterministically: its consensus agent stops at the end of the duty cycle in which it voted
  * ({@link ThreeMemberCluster.Node#holdAfterVote}), so the vote leaves and nothing after it does. It is then stopped.
  * While no quorum of members is reachable the leader elect stays up past its wait; once stand-in peers answer on
- * both stopped members' consensus endpoints (reachable on the transport, never acknowledging) it exits within the
+ * both stopped members' participation streams (reachable on the transport, never acknowledging) it exits within the
  * leader elect wait, not the shorter rejoin wait.</p>
  */
 public class LeaderElectWaitClusterTest {
@@ -109,7 +108,9 @@ public class LeaderElectWaitClusterTest {
         System.out.println("GREEN leader elect, peers reachable after " + tookMs + " ms: " + critical);
     }
 
-    /** Live subscribers on the stopped members' consensus endpoints; they never acknowledge. Returns the time taken. */
+    /**
+     * Live subscribers on the stopped members' participation streams; they never acknowledge. Returns the time taken.
+     */
     private long awaitTripWithStandInPeers(final ThreeMemberCluster.Node survivor) {
         final String dir = new File(baseDir, "stand-in-driver").getAbsolutePath();
         final int[] peers = new int[2];
@@ -124,10 +125,10 @@ public class LeaderElectWaitClusterTest {
              Aeron aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(dir));
              Subscription peer1 = aeron.addSubscription(
                      "aeron:udp?endpoint=localhost:" + cluster.consensusPort(peers[0]),
-                     ConsensusModule.Configuration.CONSENSUS_STREAM_ID_DEFAULT);
+                     PeerReachability.DEFAULT_PROBE_STREAM_ID);
              Subscription peer2 = aeron.addSubscription(
                      "aeron:udp?endpoint=localhost:" + cluster.consensusPort(peers[1]),
-                     ConsensusModule.Configuration.CONSENSUS_STREAM_ID_DEFAULT)) {
+                     PeerReachability.DEFAULT_PROBE_STREAM_ID)) {
             final long start = System.nanoTime();
             ThreeMemberCluster.await("the leader elect watchdog to trip with both peers reachable",
                     LEADER_ELECT_WAIT_MS + 30_000, () -> {

@@ -331,6 +331,45 @@ public class EngineLifecycleTest {
         }
     }
 
+    /** The probe's participation stream is parsed at install, like its term length: a bad value refuses the boot. */
+    @Test
+    public void aBadProbeStreamIdRefusesTheBoot() {
+        if (System.getenv(PeerReachability.PROBE_STREAM_ID_ENV) != null) {
+            return; // the environment wins over the property
+        }
+        final String before = System.getProperty(PeerReachability.PROBE_STREAM_ID_PROP);
+        try {
+            for (final String bad : new String[] {"0", "-5", "abc", "2147483648"}) {
+                System.setProperty(PeerReachability.PROBE_STREAM_ID_PROP, bad);
+                final IllegalArgumentException e = assertThrows(bad, IllegalArgumentException.class,
+                        () -> EngineLifecycle.install("test-node", line -> { }));
+                assertTrue(e.getMessage(), e.getMessage().startsWith(PeerReachability.PROBE_STREAM_ID_PROP + " must"));
+            }
+        } finally {
+            if (before == null) {
+                System.clearProperty(PeerReachability.PROBE_STREAM_ID_PROP);
+            } else {
+                System.setProperty(PeerReachability.PROBE_STREAM_ID_PROP, before);
+            }
+        }
+    }
+
+    /** On the consensus stream the probe would read a restoring peer reachable: refused before anything is armed. */
+    @Test
+    public void aProbeStreamEqualToTheConsensusStreamRefusesToArm() {
+        final List<String> lines = new CopyOnWriteArrayList<>();
+        final EngineLifecycle lf = new EngineLifecycle("test-node", lines::add, status -> { }, 1_000, 50);
+        final io.aeron.cluster.ConsensusModule.Context context = new io.aeron.cluster.ConsensusModule.Context()
+                .consensusStreamId(PeerReachability.probeStreamId());
+        final IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> lf.watchQuorum(context));
+        final String consensusSetting = io.aeron.cluster.ConsensusModule.Configuration.CONSENSUS_STREAM_ID_PROP_NAME;
+        assertTrue(e.getMessage(), e.getMessage().contains(PeerReachability.PROBE_STREAM_ID_ENV)
+                && e.getMessage().contains(consensusSetting));
+        assertEquals("nothing armed", null, lf.rejoinWatchdog());
+        assertEquals("nothing armed", null, lf.catchupWatchdog());
+        assertTrue(lines.toString(), lines.isEmpty());
+    }
+
     @Test
     public void mainThreadInterruptIsAFaultNotASignalStop() throws Exception {
         final EngineLifecycle lf = lifecycle(1_000, 60_000);

@@ -99,6 +99,12 @@ final class ThreeMemberCluster implements AutoCloseable {
         /** Set once the consensus agent is held. */
         volatile boolean held;
         volatile boolean releaseForClose;
+        /**
+         * Null (default): the service starts at once. Otherwise the next start's service {@code onStart} idles until
+         * this latch opens, the way a long snapshot restore does: the consensus module stays in startup recovery
+         * (module state INIT) until the service acknowledges its start.
+         */
+        volatile java.util.concurrent.CountDownLatch startGate;
 
         Node(final int id) {
             this.id = id;
@@ -174,10 +180,21 @@ final class ThreeMemberCluster implements AutoCloseable {
         volatile long lastPosition;
         volatile Cluster.Role role = Cluster.Role.FOLLOWER;
         volatile Cluster cluster;
+        private final java.util.concurrent.CountDownLatch startGate;
+
+        CountingService(final java.util.concurrent.CountDownLatch startGate) {
+            this.startGate = startGate;
+        }
 
         @Override
         public void onStart(final Cluster cluster, final Image snapshotImage) {
             this.cluster = cluster;
+            if (startGate != null) {
+                // idle through the cluster's idle strategy, as a restore does: it keeps the service's client alive
+                while (startGate.getCount() > 0) {
+                    cluster.idleStrategy().idle();
+                }
+            }
             if (snapshotImage != null) {
                 final long[] loaded = {-1};
                 while (loaded[0] < 0 && !snapshotImage.isEndOfStream()) {
@@ -296,7 +313,7 @@ final class ThreeMemberCluster implements AutoCloseable {
         n.holdAfterVote = false;
         n.held = false;
         n.releaseForClose = false;
-        n.service = new CountingService();
+        n.service = new CountingService(n.startGate);
         final File clusterDir = clusterDir(id);
         final MediaDriver.Context driverContext = new MediaDriver.Context()
                 .aeronDirectoryName(aeronDir(id))

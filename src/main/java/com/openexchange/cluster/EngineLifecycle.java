@@ -259,8 +259,10 @@ public final class EngineLifecycle {
         // the retention floor's settings are read again where the pruner is wired, inside the service's start, where
         // a refusal would be too late to stop the boot: check them here
         SnapshotLogPruner.checkSettings();
-        // the rejoin watchdog's probe reads its term length when the watchdog is armed, after the cluster starts
+        // the rejoin watchdog's probe reads its term length and stream id when the watchdog is armed, after the
+        // cluster starts
         PeerReachability.probeTermLength();
+        PeerReachability.probeStreamId();
         final EngineLifecycle lifecycle = new EngineLifecycle(name, log, status -> Runtime.getRuntime().halt(status),
                 shutdownMs, graceMs, quorumMs, rejoinMs, rejoinWindowMs, leaderElectMs, catchupRefusals(),
                 catchupRefusalWaitMs());
@@ -348,14 +350,25 @@ public final class EngineLifecycle {
      * election-state counter, with this lifecycle's quorum wait, and arms the {@link RejoinWatchdog} (with its
      * {@link PeerReachability} probe) and the {@link CatchupWatchdog} on the same counters. Both driver modes: the
      * watchdogs read counters, and their probes open clients of their own on the context's driver directory.
+     *
+     * @throws IllegalArgumentException before anything is armed, when the probe's participation stream
+     *                                  ({@code ENGINE_REJOIN_PROBE_STREAM_ID}) equals the context's consensus stream
      */
     public QuorumWatchdog watchQuorum(final io.aeron.cluster.ConsensusModule.Context context) {
+        // before anything is armed: on the consensus stream the probe would count a restoring peer as reachable
+        final int probeStreamId = PeerReachability.probeStreamId();
+        final String probeRefusal = PeerReachability.probeStreamRefusal(probeStreamId, context.consensusStreamId());
+        if (probeRefusal != null) {
+            throw new IllegalArgumentException(probeRefusal);
+        }
         log.accept(name + " quorum watchdog armed: exit 1 if no leader is known within " + quorumWaitMs + " ms ("
                 + QUORUM_WAIT_ENV + ")");
         final QuorumWatchdog quorum = QuorumWatchdog.of(this, context, quorumWaitMs);
         watchdogs.add(quorum::stop);
         quorum.startDaemon(name);
-        watchRejoin(RejoinWatchdog.of(this, context, rejoinWaitMs, leaderElectWaitMs, rejoinPeerWindowMs));
+        watchRejoin(RejoinWatchdog.of(this, context, rejoinWaitMs, leaderElectWaitMs, rejoinPeerWindowMs,
+                probeStreamId), "peer probe on participation stream " + probeStreamId + " ("
+                + PeerReachability.PROBE_STREAM_ID_ENV + ")");
         watchCatchup(CatchupWatchdog.of(this, context, catchupRefusals, catchupRefusalWaitMs));
         return quorum;
     }
@@ -378,7 +391,7 @@ public final class EngineLifecycle {
         watchdogs.add(quorum::stop);
         quorum.startDaemon(name);
         watchRejoin(new RejoinWatchdog(this, electionState, elections, rejoinWaitMs, leaderElectWaitMs,
-                quorumReachable, rejoinPeerWindowMs, null));
+                quorumReachable, rejoinPeerWindowMs, null), "reachability from the host's supplier");
         return quorum;
     }
 
@@ -389,12 +402,12 @@ public final class EngineLifecycle {
         return rejoin;
     }
 
-    private void watchRejoin(final RejoinWatchdog w) {
+    private void watchRejoin(final RejoinWatchdog w, final String evidence) {
         log.accept(name + " rejoin watchdog armed: exit 1 if, after a leader was known, one election stays open "
                 + "without a leader for " + rejoinWaitMs + " ms (" + REJOIN_WAIT_ENV + ") while a quorum of members"
                 + " is reachable (evidence window " + rejoinPeerWindowMs + " ms, " + REJOIN_PEER_WINDOW_ENV + "), or a"
                 + " leader elect stays in LEADER_LOG_REPLICATION or LEADER_READY for " + leaderElectWaitMs + " ms ("
-                + LEADER_ELECT_WAIT_ENV + ") under the same condition");
+                + LEADER_ELECT_WAIT_ENV + ") under the same condition; reachability evidence: " + evidence);
         watchdogs.add(w::stop);
         rejoin = w;
         w.startDaemon(name);

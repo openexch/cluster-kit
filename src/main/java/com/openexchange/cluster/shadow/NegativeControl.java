@@ -91,6 +91,8 @@ enum NegativeControl {
     SWEEP_OTHER_PRODUCERS,
     /** Puller: the current leader's archive endpoint is listed and pulled from like any source. */
     LEADER_SOURCE_SKIP_OFF,
+    /** Puller: at one rank and position a candidate being retried goes before one never tried (source order only). */
+    UNTRIED_FIRST_OFF,
     /** Pull settings: a source spelled differently from a member's archive endpoint passes the boot check. */
     SOURCE_SPELLING_CHECK_OFF,
     /** Witness alarm: no floor-side line and no gauge, whatever the witnesses. */

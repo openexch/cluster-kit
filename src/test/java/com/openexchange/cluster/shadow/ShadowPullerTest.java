@@ -731,7 +731,7 @@ public class ShadowPullerTest {
         return deleted;
     }
 
-    ShadowPullSettings deadlineSettings(final Pair p, final int closedPort) {
+    static ShadowPullSettings deadlineSettings(final Pair p, final int closedPort) {
         final List<ShadowPullSettings.Endpoint> sources = new ArrayList<>();
         if (closedPort > 0) {
             sources.add(new ShadowPullSettings.Endpoint("localhost", closedPort));
@@ -798,6 +798,83 @@ public class ShadowPullerTest {
                         + r[0].text() + ")");
             }
         }
+    }
+
+    /**
+     * A source whose catalog keeps two descriptors whose segment files are gone (two producers' shadows at one
+     * position), listed before a good copy of one of them (a member that lost its shadows and pulled one back holds
+     * all three). The archive refuses a replication of a dead descriptor only after its replay connect timeout, and a
+     * pass that starts on that refusal finds the refused descriptor still in its backoff and the other one out of it:
+     * a retry that goes before the copy never tried at the same position alternates the two dead ones and starves the
+     * startup pull. A candidate not yet tried goes first: the good copy is VERIFIED on the third start.
+     */
+    static void untriedFirst(final Set<NegativeControl> off) {
+        try (Pair p = new Pair(10)) {
+            final byte[] a = payload(2);
+            final byte[] b = payload(3);
+            final ShadowHeader ha = header(R3, 2, ShadowKind.ALIGNED, 2_000, GENESIS, a);
+            final ShadowHeader hb = header(F1, 2, ShadowKind.ALIGNED, 2_000, GENESIS, b);
+            final long deadA = p.src.raw(ha, a, true, -1, true);
+            final long deadB = p.src.raw(hb, b, true, -1, true);
+            assertEquals(2, wipeSegments(p.src));
+            final long good = p.src.raw(ha, a, true, -1, true);
+            assertTrue("the dead descriptors are listed first", deadA < deadB && deadB < good);
+            final ShadowPuller.Report[] r = {null};
+            try (ShadowPuller once = p.puller(deadlineSettings(p, -1), GENESIS, () -> false, off)) {
+                final long ms = timedPull(once, 30_000, r);
+                if (r[0].kind() != ShadowPuller.Report.Kind.VERIFIED) {
+                    throw new AssertionError("the good copy was never tried: " + r[0].text() + " in " + ms
+                            + " ms, started " + once.counters().get(Counter.STARTED_TOTAL));
+                }
+                assertEquals("replications started: the two dead ones once each, then the good one", 3,
+                        once.counters().get(Counter.STARTED_TOTAL));
+                ShadowRig.green("puller untried first: two dead descriptors refused once each, the good copy VERIFIED"
+                        + " in " + ms + " ms (" + r[0].text() + ")");
+            }
+        }
+    }
+
+    /**
+     * The same two dead descriptors at a position the startup pull's target ranks first, and a good copy at an older
+     * position it ranks second: a candidate being retried waits for every accepted one not yet tried, whatever its
+     * rank, so the good copy is VERIFIED on the third start.
+     */
+    static void untriedFirstAcrossRanks(final Set<NegativeControl> off) {
+        try (Pair p = new Pair(10)) {
+            final byte[] a = payload(4);
+            final byte[] b = payload(5);
+            final byte[] g = payload(6);
+            final long deadA = p.src.raw(header(R3, 2, ShadowKind.ALIGNED, 3_000, GENESIS, a), a, true, -1, true);
+            final long deadB = p.src.raw(header(F1, 2, ShadowKind.ALIGNED, 3_000, GENESIS, b), b, true, -1, true);
+            assertEquals(2, wipeSegments(p.src));
+            final long good = p.src.raw(header(R3, 1, ShadowKind.ALIGNED, 2_000, GENESIS, g), g, true, -1, true);
+            assertTrue("the dead descriptors are listed first", deadA < deadB && deadB < good);
+            try (ShadowPuller once = p.puller(deadlineSettings(p, -1), GENESIS, () -> false, off)) {
+                final long t0 = System.nanoTime();
+                final ShadowPuller.Report r = once.pullOnce(x -> x.logPosition() == 3_000 ? 0 : 1,
+                        t0 + TimeUnit.SECONDS.toNanos(30));
+                final long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+                if (r.kind() != ShadowPuller.Report.Kind.VERIFIED) {
+                    throw new AssertionError("the good copy was never tried: " + r.text() + " in " + ms
+                            + " ms, started " + once.counters().get(Counter.STARTED_TOTAL));
+                }
+                assertEquals(2_000, r.pulled().header().logPosition());
+                assertEquals("replications started: the two dead ones once each, then the good one", 3,
+                        once.counters().get(Counter.STARTED_TOTAL));
+                ShadowRig.green("puller untried first across ranks: two dead descriptors at the first rank refused once"
+                        + " each, the good copy at the second rank VERIFIED in " + ms + " ms (" + r.text() + ")");
+            }
+        }
+    }
+
+    @Test(timeout = 240_000)
+    public void aCandidateNotYetTriedGoesBeforeARetry() {
+        untriedFirst(Set.of());
+        untriedFirstAcrossRanks(Set.of());
+        nc("UNTRIED_FIRST_OFF", "the good copy was never tried",
+                () -> untriedFirstAcrossRanks(Set.of(NegativeControl.UNTRIED_FIRST_OFF)));
+        nc("UNTRIED_FIRST_OFF", "the good copy was never tried",
+                () -> untriedFirst(Set.of(NegativeControl.UNTRIED_FIRST_OFF)));
     }
 
     /** A dead descriptor found by the first scan of a startup pull is not read again by its later scans. */

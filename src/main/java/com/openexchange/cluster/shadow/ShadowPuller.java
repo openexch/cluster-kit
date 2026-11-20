@@ -48,8 +48,10 @@ import java.util.function.LongSupplier;
  * position (steady state) or accepted by the {@link Target} (a startup pull). One exception in steady state: an ALIGNED
  * at a position this node holds usable ALIGNED copies of, all from ONE producer, is a candidate when its producer is
  * another one (the second witness the two-producer anchor needs; once two producers are held there, nothing more is
- * pulled at that position). Newest position first, then source order. The alias is a locator: the local header
- * decides after the pull.</p>
+ * pulled at that position). Newest position first, then the fewest refusals since the last success (a candidate never
+ * tried before one being retried), then source order: the allowlist order only breaks ties between candidates refused
+ * equally often. A startup pull orders every candidate not yet tried before every one being retried, then by the
+ * {@link Target}'s rank, then as in steady state. The alias is a locator: the local header decides after the pull.</p>
  *
  * <h2>Pull and completion</h2>
  * <p>At most {@code SHADOW_PULL_MAX_INFLIGHT} replications ({@code replicate} with {@link ReplicationParams}: the
@@ -825,10 +827,26 @@ public final class ShadowPuller implements AutoCloseable {
             }
         }
         final Comparator<Candidate> newestFirst = Comparator.comparingLong((Candidate c) -> c.alias().logPosition())
-                .reversed().thenComparingInt(Candidate::sourceOrder);
+                .reversed().thenComparingInt(this::failures).thenComparingInt(Candidate::sourceOrder);
+        // a startup pull accepts every ranked candidate as a restore source: one being retried waits for every accepted
+        // one not yet tried, whatever its rank, so dead descriptors at a better rank never starve a good copy below
         out.sort(target == null ? newestFirst
-                : Comparator.comparingInt((Candidate c) -> target.rank(c.alias())).thenComparing(newestFirst));
+                : Comparator.comparingInt((Candidate c) -> failures(c) > 0 ? 1 : 0)
+                        .thenComparingInt((Candidate c) -> target.rank(c.alias())).thenComparing(newestFirst));
         return out;
+    }
+
+    /**
+     * The refusals of {@code c} since its last success, 0 for a candidate never tried: at one rank and position a
+     * candidate tried fewer times goes first, so a source descriptor refused again and again (its segment file gone,
+     * the archive answering only after its replay connect timeout) never keeps a copy not yet tried from its turn.
+     */
+    private int failures(final Candidate c) {
+        if (off.contains(NegativeControl.UNTRIED_FIRST_OFF)) {
+            return 0;
+        }
+        final Backoff b = backoff.get(c.key());
+        return b == null ? 0 : b.failures;
     }
 
     /** A producer slot as the alias names it ({@code <producer kind>.<producer id>}). */

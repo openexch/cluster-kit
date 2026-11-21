@@ -28,12 +28,13 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 /**
- * The leader's floor behind shadows the other members hold (the one relaxation of rule 12.7, for the current leader
- * only). Three real archives: a FOLLOWER archive holding shadows (a {@link FloorRig}: its {@link FloorAttestor}
+ * The leader's floor behind shadows the other members hold (the one relaxation of the verified-only floor rule, for
+ * the current leader only). Three real archives: a FOLLOWER archive holding shadows (a {@link FloorRig}: its
+ * {@link FloorAttestor}
  * publishes the marker from its own verified scan), and a LEADER archive holding a log, a stub group at P_cm and no
  * shadow at all (a second {@link FloorRig}), whose {@link RemoteFloor} lists the follower's archive over its UDP
  * control channel. The leader's pruner pass ({@code ArchiveHousekeeping.purgeBelow}) really deletes the log below the
- * floor. Each guard has its negative control, and each control turns its own assertion RED with the named text (C6).
+ * floor. Each guard has its negative control, and each control turns its own assertion RED with the named text.
  */
 public class LeaderRemoteFloorTest {
 
@@ -309,7 +310,7 @@ public class LeaderRemoteFloorTest {
             assertEquals("one remote producer: the leader's log stays whole", 0, l.pass());
             assertEquals(0, l.rig.hk.get(ShadowHousekeeping.Counter.LEADER_REMOTE_FLOOR_APPLIED_TOTAL));
 
-            // the second producer arrives later (C2): the follower attests, the leader's next listing sees it
+            // the second producer arrives later: the follower attests, the leader's next listing sees it
             f.rig.shadow(P_CM, SAFE_SEQ, image, F1, ShadowKind.ALIGNED);
             attestor.observe(f.verifiedScan());
             assertEquals(List.of(new FloorAttestation(ENGINE, 0, GENESIS, FOLLOWER_ID, P_CM, 2, P_2, 1)), f.markers());
@@ -330,7 +331,7 @@ public class LeaderRemoteFloorTest {
             assertTrue(P_2 >= start);
             ShadowRig.green("leader remote floor: log start " + start + " behind the follower's attested shadows");
 
-            // the attestation is retracted when its position is no longer witnessed (C4), and written again (twice)
+            // the attestation is retracted when its position is no longer witnessed, and written again (twice)
             for (int round = 0; round < 2; round++) {
                 final Scan none = new Scan(List.of(), List.of(), List.of(), List.of(), 0, java.util.Map.of(), true, 0,
                         null, 0);
@@ -495,7 +496,7 @@ public class LeaderRemoteFloorTest {
             l.awaitListed(2);
             assertLogWhole("holders=2 and one member attests", l);
             assertEquals(RemoteFloor.Result.Kind.TOO_FEW_HOLDERS, l.floor.remoteResult(l.floor.evaluate()).kind());
-            // the second member attests later (C2); its margin shadow is lower: the floor both attest
+            // the second member attests later; its margin shadow is lower: the floor both attest
             final byte[] image = FloorRig.payload(11);
             f2.rig.shadow(P_1, SAFE_SEQ, FloorRig.payload(5), R3, ShadowKind.ALIGNED);
             f2.rig.shadow(P_CM, SAFE_SEQ, image, R3, ShadowKind.ALIGNED);

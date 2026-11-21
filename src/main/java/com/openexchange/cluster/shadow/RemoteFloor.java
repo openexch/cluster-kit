@@ -19,9 +19,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
 
 /**
- * The LEADER's floor behind shadows it does not hold: the one place the rule "only VERIFIED shadows this node
- * can restore from feed the floor" is relaxed, for the current leader only. The leader never
- * pulls (a pull records into the leader's archive, whose recorder also records the log) and does not produce,
+ * The LEADER's floor behind shadows it does not hold: the one place hard rule 12.7 ("only VERIFIED shadows this node
+ * can restore from feed the floor") is relaxed, for the current leader only (Emre, 2026-11-19). The leader never
+ * pulls (D15: a pull records into the leader's archive, whose recorder also records the log) and does not produce,
  * so its local floor stays where it was when it was elected; with the follower rule (never past the leader's log
  * start) no member would purge while leadership is stable.
  *

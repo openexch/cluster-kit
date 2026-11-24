@@ -79,7 +79,7 @@ public class ReplicaContextsTest {
     public void portsAreFixedSlotPortsAndDefaultsAreTuned() {
         final ReplicaConfig c = base().build();
         assertEquals("10.0.0.1:9303,10.0.0.2:9403,10.0.0.3:9503", ReplicaContexts.consensusEndpoints(c));
-        assertEquals("aeron:udp?endpoint=10.0.0.9:9603", ReplicaContexts.consensusChannel(c));
+        assertEquals("aeron:udp?endpoint=10.0.0.9:9603|term-length=1m", ReplicaContexts.consensusChannel(c));
         assertEquals("10.0.0.9:9604", ReplicaContexts.catchupEndpoint(c));
         assertEquals("aeron:udp?endpoint=10.0.0.9:9601", ReplicaContexts.archiveControlChannel(c));
         assertEquals("aeron:udp?endpoint=10.0.0.9:9605", ReplicaContexts.transferChannel(c));
@@ -103,6 +103,14 @@ public class ReplicaContextsTest {
         }
         assertTrue("defaults must not warn: " + ReplicaContexts.windowWarnings(c),
                 ReplicaContexts.windowWarnings(c).isEmpty());
+    }
+
+    /** The replica publishes consensus on the members' consensus term, so a configured term reaches it. */
+    @Test
+    public void theConsensusChannelTakesTheConfiguredTerm() {
+        final ReplicaConfig c = base().consensusChannel(com.openexchange.cluster.ConsensusChannel.parse(
+                n -> com.openexchange.cluster.ConsensusChannel.SETTING.equals(n) ? "4m" : null)).build();
+        assertEquals("aeron:udp?endpoint=10.0.0.9:9603|term-length=4m", ReplicaContexts.consensusChannel(c));
     }
 
     /** The driver MTU, its term lengths and the catch-up so-sndbuf are settings with the old defaults. */

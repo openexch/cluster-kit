@@ -263,17 +263,38 @@ public final class ArchiveHousekeeping {
      * an operator running this by hand against a filling disk must not be
      * blocked by an argument they do not have.
      *
-     * Usage: ArchiveHousekeeping &lt;clusterDir&gt; &lt;aeronDir&gt; [--watermark=N] [ignored]
+     * <p>The member's off-box watermark file ({@link OffBoxWatermark}) bounds this
+     * purge exactly as it bounds the engine's own pruner, under the same
+     * {@code RETENTION_OFFBOX} setting: there is no purge path around it. The
+     * tool is not the member, so the member's identity arrives as named
+     * arguments ({@code --offbox-engine=core|match}, {@code --offbox-cluster-id=N},
+     * {@code --offbox-genesis-id=G}); without them the watermark cannot be
+     * matched to this member and, under {@code required}, nothing is purged.
+     * {@code off} with a watermark file present refuses the run.
+     *
+     * Usage: ArchiveHousekeeping &lt;clusterDir&gt; &lt;aeronDir&gt; [--watermark=N]
+     *        [--offbox-engine=core|match --offbox-cluster-id=N --offbox-genesis-id=G] [ignored]
      */
     public static void main(final String[] args) {
         if (args.length < 2) {
-            System.err.println("Usage: ArchiveHousekeeping <clusterDir> <aeronDir> [ignored]");
+            System.err.println("Usage: ArchiveHousekeeping <clusterDir> <aeronDir> [--watermark=N]"
+                    + " [--offbox-engine=core|match --offbox-cluster-id=N --offbox-genesis-id=G] [ignored]");
             System.exit(2);
         }
         final File clusterDir = new File(args[0]);
         final String aeronDir = args[1];
 
         final long watermark = watermarkFrom(args);
+        final OffBoxWatermark offBox;
+        try {
+            // off with a file present refuses, as it refuses a member's start
+            OffBoxWatermark.checkBoot(clusterDir);
+            offBox = offBoxFrom(clusterDir, args);
+        } catch (final IllegalArgumentException refused) {
+            System.err.println("[HOUSEKEEPING] FAILED: " + refused.getMessage());
+            System.exit(1);
+            return;
+        }
 
         try (AeronArchive archive = AeronArchive.connect(
                 new AeronArchive.Context()
@@ -281,7 +302,14 @@ public final class ArchiveHousekeeping {
                         .controlResponseChannel("aeron:ipc?term-length=16m")
                         .aeronDirectoryName(aeronDir))) {
 
-            final Result result = purgeBelow(clusterDir, archive, watermark);
+            final int clusterId = (int) flagValue(args, OFFBOX_CLUSTER_ID_FLAG, 0);
+            final org.agrona.concurrent.status.CountersReader counters = archive.context().aeron().countersReader();
+            final int counterId = io.aeron.cluster.service.ClusterCounters.find(
+                    counters, io.aeron.AeronCounters.CLUSTER_COMMIT_POSITION_TYPE_ID, clusterId);
+            final long commitPosition = counterId == org.agrona.concurrent.status.CountersReader.NULL_COUNTER_ID
+                    ? -1 : counters.getCounterValue(counterId);
+
+            final Result result = purgeBelow(clusterDir, archive, watermark, offBox, commitPosition);
             System.out.println("[HOUSEKEEPING] Done: " + result);
             if (result.errors > 0) {
                 System.exit(1);
@@ -291,5 +319,73 @@ public final class ArchiveHousekeeping {
             e.printStackTrace();
             System.exit(1);
         }
+    }
+
+    private static final String OFFBOX_ENGINE_FLAG = "--offbox-engine=";
+    private static final String OFFBOX_CLUSTER_ID_FLAG = "--offbox-cluster-id=";
+    private static final String OFFBOX_GENESIS_ID_FLAG = "--offbox-genesis-id=";
+
+    /** Test seam (the negative control of the off-box bound on this path): the file is not evaluated. */
+    static volatile boolean offBoxOffForTest;
+
+    /**
+     * The purge of the command line: {@link #purgeBelow(File, AeronArchive, long)} bounded by the member's off-box
+     * watermark as well, evaluated from its file now.
+     *
+     * @param offBox         the member's watermark with its mode
+     * @param commitPosition the member's commit position, below 0 when it could not be read
+     */
+    static Result purgeBelow(final File clusterDir, final AeronArchive archive, final long watermark,
+                             final OffBoxWatermark offBox, final long commitPosition) {
+        if (offBoxOffForTest) {
+            return purgeBelow(clusterDir, archive, watermark);
+        }
+        final long nowMs = System.currentTimeMillis();
+        final OffBoxWatermark.Evaluation evaluation = offBox.evaluate(commitPosition, nowMs);
+        final Result result = purgeBelow(clusterDir, archive, Math.min(watermark, evaluation.appliedFloor()));
+        offBox.reportPass(evaluation, watermark, nowMs, System.out::println, System.err::println);
+        return result;
+    }
+
+    /**
+     * The member's off-box watermark as this tool can know it. Without the three identity arguments the genesis id
+     * is 0, which evaluates as "no recorded genesis": under {@code required} that holds the whole log.
+     *
+     * @throws IllegalArgumentException for a malformed identity argument or setting
+     */
+    static OffBoxWatermark offBoxFrom(final File clusterDir, final String[] args) {
+        String engine = null;
+        for (int i = 2; i < args.length; i++) {
+            if (args[i].startsWith(OFFBOX_ENGINE_FLAG)) {
+                engine = args[i].substring(OFFBOX_ENGINE_FLAG.length());
+            }
+        }
+        final long clusterId = flagValue(args, OFFBOX_CLUSTER_ID_FLAG, 0);
+        if (clusterId < 0 || clusterId > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(OFFBOX_CLUSTER_ID_FLAG + clusterId + " is not a cluster id");
+        }
+        final long genesisId = engine == null ? 0 : flagValue(args, OFFBOX_GENESIS_ID_FLAG, 0);
+        if (engine == null && OffBoxWatermark.modeSetting() != OffBoxWatermark.Mode.OFF) {
+            System.err.println("[HOUSEKEEPING] " + OffBoxWatermark.MODE_ENV + "="
+                    + OffBoxWatermark.modeSetting().text() + " and no " + OFFBOX_ENGINE_FLAG + ", "
+                    + OFFBOX_CLUSTER_ID_FLAG + ", " + OFFBOX_GENESIS_ID_FLAG + ": the watermark cannot be matched"
+                    + " to this member");
+        }
+        return new OffBoxWatermark(clusterDir, engine == null ? OffBoxWatermark.ENGINE_CORE : engine,
+                (int) clusterId, () -> genesisId);
+    }
+
+    private static long flagValue(final String[] args, final String flag, final long absent) {
+        for (int i = 2; i < args.length; i++) {
+            if (args[i].startsWith(flag)) {
+                final String value = args[i].substring(flag.length());
+                try {
+                    return Long.parseLong(value);
+                } catch (final NumberFormatException e) {
+                    throw new IllegalArgumentException("unparseable " + flag + "value: " + value);
+                }
+            }
+        }
+        return absent;
     }
 }

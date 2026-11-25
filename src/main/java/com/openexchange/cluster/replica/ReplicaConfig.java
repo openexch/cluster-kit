@@ -162,6 +162,7 @@ public final class ReplicaConfig {
     final String catchupRcvbuf;
     final String catchupRcvWnd;
     final String catchupSndbuf;
+    final com.openexchange.cluster.ConsensusChannel consensusChannel;
     final int driverMtu;
     final int driverTermLength;
     final long driverDirActiveMs;
@@ -233,6 +234,7 @@ public final class ReplicaConfig {
         this.catchupRcvbuf = b.catchupRcvbuf;
         this.catchupRcvWnd = b.catchupRcvWnd;
         this.catchupSndbuf = b.catchupSndbuf;
+        this.consensusChannel = b.consensusChannel;
         this.driverMtu = b.driverMtu;
         this.driverTermLength = b.driverTermLength;
         this.driverDirActiveMs = b.driverDirActiveMs;
@@ -381,6 +383,11 @@ public final class ReplicaConfig {
 
     public String catchupSndbuf() {
         return catchupSndbuf;
+    }
+
+    /** {@code TRANSPORT_CONSENSUS_TERM_LENGTH}: the term of the replica's consensus publication, as the members'. */
+    public com.openexchange.cluster.ConsensusChannel consensusChannel() {
+        return consensusChannel;
     }
 
     public int driverMtu() {
@@ -609,6 +616,8 @@ public final class ReplicaConfig {
         private String catchupRcvbuf = DEFAULT_CATCHUP_RCVBUF;
         private String catchupRcvWnd = DEFAULT_CATCHUP_RCV_WND;
         private String catchupSndbuf = DEFAULT_CATCHUP_SNDBUF;
+        private com.openexchange.cluster.ConsensusChannel consensusChannel =
+                com.openexchange.cluster.ConsensusChannel.parse(name -> null);
         private int driverMtu = DEFAULT_DRIVER_MTU;
         private int driverTermLength = DEFAULT_DRIVER_TERM_LENGTH;
         private long driverDirActiveMs = DEFAULT_DRIVER_DIR_ACTIVE_MS;
@@ -772,6 +781,12 @@ public final class ReplicaConfig {
         /** {@code REPLICA_CATCHUP_SNDBUF}. */
         public Builder catchupSndbuf(final String v) {
             this.catchupSndbuf = v;
+            return this;
+        }
+
+        /** {@code TRANSPORT_CONSENSUS_TERM_LENGTH}, parsed by the host with {@code ConsensusChannel.parse}. */
+        public Builder consensusChannel(final com.openexchange.cluster.ConsensusChannel v) {
+            this.consensusChannel = v;
             return this;
         }
 
@@ -1148,6 +1163,7 @@ public final class ReplicaConfig {
                 throw new IllegalArgumentException(clientTimeouts);
             }
             Objects.requireNonNull(catchupSndbuf, "REPLICA_CATCHUP_SNDBUF");
+            Objects.requireNonNull(consensusChannel, com.openexchange.cluster.ConsensusChannel.SETTING);
             positive("archiveSegmentLength", archiveSegmentLength);
             nonNegative("SHADOW_STANDBY_FALLBACK_MINUTES", standbyFallbackMs);
             nonNegative("REPLICA_READY_SHADOW_AGE_MS", readyShadowAgeMs);

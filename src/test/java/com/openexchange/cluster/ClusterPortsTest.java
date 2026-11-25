@@ -94,6 +94,64 @@ public class ClusterPortsTest {
         }
     }
 
+    /**
+     * The member's HTTP endpoint follows the same rule as its UDP ports: at the default stride members 0 and 2
+     * (on their own hosts) serve it on the same port. The old per-engine defaults (9700 + id, 9500 + id) gave
+     * them different ports.
+     */
+    @Test
+    public void theNodeEndpointIsTheSamePortOnEveryHostByDefault() {
+        assertEquals(0, ClusterPorts.stride());
+        assertEquals(9306, ClusterPorts.nodeEndpointPort(0, 9300, "CORE_NODE_PORT", null));
+        assertEquals(ClusterPorts.nodeEndpointPort(0, 9300, "CORE_NODE_PORT", null),
+                ClusterPorts.nodeEndpointPort(2, 9300, "CORE_NODE_PORT", null));
+        assertEquals(9006, ClusterPorts.nodeEndpointPort(2, 9000, "METRICS_PORT", ""));
+    }
+
+    /** Co-located members (the shared-host stride) get distinct endpoint ports, one stride apart. */
+    @Test
+    public void aSharedHostStrideGivesDistinctNodeEndpoints() {
+        System.setProperty(PROP, Integer.toString(ClusterPorts.SHARED_HOST_STRIDE));
+        ClusterPorts.resetStrideForTest();
+        assertEquals(9306, ClusterPorts.nodeEndpointPort(0, 9300, "CORE_NODE_PORT", null));
+        assertEquals(9406, ClusterPorts.nodeEndpointPort(1, 9300, "CORE_NODE_PORT", null));
+        assertEquals(9506, ClusterPorts.nodeEndpointPort(2, 9300, "CORE_NODE_PORT", null));
+        assertEquals(9606, ClusterPorts.nodeEndpointPort(3, 9300, "CORE_NODE_PORT", null));
+        assertEquals(9206, ClusterPorts.nodeEndpointPort(2, 9000, "METRICS_PORT", null));
+    }
+
+    /** An override that names the computed port is accepted (a launcher that writes the port out is checked). */
+    @Test
+    public void anAgreeingOverrideIsAccepted() {
+        assertEquals(9406, ClusterPorts.nodeEndpointPort(1, 9300, 100, "CORE_NODE_PORT", " 9406 "));
+        assertEquals(9306, ClusterPorts.nodeEndpointPort(1, 9300, 0, "CORE_NODE_PORT", "9306"));
+    }
+
+    /**
+     * An override that disagrees refuses the boot, with both numbers: the old per-id port under the default
+     * stride, and a stride mismatch between a launcher and the engine.
+     */
+    @Test
+    public void aConflictingOverrideIsRefused() {
+        assertRefused(() -> ClusterPorts.nodeEndpointPort(2, 9300, 0, "CORE_NODE_PORT", "9702"),
+                "CORE_NODE_PORT=9702 disagrees with the node endpoint port 9306 (port base 9300 + node 2 x stride 0 + 6)");
+        assertRefused(() -> ClusterPorts.nodeEndpointPort(1, 9000, 0, "METRICS_PORT", "9106"),
+                "METRICS_PORT=9106 disagrees with the node endpoint port 9006");
+        assertRefused(() -> ClusterPorts.nodeEndpointPort(1, 9000, 100, "METRICS_PORT", "nine"),
+                "METRICS_PORT=nine is not a number");
+        assertRefused(() -> ClusterPorts.nodeEndpointPort(1, 65_500, 100, "METRICS_PORT", null),
+                "outside 1..65535");
+    }
+
+    private static void assertRefused(final Runnable r, final String text) {
+        try {
+            r.run();
+            fail("expected a refusal containing: " + text);
+        } catch (final IllegalArgumentException expected) {
+            assertTrue(expected.getMessage(), expected.getMessage().contains(text));
+        }
+    }
+
     /** The offsets themselves are the contract; changing one silently repoints a component. */
     @Test
     public void theOffsetsAreFixed() {
@@ -102,5 +160,6 @@ public class ClusterPortsTest {
         assertEquals(3, ClusterPorts.MEMBER_FACING_OFFSET);
         assertEquals(4, ClusterPorts.LOG_OFFSET);
         assertEquals(5, ClusterPorts.TRANSFER_OFFSET);
+        assertEquals(6, ClusterPorts.NODE_ENDPOINT_OFFSET);
     }
 }

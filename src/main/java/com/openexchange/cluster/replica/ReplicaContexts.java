@@ -65,8 +65,13 @@ public final class ReplicaContexts {
         return sb.toString();
     }
 
+    /**
+     * The replica's consensus channel, on the members' consensus term ({@code TRANSPORT_CONSENSUS_TERM_LENGTH}): each
+     * member holds an image of the replica's consensus publication, so its term lands in every member's driver.
+     */
     public static String consensusChannel(final ReplicaConfig c) {
-        return "aeron:udp?endpoint=" + replicaEndpoint(c, ClusterPorts.MEMBER_FACING_OFFSET);
+        return "aeron:udp?endpoint=" + replicaEndpoint(c, ClusterPorts.MEMBER_FACING_OFFSET) + "|term-length="
+                + c.consensusChannel.termLengthText();
     }
 
     public static String catchupEndpoint(final ReplicaConfig c) {

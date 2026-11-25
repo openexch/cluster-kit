@@ -50,6 +50,13 @@ public final class ClusterPorts {
     public static final int LOG_OFFSET = 4;
     /** Catch-up replay / transfer. */
     public static final int TRANSFER_OFFSET = 5;
+    /**
+     * The member's HTTP endpoint ({@code /health}, {@code /ready}, {@code /metrics}), TCP. It follows the same rule as
+     * the UDP ports, so at the default stride every member serves it on the same port and a co-located set (stride
+     * 100) gets distinct ones. It used to be a per-engine base plus the member id, which is a shared-host layout
+     * baked into a default: with one member per address it gave each member a different port for no reason.
+     */
+    public static final int NODE_ENDPOINT_OFFSET = 6;
 
     /** Members share a host and need distinct ports: the historical layout. */
     public static final int SHARED_HOST_STRIDE = 100;
@@ -121,6 +128,55 @@ public final class ClusterPorts {
     public static String endpoint(final int nodeId, final String host, final int portBase,
                                   final int offset) {
         return host + ":" + port(nodeId, portBase, offset);
+    }
+
+    /**
+     * The member's HTTP endpoint port ({@link #NODE_ENDPOINT_OFFSET}) under the configured stride, cross-checked
+     * against an optional override.
+     *
+     * @see #nodeEndpointPort(int, int, int, String, String)
+     */
+    public static int nodeEndpointPort(final int nodeId, final int portBase, final String overrideName,
+                                       final String overrideText) {
+        return nodeEndpointPort(nodeId, portBase, stride(), overrideName, overrideText);
+    }
+
+    /**
+     * The member's HTTP endpoint port: {@code portBase + nodeId * stride + NODE_ENDPOINT_OFFSET}.
+     *
+     * <p>An override (the engine's port env, null or blank when unset) is accepted only when it names the same
+     * port. It is kept so a launcher that writes the port out explicitly is checked against the rule rather than
+     * trusted: a launcher and an engine that disagree about where the probe listens produce a member that is up but
+     * reads as dead, so the boot is refused instead, with both numbers in the text.</p>
+     *
+     * @param overrideName the setting the override came from, for the refusal text
+     * @throws IllegalArgumentException when the override is not a number or disagrees with the computed port, or
+     *                                  the computed port is outside 1..65535
+     */
+    public static int nodeEndpointPort(final int nodeId, final int portBase, final int stride,
+                                       final String overrideName, final String overrideText) {
+        final long computed = (long) portBase + (long) nodeId * stride + NODE_ENDPOINT_OFFSET;
+        final String rule = "port base " + portBase + " + node " + nodeId + " x stride " + stride + " + "
+                + NODE_ENDPOINT_OFFSET;
+        if (computed < 1 || computed > 65_535) {
+            throw new IllegalArgumentException("node endpoint port " + computed + " (" + rule
+                    + ") is outside 1..65535");
+        }
+        if (overrideText == null || overrideText.isBlank()) {
+            return (int) computed;
+        }
+        final int override;
+        try {
+            override = Integer.parseInt(overrideText.trim());
+        } catch (final NumberFormatException e) {
+            throw new IllegalArgumentException(overrideName + "=" + overrideText + " is not a number", e);
+        }
+        if (override != computed) {
+            throw new IllegalArgumentException(overrideName + "=" + override
+                    + " disagrees with the node endpoint port " + computed + " (" + rule
+                    + "); unset it, or fix the port base or CLUSTER_PORT_STRIDE");
+        }
+        return override;
     }
 
     /**

@@ -25,7 +25,7 @@ auth policy, its image format), the engine passes it in.
 
 | Package | What it holds |
 |---|---|
-| `com.openexchange.cluster` | Snapshots and retention: `SnapshotCadence` (leader-side snapshot trigger, by log bytes with a timer floor), `SnapshotEnvelope` (magic, version, length, CRC32C around a snapshot payload), `SnapshotLayouts` (the snapshot layouts one build reads, the current and the previous one, and the layout it writes, picked by the recorded behaviour version), `SnapshotImageReader`, `SnapshotLogPruner`, `ArchiveHousekeeping`, `RetentionWatermark`, `ReaderRegistry`, `ClusterMemberPositions`, `StagingArchive`, `BundleCapture`. Node process: `EngineLifecycle`, `QuorumWatchdog`, `NodeEndpoint` (`/health`, `/ready`, `/metrics`), `NodeReadiness`, `ConsensusReadiness`, `ConsensusCommitObserver`. Wiring: `ClusterPorts` (UDP offsets 1..5 and the HTTP endpoint at offset 6), `ConsensusChannel` (the consensus term), `TimerPort`, `TermTimerId`. Driver and transport checks: `EmbeddedDriverDir` (refuses a live driver's directory, replaces a stale one), `SocketBufferProbe` (the kernel's grant of a socket buffer against the configured size). |
+| `com.openexchange.cluster` | Snapshots and retention: `SnapshotCadence` (leader-side snapshot trigger, by log bytes with a timer floor), `SnapshotEnvelope` (magic, version, length, CRC32C around a snapshot payload), `SnapshotLayouts` (the snapshot layouts one build reads, the current and the previous one, and the layout it writes, picked by the recorded behaviour version), `WireCeiling` (the ingress wire gate: a frame above the recorded ceiling is dropped from its header before the jar range is consulted; the ceiling only rises; a jar below it stops), `SnapshotImageReader`, `SnapshotLogPruner`, `ArchiveHousekeeping`, `RetentionWatermark`, `ReaderRegistry`, `ClusterMemberPositions`, `StagingArchive`, `BundleCapture`. Node process: `EngineLifecycle`, `QuorumWatchdog`, `NodeEndpoint` (`/health`, `/ready`, `/metrics`), `NodeReadiness`, `ConsensusReadiness`, `ConsensusCommitObserver`. Wiring: `ClusterPorts` (UDP offsets 1..5 and the HTTP endpoint at offset 6), `ConsensusChannel` (the consensus term), `TimerPort`, `TermTimerId`. Driver and transport checks: `EmbeddedDriverDir` (refuses a live driver's directory, replaces a stale one), `SocketBufferProbe` (the kernel's grant of a socket buffer against the configured size). |
 | `com.openexchange.cluster.auth` | Session authentication and authorisation shared by both engines: credentials, principals, key table, `ClusterAuthenticator`, `ClassAuthorisationService`. See [docs/auth.md](docs/auth.md). |
 | `com.openexchange.cluster.log` | `ClusterLogReader` (reads a committed cluster log without a cluster), `ReplayContainer`, `ShadowEngine` (the apply interface an engine implements), `SkipWindow`. |
 | `com.openexchange.cluster.replica` | The replica process: a non-member that follows the cluster through `ClusterBackup`, applies the log into its own engine instance and writes shadow images, with a trust check after every restore. See [docs/replica.md](docs/replica.md). |
@@ -100,6 +100,9 @@ system property:
 | `RETENTION_MEMBER_WAIT_BYTES` / `-Dretention.member.wait.bytes` | `SnapshotLogPruner`, `RetentionWatermark` | `2147483648` (1048576..1099511627776). How far behind the newest snapshot a member may be before the floor stops waiting for it. |
 | `RETENTION_PROBE_TIMEOUT_MS` / `-Dretention.probe.timeout.ms` | `SnapshotLogPruner`, `CatchupWatchdog`, `LogExtent` | `5000` (100..60000). How long one read of the leader's log start from the leader's archive may take. |
 | `RETENTION_RECHECK_MAX_MS` / `-Dretention.recheck.max.ms` | `SnapshotLogPruner` | `60000` (1000..3600000). After a purge pass the retention floor stopped, the floor is read again without a new snapshot: one poll interval later, then doubling up to this bound; a floor that rose starts a purge pass at once (a follower follows its leader's log start). |
+| `RETENTION_OFFBOX` / `-Dretention.offbox` | `SnapshotLogPruner`, `OffBoxWatermark`, `ArchiveHousekeeping` | `off`. `required`: the purge never passes the member's off-box watermark, and a watermark that is missing, invalid, foreign or above the commit position holds the whole log. `report`: the same evaluation, logged and exported, not applied. `off` with a watermark file present refuses the start. |
+| `RETENTION_OFFBOX_ALARM_BYTES` / `-Dretention.offbox.alarm.bytes` | `OffBoxWatermark` | `2147483648` (1048576..1099511627776). Log bytes held for the off-box copy above which every purge pass prints a CRITICAL line. An alarm, not a limit. |
+| `RETENTION_OFFBOX_STALE_MS` / `-Dretention.offbox.stale.ms` | `OffBoxWatermark` | `3600000` (1000..604800000). Age of the watermark file above which every purge pass prints a CRITICAL line. It does not change the floor. |
 
 A value outside its range refuses the start: `EngineLifecycle.install` parses
 every row above before any thread starts.
@@ -148,6 +151,94 @@ wait, then logs a CRITICAL line and purges to its own snapshot again; while
 the floor is unknown the pruner's `lastError()` says so. The time half of
 the bound runs on the local clock and restarts when leadership moves; the byte
 half needs no clock.
+
+### Log retention and a copy off the cluster's hosts
+
+A deployment that keeps a copy of the cluster log off every host of the cluster
+(a bundle store, a replica host) can make that copy bound the purge:
+**retention never deletes what is not yet durably off-box.** The fact "the log
+is durably off-box below position X" is about storage outside the cluster, so it
+is not carried in the replicated log. It lives in one small file per member,
+`<clusterDir>/retention/offbox-watermark`, written by a command run on that
+member's host:
+
+```
+java -cp <engine jar> com.openexchange.cluster.OffBoxWatermarkTool
+  set     --cluster-dir <dir> --engine core|match --cluster-id <n> --genesis-id <g>
+          --log-position-bytes <p> --source <name> [--allow-lower]
+  release --cluster-dir <dir> --genesis-id <g> --up-to-log-position-bytes <p> --reason <text>
+  show    --cluster-dir <dir>
+  clear   --cluster-dir <dir> --genesis-id <g>
+```
+
+Every value is a named flag with its unit in the name; a positional argument,
+an unknown, missing or repeated flag exits 64. A refused input exits 65 and
+leaves the file as it was: another engine, cluster id or genesis id than the
+file's (`clear` first), a lower position without `--allow-lower`, a wrong
+genesis id on `release` or `clear`. An I/O failure exits 1. The archiver runs
+`set` on each member host after each verified upload and repeats the last
+value from time to time; a member that missed an update holds more log and
+nothing else.
+
+The file is text, one `key=value` per line, LF line ends, in this order:
+`format=offbox-watermark/1`, `engine`, `cluster_id`, `genesis_id`,
+`log_position_bytes`, `released_up_to_bytes` (-1: none), `release_reason`,
+`seq` (+1 on every write), `written_at_epoch_ms`, `source`, `sha256` (over
+every byte above its line). It is replaced by temp file, fsync, atomic rename
+and fsync of the directory. Anything else in the file makes it invalid.
+
+With `RETENTION_OFFBOX=required` the pruner reads the file on every wake and
+purges to the lowest of the node's own floor, the retention floor and the
+off-box floor. Nothing is remembered between two reads:
+
+| File and identity | State | Off-box floor |
+|---|---|---|
+| no file | `ABSENT` | 0 (hold everything) |
+| unknown key, missing key, wrong order, number out of range, CR, digest mismatch | `INVALID` | 0 |
+| the member has no recorded genesis id yet | `UNBOUND` | 0 |
+| `engine`, `cluster_id` or `genesis_id` differs from the member's | `FOREIGN` | 0 |
+| `log_position_bytes` above the member's commit position, or the commit position cannot be read | `AHEAD` | 0 |
+| valid | `VALID` | `max(log_position_bytes, released_up_to_bytes)` |
+
+Under `off` the states are `OFF` (no file) and `IGNORED` (a file appeared
+after the start, CRITICAL on every pass); neither bounds the purge.
+
+Unlike the retention floor this bound has no wait and no give-up. A dead
+archiver holds the log, the disk grows, and the alarm lines fire
+(`RETENTION_OFFBOX_ALARM_BYTES`, `RETENTION_OFFBOX_STALE_MS`). The only way
+past is an operator's decision, per member: `release` raises the floor to the
+released position, and while it is above the durable position every pass
+prints `[RETENTION] CRITICAL: off-box hold released by operator up to <P>
+(durable <X>): ...; reason: <text>`. The next `set` at or above the released
+position clears the release.
+
+What a member cannot see: a watermark at or below its commit position that
+the store does not in fact hold. The member purges to it. The position must
+come only from a verified upload; `source` and `seq` are in every pass line
+for audit, and a store that lost data lowers the position with
+`--allow-lower`.
+
+Each pass prints `[RETENTION] off-box: floor <f> state <S> position <X> seq
+<n> age <ms> source <s>`, and under `required` any state other than `VALID`
+is the pruner's `lastError()`. `/ready` is not failed by a hold: a member that
+keeps its log is healthy. `OffBoxWatermark.Gauge` lists the gauges the
+engines export under their own prefix: `retention_offbox_mode` (0 off, 1
+report, 2 required), `retention_offbox_state` (0 VALID, 1 ABSENT, 2 INVALID,
+3 UNBOUND, 4 FOREIGN, 5 AHEAD, 6 IGNORED, 7 OFF),
+`retention_offbox_position_bytes`, `retention_offbox_held_bytes`,
+`retention_offbox_age_ms`, `retention_offbox_released_bytes`.
+
+A follower never purges past the leader's log start, so a leader that holds
+also holds its followers. Each member obeys its own setting: set the same
+mode on every member, and turn `required` on only once every member runs a
+build that knows it (write the watermark on every member first, then restart
+with `RETENTION_OFFBOX=required`). To turn it off: `clear` on the member,
+then restart with `off`.
+
+`ArchiveHousekeeping` (the command line purge) obeys the same file under the
+same setting. It is not the member, so it is told which member this is:
+`--offbox-engine=core|match --offbox-cluster-id=N --offbox-genesis-id=G`.
+Without them, under `required`, it purges nothing.
 
 A member that returns below the leader's log start cannot catch up: the leader
 refuses every catch-up replay and the member times out and tries again. After

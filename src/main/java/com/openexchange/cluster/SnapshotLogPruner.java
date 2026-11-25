@@ -75,6 +75,16 @@ import java.util.function.BooleanSupplier;
  * <p>{@link #FLOOR_MODE_ENV}{@code =report} computes and logs the floor without applying it (the purge then goes to
  * this node's own snapshot, as before the floor existed).</p>
  *
+ * <h2>The off-box watermark</h2>
+ *
+ * <p>A deployment that keeps a copy of the log off the cluster's hosts sets {@code RETENTION_OFFBOX=required} and
+ * tells each member, through a file on that member ({@link OffBoxWatermark}), how far the copy reaches. The purge
+ * then goes to the lowest of this node's own floor, the retention floor and that position. Unlike the retention
+ * floor this bound has no wait and no give-up: a watermark that is lost, unreadable, from another cluster or above
+ * this member's commit position holds the whole log, and only a correct watermark or an operator's explicit release
+ * moves it. A pass this bound stopped is looked at again on the same backoff as the retention floor. The default,
+ * {@code off}, changes nothing.</p>
+ *
  * <p>Two guards, both cheap. A node purges nothing unless it reports itself
  * caught up ({@link NodeReadiness#ready()}) - a member still replaying has no
  * business deleting log. And a purge that finds a snapshot recording missing
@@ -164,6 +174,18 @@ public final class SnapshotLogPruner {
     private String floorProblem;
     private volatile long lastAppliedFloor = Long.MAX_VALUE;
 
+    // The off-box watermark. Null until offBoxWatermark() wires it; then read from its file on every wake.
+    private volatile OffBoxWatermark offBox;
+    /** Where this member's commit position comes from; the default reads the consensus module's counter. */
+    private java.util.function.LongSupplier commitPosition = this::commitPositionCounter;
+    /** The lowest of the retention floor and the off-box floor the last pass applied (pruner thread). */
+    private long lastAppliedBound = Long.MAX_VALUE;
+    private OffBoxWatermark.State lastOffBoxState;
+    /** The lastError text this class set for an off-box hold, so that only its own text is cleared again. */
+    private String offBoxError;
+    /** Test seam (the off-box bound's negative control): the pass takes the lowest of the other floors only. */
+    boolean offBoxOff;
+
     // A purge pass may also be requested by the shadow housekeeping, which runs as a hook on
     // this thread before every decision. Without them the pruner behaves exactly as before.
     private volatile BooleanSupplier purgeRequested = () -> false;
@@ -212,6 +234,29 @@ public final class SnapshotLogPruner {
      */
     public boolean watermarkIs(final java.util.function.LongSupplier supplier) {
         return supplier != null && watermark == supplier;
+    }
+
+    /**
+     * Bound the purge by the off-box watermark as well: the pass purges to the lowest of this node's own floor, the
+     * retention floor and the off-box floor. It is a separate input, not the {@link #watermark} supplier, and the
+     * member wait of the retention floor never applies to it: under {@code RETENTION_OFFBOX=required} a missing,
+     * invalid, foreign or too-high watermark holds the log until a correct one is set or an operator releases it.
+     * The file is read on every wake; nothing about it is remembered.
+     */
+    public SnapshotLogPruner offBoxWatermark(final OffBoxWatermark offBox) {
+        this.offBox = java.util.Objects.requireNonNull(offBox, "offBox");
+        return this;
+    }
+
+    /** The wired off-box watermark, or null: its gauges, for the engine's metrics. */
+    public OffBoxWatermark offBoxWatermark() {
+        return offBox;
+    }
+
+    /** This member's commit position, set directly (tests: no consensus module behind the pruner). */
+    SnapshotLogPruner commitPosition(final java.util.function.LongSupplier commitPosition) {
+        this.commitPosition = java.util.Objects.requireNonNull(commitPosition, "commitPosition");
+        return this;
     }
 
     /**
@@ -281,6 +326,7 @@ public final class SnapshotLogPruner {
         LogExtent.probeTimeoutMs();
         EngineLifecycle.rangedSetting(RECHECK_MAX_MS_ENV, RECHECK_MAX_MS_PROP,
             DEFAULT_RECHECK_MAX_MS, MIN_RECHECK_MAX_MS, MAX_RECHECK_MAX_MS);
+        OffBoxWatermark.checkSettings();
     }
 
     /** The floor's mode and bound, set directly (tests; a host that parses the settings itself). */
@@ -378,6 +424,7 @@ public final class SnapshotLogPruner {
                 Thread.sleep(pollIntervalMs);
 
                 noteMemberPositions();
+                noteOffBox();
 
                 boolean shadowRequested;
                 try {
@@ -417,39 +464,63 @@ public final class SnapshotLogPruner {
                     archive = AeronArchive.connect(archiveContext);
                 }
 
+                // the off-box watermark is read from its file for this pass, and for a re-check before it
+                final long passMs = System.currentTimeMillis();
+                final OffBoxWatermark offBoxNow = offBox;
+                final OffBoxWatermark.Evaluation offBoxEvaluation =
+                    offBoxNow == null ? null : offBoxNow.evaluate(commitPosition.getAsLong(), passMs);
+                final long offBoxFloor = offBoxEvaluation == null || offBoxOff
+                    ? Long.MAX_VALUE : offBoxEvaluation.appliedFloor();
+
                 long recheckedFloor = Long.MIN_VALUE;
                 if (recheck) {
                     recheckedFloor = retentionFloor(archive);
-                    if (recheckedFloor <= lastAppliedFloor) {
+                    final long bound = Math.min(recheckedFloor, offBoxFloor);
+                    if (bound <= lastAppliedBound) {
                         // still where the last pass left it: nothing to purge, look again later
                         recheckDelayMs = Math.min(recheckMaxMs, Math.max(pollIntervalMs, recheckDelayMs * 2));
                         nextRecheckMs = System.currentTimeMillis() + recheckDelayMs;
                         continue;
                     }
-                    System.out.println("[RETENTION] the retention floor rose from " + describe(lastAppliedFloor)
-                        + " to " + describe(recheckedFloor) + " since the last purge pass: purging again");
+                    System.out.println(offBoxEvaluation == null
+                        ? "[RETENTION] the retention floor rose from " + describe(lastAppliedFloor) + " to "
+                            + describe(recheckedFloor) + " since the last purge pass: purging again"
+                        : "[RETENTION] the purge bound rose from " + describe(lastAppliedBound) + " to "
+                            + describe(bound) + " since the last purge pass (retention floor "
+                            + describe(recheckedFloor) + ", off-box floor " + describe(offBoxFloor)
+                            + "): purging again");
                 }
 
                 // the node's own floor is read exactly once per pass: the shadow floor consumes its request there
                 final long ownFloor = watermark.getAsLong();
                 final long retentionFloor = recheck ? recheckedFloor : retentionFloor(archive);
                 lastAppliedFloor = retentionFloor;
+                // the lowest of the three: the off-box floor has no wait and no give-up of its own
+                final long bound = Math.min(retentionFloor, offBoxFloor);
+                lastAppliedBound = bound;
 
                 final ArchiveHousekeeping.Result result =
-                    ArchiveHousekeeping.purgeBelow(clusterDir, archive, Math.min(ownFloor, retentionFloor));
+                    ArchiveHousekeeping.purgeBelow(clusterDir, archive, Math.min(ownFloor, bound));
+                if (offBoxEvaluation != null) {
+                    offBoxNow.reportPass(offBoxEvaluation, otherFloor(ownFloor, retentionFloor), passMs,
+                        System.out::println, System.err::println);
+                }
                 seenSnapshots = Math.max(seenSnapshots, count);
                 if (recheck) {
                     wakesByRecheck++;
                 } else if (!newSnapshot) {
                     wakesByShadow++;
                 }
-                recheckPending = !recheckOff && limitedByRetention(retentionFloor, ownFloor);
+                recheckPending = !recheckOff && limitedByRetention(bound, ownFloor);
                 recheckDelayMs = pollIntervalMs;
                 nextRecheckMs = System.currentTimeMillis() + recheckDelayMs;
                 prunesRun++;
                 bytesReclaimed += Math.max(0, result.logBytesReclaimed);
+                offBoxError = offBoxEvaluation != null && offBoxEvaluation.holdsAsError()
+                    ? offBoxProblem(offBoxEvaluation) : null;
                 lastError = result.errors > 0
                     ? result.errors + " snapshot recording(s) missing from the archive"
+                    : offBoxError != null ? offBoxError
                     : floorMode == FloorMode.APPLY ? floorProblem : null;
                 System.out.println("[PRUNE] after " + (newSnapshot ? "snapshot " + count
                     : recheck ? "the retention floor rose" : "shadow wake")
@@ -475,8 +546,71 @@ public final class SnapshotLogPruner {
     }
 
     /**
-     * Whether the pass that just ran stopped at the retention floor: below this node's own floor and below its newest
-     * snapshot, so more log goes as soon as the floor rises. A snapshot position that cannot be read answers no.
+     * Between purge passes: read the off-box watermark, so its gauges and {@link #lastError()} follow the file within
+     * one poll interval and a change of state is logged when it happens, not at the next snapshot.
+     */
+    private void noteOffBox() {
+        final OffBoxWatermark w = offBox;
+        if (w == null) {
+            return;
+        }
+        try {
+            final OffBoxWatermark.Evaluation e = w.evaluate(commitPosition.getAsLong(), System.currentTimeMillis());
+            if (e.state != lastOffBoxState) {
+                final String line = "[RETENTION] off-box: state " + (lastOffBoxState == null ? "(start)"
+                    : lastOffBoxState.name()) + " -> " + e.state + " (" + e + ")";
+                if (e.state == OffBoxWatermark.State.VALID || e.state == OffBoxWatermark.State.OFF) {
+                    System.out.println(line);
+                } else {
+                    System.err.println(line);
+                }
+                lastOffBoxState = e.state;
+            }
+            final String previous = offBoxError;
+            if (e.holdsAsError()) {
+                offBoxError = offBoxProblem(e);
+                lastError = offBoxError;
+            } else if (previous != null) {
+                offBoxError = null;
+                if (previous.equals(lastError)) {
+                    lastError = null;
+                }
+            }
+        } catch (final RuntimeException e) {
+            reportDriverLoss(e);
+            // the purge pass evaluates again; a read that failed here decides nothing
+            lastError = "off-box watermark: " + e;
+        }
+    }
+
+    private static String offBoxProblem(final OffBoxWatermark.Evaluation e) {
+        return "off-box watermark " + e.state + ": " + e.detail + " (" + OffBoxWatermark.MODE_ENV
+            + "=required holds the log)";
+    }
+
+    /** What the pass would purge to without the off-box floor, for the held-bytes gauge. */
+    private long otherFloor(final long ownFloor, final long retentionFloor) {
+        long other = Math.min(ownFloor, retentionFloor);
+        try {
+            final long snapshot = latestSnapshotPosition();
+            other = snapshot < 0 ? Long.MAX_VALUE : Math.min(other, snapshot);
+        } catch (final RuntimeException unreadable) {
+            // keep the floors alone
+        }
+        return other;
+    }
+
+    /** The consensus module's commit position, or -1 when its counter is not published. */
+    private long commitPositionCounter() {
+        final int counterId = ClusterCounters.find(
+            countersReader, io.aeron.AeronCounters.CLUSTER_COMMIT_POSITION_TYPE_ID, clusterId);
+        return counterId == CountersReader.NULL_COUNTER_ID ? -1 : countersReader.getCounterValue(counterId);
+    }
+
+    /**
+     * Whether the pass that just ran stopped at the retention floor or the off-box floor: below this node's own floor
+     * and below its newest snapshot, so more log goes as soon as that bound rises. A snapshot position that cannot
+     * be read answers no.
      */
     private boolean limitedByRetention(final long retentionFloor, final long ownFloor) {
         if (retentionFloor == Long.MAX_VALUE || retentionFloor >= ownFloor) {

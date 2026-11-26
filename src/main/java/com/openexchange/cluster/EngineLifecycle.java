@@ -619,7 +619,7 @@ public final class EngineLifecycle {
     }
 
     /** The errors after which the reporting Aeron client closes itself and unmaps the CnC. */
-    static boolean isDriverLoss(final Throwable t) {
+    public static boolean isDriverLoss(final Throwable t) {
         return t instanceof DriverTimeoutException
                 || t instanceof ClientTimeoutException
                 || t instanceof ConductorServiceTimeoutException;

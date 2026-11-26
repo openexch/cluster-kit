@@ -23,7 +23,9 @@ import static org.junit.Assert.assertTrue;
  * member CM/service snapshot recordings, never a shadow), plus {@link ShadowPuller} (only the local recordings it
  * created by a pull in this process: a partial, timed-out, aborted or content-refused copy, through
  * {@code ShadowCatalog.purge(id, force)}), plus {@link FloorAttestor} (the attestation markers of its own archive
- * on {@code FloorAttestation.STREAM_ID}, by id from a listing of that stream; never a shadow). Exactly these seven;
+ * on {@code FloorAttestation.STREAM_ID}, by id from a listing of that stream; never a shadow), plus
+ * {@code journal.JournalRetention} (the journal recordings of a member, by id from a listing of the journal's stream;
+ * never a shadow: {@code JournalPurgeCallSiteTest} holds that side). Exactly these eight;
  * anything else in {@code cluster}, {@code cluster.shadow}
  * or {@code cluster.replica} fails.
  */
@@ -37,7 +39,8 @@ public class ShadowPurgeCallSiteTest {
             PKG + "StagingArchive",
             PKG + "replica/RetrievedSetTrim",
             PKG + "shadow/ShadowPuller",
-            PKG + "shadow/FloorAttestor");
+            PKG + "shadow/FloorAttestor",
+            PKG + "journal/JournalRetention");
 
     static NeverSchedulesScan.Rules purgeRules() {
         return new NeverSchedulesScan.Rules(Set.of(), List.of(), Set.of(),
@@ -92,8 +95,10 @@ public class ShadowPurgeCallSiteTest {
                 + "com/openexchange/cluster/shadow/ShadowCatalog.purge"));
         assertTrue(callers.toString(), callers.contains(PKG + "shadow/FloorAttestor -> "
                 + "io/aeron/archive/client/AeronArchive.purgeRecording"));
-        assertEquals(callers.toString(), 7, callers.size());
-        assertEquals(7, ALLOWED.size());
+        assertTrue(callers.toString(), callers.contains(PKG + "journal/JournalRetention$AeronPort -> "
+                + "io/aeron/archive/client/AeronArchive.purgeRecording"));
+        assertEquals(callers.toString(), 8, callers.size());
+        assertEquals(8, ALLOWED.size());
         ShadowRig.green("purge call sites: " + callers);
     }
 

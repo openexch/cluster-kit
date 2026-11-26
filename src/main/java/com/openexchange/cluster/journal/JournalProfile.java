@@ -38,6 +38,7 @@ public final class JournalProfile {
     private final Map<Integer, Integer> logPositionOffsetByTemplate;
     private final int logPositionSinceVersion;
     private final int maxFrameLength;
+    private final boolean strictStartEpoch;
 
     /**
      * @param journal                     the journal's name in settings, reader files and metrics ({@code money},
@@ -55,6 +56,15 @@ public final class JournalProfile {
                           final int journalSeqOffset, final int epochOffset,
                           final Map<Integer, Integer> logPositionOffsetByTemplate, final int logPositionSinceVersion,
                           final int maxFrameLength) {
+        this(journal, streamId, channelFragment, schemaId, journalSeqOffset, epochOffset, logPositionOffsetByTemplate,
+            logPositionSinceVersion, maxFrameLength, false);
+    }
+
+    private JournalProfile(final String journal, final int streamId, final String channelFragment, final int schemaId,
+                           final int journalSeqOffset, final int epochOffset,
+                           final Map<Integer, Integer> logPositionOffsetByTemplate, final int logPositionSinceVersion,
+                           final int maxFrameLength, final boolean strictStartEpoch) {
+        this.strictStartEpoch = strictStartEpoch;
         this.journal = Objects.requireNonNull(journal, "journal");
         if (!JournalReaders.validName(journal)) {
             throw new IllegalArgumentException("journal name '" + journal + "' is not a name");
@@ -108,6 +118,25 @@ public final class JournalProfile {
 
     public int maxFrameLength() {
         return maxFrameLength;
+    }
+
+    /**
+     * This profile for an engine that never writes a record before it has a genesis: a recording whose first record
+     * carries epoch 0 is then a recording of another epoch, like any other foreign start (not purged, an ANOMALY).
+     * Without it epoch 0 at a recording's start reads as "written before the member had a genesis": such records
+     * are no other genesis' and go with the segments below a boundary of this genesis that every reader has applied.
+     */
+    public JournalProfile strictStartEpoch() {
+        if (epochOffset == NO_EPOCH) {
+            throw new IllegalStateException("journal " + journal + " carries no epoch");
+        }
+        return new JournalProfile(journal, streamId, channelFragment, schemaId, journalSeqOffset, epochOffset,
+            logPositionOffsetByTemplate, logPositionSinceVersion, maxFrameLength, true);
+    }
+
+    /** Whether epoch 0 at a recording's start is another epoch ({@link #strictStartEpoch()}). */
+    public boolean startEpochStrict() {
+        return strictStartEpoch;
     }
 
     /** The key of one record, as read from a frame. */

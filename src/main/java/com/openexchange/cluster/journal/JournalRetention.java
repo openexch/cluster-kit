@@ -71,7 +71,11 @@ import java.util.function.Consumer;
  *       recording that carries the member's tail: the tail a member's restore rules read is the same after a pass
  *       as before it. Any other stopped recording is cut to the greatest qualifying base at or below the base of its
  *       last segment, so its last record stays readable.</li>
- *   <li>A recording whose records carry another epoch is never touched.</li>
+ *   <li>A recording whose records carry another epoch is never touched. That is decided on its last record; a
+ *       recording whose last record is this genesis' and whose first record is another genesis' (one process run
+ *       that wrote two epochs) is an ANOMALY: it is not cut and not deleted. Epoch 0 at the start is "written before
+ *       the member had a genesis" and no other genesis', unless the profile is
+ *       {@link JournalProfile#strictStartEpoch() strict} (an engine that never writes before its genesis).</li>
  * </ul>
  */
 public final class JournalRetention {
@@ -127,7 +131,7 @@ public final class JournalRetention {
         public static volatile boolean aheadCheckOff;
         /** The bound is the maximum over the readers instead of the minimum. */
         public static volatile boolean minIsMax;
-        /** A recording or a boundary of another epoch is treated as this genesis'. */
+        /** A recording, its first record or a boundary of another epoch is treated as this genesis'. */
         public static volatile boolean epochCheckOff;
         /** An active recording is cut up to its head segment. */
         public static volatile boolean clampOff;
@@ -135,6 +139,8 @@ public final class JournalRetention {
         public static volatile boolean tailCoverOff;
         /** The off-box floor is not applied to a boundary or to a last record. */
         public static volatile boolean offBoxBoundOff;
+        /** A reader file of another engine, cluster, genesis, journal or reader is taken as this member's. */
+        public static volatile boolean foreignCheckOff;
 
         private Seams() {
         }
@@ -147,6 +153,7 @@ public final class JournalRetention {
             clampOff = false;
             tailCoverOff = false;
             offBoxBoundOff = false;
+            foreignCheckOff = false;
         }
     }
 
@@ -645,8 +652,8 @@ public final class JournalRetention {
         }
         for (final JournalReaders.Entry e : readers) {
             final JournalReaders.Record r = e.read().record;
-            if (!r.engine.equals(engine) || r.clusterId != clusterId || r.genesisId != genesisId
-                || !r.journal.equals(journal) || !r.reader.equals(e.name())) {
+            if (!Seams.foreignCheckOff && (!r.engine.equals(engine) || r.clusterId != clusterId
+                || r.genesisId != genesisId || !r.journal.equals(journal) || !r.reader.equals(e.name()))) {
                 return Evaluation.hold(mode, State.FOREIGN, e.name(), "the file of reader " + e.name()
                     + " is for engine=" + r.engine + " cluster_id=" + r.clusterId + " genesis_id=" + r.genesisId
                     + " journal=" + r.journal + " reader=" + r.reader + ", this member is engine=" + engine
@@ -922,6 +929,21 @@ public final class JournalRetention {
                     && logPositionAllowed(last.logPosition(), evaluation.logFloor)
                     && (r != keeper || Seams.tailCoverOff);
                 if (whole) {
+                    final String mixed = startOfAnotherEpoch(archive, r, genesisId, deadlineNs);
+                    if (mixed != null && clock.nanoTime() - deadlineNs >= 0) {
+                        // the read ran into the pass deadline: nothing is known about the start, so nothing is
+                        // deleted and nothing is called an anomaly; the next pass reads again
+                        budgetExceeded = true;
+                        out.accept(LOG + profile.journal() + " journal recording " + r.id() + ": the pass budget"
+                            + " ended while its start was read (" + mixed + "). Not purged this pass.");
+                        break;
+                    }
+                    if (mixed != null) {
+                        flag(anomalies, r);
+                        err.accept(LOG + "CRITICAL: " + profile.journal() + " journal recording " + r.id()
+                            + " ANOMALY: " + mixed + ". The recording is not purged; an operator has to look at it.");
+                        continue;
+                    }
                     target = r.end();
                 } else {
                     try {
@@ -991,6 +1013,33 @@ public final class JournalRetention {
         return best;
     }
 
+    /**
+     * Why a stopped recording that would go whole may not: the record at its start is unreadable, or it carries
+     * another epoch than the member's genesis (the recording holds records of two epochs, and its last record says
+     * nothing about the first). Null when the start is this genesis', or the journal's records carry no epoch.
+     */
+    private String startOfAnotherEpoch(final Archive archive, final Recording r, final long genesisId,
+                                       final long deadlineNs) {
+        if (!profile.hasEpoch() || Seams.epochCheckOff) {
+            return null;
+        }
+        final Peek atStart = archive.first(r, r.start(), deadlineNs);
+        if (!atStart.readable()) {
+            return "the record at its start " + r.start() + " is unreadable (" + atStart.unreadable() + ")";
+        }
+        return startEpochIsOwn(atStart.key().epoch(), genesisId) ? null : mixedEpochs(r, atStart.key(), genesisId);
+    }
+
+    /** The member's genesis, or epoch 0 (no genesis yet) where the profile does not call that another epoch. */
+    private boolean startEpochIsOwn(final long epoch, final long genesisId) {
+        return epoch == genesisId || (epoch == 0 && !profile.startEpochStrict());
+    }
+
+    private static String mixedEpochs(final Recording r, final JournalProfile.Key atStart, final long genesisId) {
+        return "the record at its start " + r.start() + " carries epoch " + atStart.epoch() + " (journalSeq "
+            + atStart.journalSeq() + "), this member's genesis is " + genesisId + ": a recording of two epochs";
+    }
+
     private static boolean logPositionAllowed(final long logPosition, final long logFloor) {
         if (logFloor == OffBoxWatermark.NO_CONSTRAINT || Seams.offBoxBoundOff) {
             return true;
@@ -1042,6 +1091,9 @@ public final class JournalRetention {
                 + " at its start " + r.start() + " is unreadable (" + atStart.unreadable() + "): not purged this pass."
                 + " If it stays unreadable an operator has to look at the recording.");
             return r.start();
+        }
+        if (profile.hasEpoch() && !startEpochIsOwn(atStart.key().epoch(), genesisId) && !Seams.epochCheckOff) {
+            throw new Anomaly(mixedEpochs(r, atStart.key(), genesisId));
         }
         note(seqAt, r, r.start(), atStart.key().journalSeq(), last);
         long lo = 1;

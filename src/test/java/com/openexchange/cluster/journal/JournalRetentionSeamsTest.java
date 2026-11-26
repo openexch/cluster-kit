@@ -54,7 +54,7 @@ public class JournalRetentionSeamsTest {
     @Test
     public void everySeamIsOffByDefaultAndResetSwitchesEveryOneOff() throws Exception {
         final List<Field> fields = seams();
-        assertEquals("the seven seams: " + fields, 7, fields.size());
+        assertEquals("the eight seams: " + fields, 8, fields.size());
         for (final Field f : fields) {
             assertEquals(f.getName(), boolean.class, f.getType());
             assertTrue(f.getName() + " is static", Modifier.isStatic(f.getModifiers()));

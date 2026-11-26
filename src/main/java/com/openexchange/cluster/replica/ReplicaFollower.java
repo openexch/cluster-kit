@@ -759,7 +759,8 @@ public final class ReplicaFollower implements Runnable, AutoCloseable {
                 new ShadowProducer(cfg.clusterId, ProducerKind.REPLICA, cfg.slot), binding.selfCheck(),
                 cfg.shadowTermLength, clock, TimeUnit.MILLISECONDS.toNanos(cfg.writeConnectTimeoutMs),
                 TimeUnit.MILLISECONDS.toNanos(cfg.writeOfferTimeoutMs),
-                TimeUnit.MILLISECONDS.toNanos(cfg.writeRecordTimeoutMs), maxSeq + 1, maxPos, shadowCounters);
+                TimeUnit.MILLISECONDS.toNanos(cfg.writeRecordTimeoutMs), maxSeq + 1, maxPos, shadowCounters,
+                ReplicaContexts.writerIdle(cfg));
         writerThread = new ShadowWriterThread(writer, policy, this::onWriterError, shadowCounters);
         writerThread.fenceLatch(() -> fence.reason() != null); // read by the writer thread before each write starts
         policy.attachWriter(ShadowTriggerPolicy.port(writerThread));

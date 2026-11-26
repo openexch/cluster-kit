@@ -13,6 +13,7 @@ import org.agrona.ErrorHandler;
 import org.agrona.concurrent.BackoffIdleStrategy;
 import org.agrona.concurrent.BusySpinIdleStrategy;
 import org.agrona.concurrent.IdleStrategy;
+import org.agrona.concurrent.SleepingMillisIdleStrategy;
 
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
@@ -96,7 +97,25 @@ public final class ReplicaContexts {
     }
 
     public static IdleStrategy idle(final ReplicaConfig c) {
-        return c.busySpin ? new BusySpinIdleStrategy() : new BackoffIdleStrategy(10, 20, 1_000, 1_000_000);
+        switch (c.idleMode) {
+            case BUSY_SPIN:
+                return new BusySpinIdleStrategy();
+            case SLEEP:
+                return new SleepingMillisIdleStrategy(1);
+            case BACKOFF:
+                return new BackoffIdleStrategy(10, 20, 1_000, 1_000_000);
+            default:
+                throw new IllegalStateException("idle mode " + c.idleMode);
+        }
+    }
+
+    /**
+     * The shadow writer's waits inside a write: backoff in BACKOFF and BUSY_SPIN (as before the idle mode existed,
+     * the writer never busy-spun), the 1 ms sleep in SLEEP.
+     */
+    static IdleStrategy writerIdle(final ReplicaConfig c) {
+        return c.idleMode == ReplicaConfig.IdleMode.SLEEP
+                ? idle(c) : new BackoffIdleStrategy(10, 20, 1_000, 1_000_000);
     }
 
     /**
@@ -116,6 +135,16 @@ public final class ReplicaContexts {
      * is the kit's {@link com.openexchange.cluster.EmbeddedDriverDir#guard}, shared with the member.</p>
      */
     public static MediaDriver.Context driver(final ReplicaConfig c) {
+        final MediaDriver.Context driver = driverBase(c);
+        if (c.idleMode == ReplicaConfig.IdleMode.SLEEP) {
+            // SHARED reads only the shared strategy; the others are set so no default (backoff) is left behind
+            driver.conductorIdleStrategy(idle(c)).senderIdleStrategy(idle(c)).receiverIdleStrategy(idle(c))
+                    .sharedNetworkIdleStrategy(idle(c)).nativeResourceAgentIdleStrategy(idle(c));
+        }
+        return driver;
+    }
+
+    private static MediaDriver.Context driverBase(final ReplicaConfig c) {
         return com.openexchange.cluster.EmbeddedDriverDir.guard(new MediaDriver.Context(), c.driverDirActiveMs)
                 .aeronDirectoryName(c.aeronDir)
                 .threadingMode(ThreadingMode.SHARED)
@@ -137,6 +166,14 @@ public final class ReplicaContexts {
 
     /** {@code BASE_DIR/archive}: shadows, the live log L, the retrieved member sets. Never deleted on start. */
     public static Archive.Context archive(final ReplicaConfig c, final ErrorHandler errorHandler) {
+        final Archive.Context archive = archiveBase(c, errorHandler);
+        if (c.idleMode == ReplicaConfig.IdleMode.SLEEP) {
+            archive.recorderIdleStrategySupplier(() -> idle(c)).replayerIdleStrategySupplier(() -> idle(c));
+        }
+        return archive;
+    }
+
+    private static Archive.Context archiveBase(final ReplicaConfig c, final ErrorHandler errorHandler) {
         return new Archive.Context()
                 .aeronDirectoryName(c.aeronDir)
                 .archiveDir(c.archiveDir())
@@ -184,6 +221,15 @@ public final class ReplicaContexts {
      */
     public static ClusterBackup.Context backup(final ReplicaConfig c, final ClusterBackupEventsListener events,
                                                final ErrorHandler errorHandler, final Runnable terminationHook) {
+        final ClusterBackup.Context backup = backupBase(c, events, errorHandler, terminationHook);
+        if (c.idleMode == ReplicaConfig.IdleMode.SLEEP) {
+            backup.idleStrategySupplier(() -> idle(c)); // otherwise the agent's default backoff spins and yields
+        }
+        return backup;
+    }
+
+    private static ClusterBackup.Context backupBase(final ReplicaConfig c, final ClusterBackupEventsListener events,
+                                                    final ErrorHandler errorHandler, final Runnable terminationHook) {
         return new ClusterBackup.Context()
                 .aeronDirectoryName(c.aeronDir)
                 .clusterDir(c.clusterDir())

@@ -150,7 +150,7 @@ public final class ReplicaConfig {
     final DriverMode driverMode;
     final String aeronDir;
     final long externalDriverTimeoutMs;
-    final boolean busySpin;
+    final IdleMode idleMode;
     final ClusterBackup.SourceType sourceType;
     final CredentialsSupplier credentials;
     final long memberBackupWindowMs;
@@ -222,7 +222,7 @@ public final class ReplicaConfig {
         this.driverMode = b.driverMode;
         this.aeronDir = b.aeronDir;
         this.externalDriverTimeoutMs = b.externalDriverTimeoutMs;
-        this.busySpin = b.busySpin;
+        this.idleMode = b.idleMode;
         this.sourceType = b.sourceType;
         this.credentials = b.credentials;
         this.memberBackupWindowMs = b.memberBackupWindowMs;
@@ -592,6 +592,16 @@ public final class ReplicaConfig {
     }
 
     /** Defaults are the setting defaults; every value the host does not set keeps them. */
+    /**
+     * How every thread of the replica idles. {@code BACKOFF} is the default; {@code SLEEP} is for small hosts: every
+     * agent sleeps 1 ms when idle, nothing spins or yields.
+     */
+    public enum IdleMode {
+        BUSY_SPIN,
+        BACKOFF,
+        SLEEP
+    }
+
     public static final class Builder {
         private List<String> memberHosts = List.of();
         private int portBase = 9300;
@@ -604,7 +614,7 @@ public final class ReplicaConfig {
         private DriverMode driverMode = DriverMode.EMBEDDED;
         private String aeronDir;
         private long externalDriverTimeoutMs = DEFAULT_EXTERNAL_DRIVER_TIMEOUT_MS;
-        private boolean busySpin;
+        private IdleMode idleMode = IdleMode.BACKOFF;
         private ClusterBackup.SourceType sourceType = ClusterBackup.SourceType.FOLLOWER;
         private CredentialsSupplier credentials;
         private long memberBackupWindowMs = DEFAULT_MEMBER_BACKUP_WINDOW_MS;
@@ -723,8 +733,13 @@ public final class ReplicaConfig {
             return this;
         }
 
+        /** Thin setter kept for existing callers: true is {@link IdleMode#BUSY_SPIN}, false is {@link IdleMode#BACKOFF}. */
         public Builder busySpin(final boolean v) {
-            this.busySpin = v;
+            return idleMode(v ? IdleMode.BUSY_SPIN : IdleMode.BACKOFF);
+        }
+
+        public Builder idleMode(final IdleMode v) {
+            this.idleMode = Objects.requireNonNull(v, "idleMode");
             return this;
         }
 

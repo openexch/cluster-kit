@@ -30,10 +30,16 @@ public interface ReplicaEngine {
     /** The writer thread's round trip through a scratch engine. */
     ShadowSelfCheck selfCheck();
 
-    /** The members' {@code ClusteredServiceContainer.Context.appVersion()} (members set none: the Aeron default). */
+    /**
+     * The members' {@code ClusteredServiceContainer.Context.appVersion()}: the engine's
+     * {@code MEMBER_COMPAT.appVersion()} ({@link com.openexchange.cluster.MemberCompat}).
+     */
     int appVersion();
 
-    /** The members' {@code appVersionValidator()}. */
+    /**
+     * The members' {@code appVersionValidator()}: {@code MemberCompat.validator(own, onRefusal)}, whose refusal stops
+     * the replay process with exit 78 ({@code MemberCompat.fatalOnRefusal}).
+     */
     VersionValidator validator();
 
     /**

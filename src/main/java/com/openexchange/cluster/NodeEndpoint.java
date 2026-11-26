@@ -32,6 +32,8 @@ public final class NodeEndpoint {
     private HttpServer server;
     /** The {@code " version=<v> build=<sha>"} suffix, built once; the HTTP thread only reads the reference. */
     private volatile String buildTokens = BuildInfo.unknown().tokens();
+    /** The capability tokens after {@code build=} ({@link #capabilities}); empty by default. */
+    private volatile Supplier<String> capabilities = () -> "";
 
     /**
      * @param readiness   the node's own view of itself
@@ -70,6 +72,22 @@ public final class NodeEndpoint {
         return this;
     }
 
+    /**
+     * What the build can do and what the cluster has recorded, appended after {@code build=} on {@code /health} and
+     * {@code /ready} (nothing existing moves): the tokens of {@link MemberCompat.Capabilities}, leading space
+     * included. Read once per request on the HTTP thread, so the supplier must be lock-free.
+     *
+     * @return this endpoint, for chaining at construction
+     */
+    public NodeEndpoint capabilities(final Supplier<String> tokens) {
+        this.capabilities = tokens == null ? () -> "" : tokens;
+        return this;
+    }
+
+    private String suffix() {
+        return buildTokens + capabilities.get();
+    }
+
     public void start(final int port) throws IOException {
         server = HttpServer.create(new InetSocketAddress(port), 0);
 
@@ -77,14 +95,14 @@ public final class NodeEndpoint {
         // request: the process is up but no longer doing its job.
         server.createContext("/health", exchange -> {
             final NodeReadiness.Probe p = probe.get();
-            respond(exchange, p.live() ? 200 : 503, p.detail() + buildTokens);
+            respond(exchange, p.live() ? 200 : 503, p.detail() + suffix());
         });
 
         // 200 only when this member can be counted on. A rolling restart waits
         // on this, so a false 200 costs quorum.
         server.createContext("/ready", exchange -> {
             final NodeReadiness.Probe p = probe.get();
-            respond(exchange, p.ready() ? 200 : 503, p.detail() + buildTokens);
+            respond(exchange, p.ready() ? 200 : 503, p.detail() + suffix());
         });
 
         if (metricsBody != null) {

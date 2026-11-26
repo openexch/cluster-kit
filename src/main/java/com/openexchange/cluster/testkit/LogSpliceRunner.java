@@ -71,6 +71,20 @@ public final class LogSpliceRunner {
 
     public static <E extends ShadowEngine> Report run(final Supplier<? extends E> fresh, final RecordedLog log,
                                                       final Cuts cuts, final ShadowRestoreRunner.Probe<? super E> probe) {
+        return run(fresh, log, cuts, probe, ShadowRestoreRunner.DEFAULT_APP_VERSION,
+                ShadowRestoreRunner.DEFAULT_VALIDATOR);
+    }
+
+    /**
+     * As above, the containers carrying {@code appVersion} and {@code validator}: an engine rig that splices a log
+     * its members recorded passes the engine's member version ({@code MEMBER_COMPAT.appVersion()}) and the kit
+     * validator, the pair its members ran with.
+     */
+    public static <E extends ShadowEngine> Report run(final Supplier<? extends E> fresh, final RecordedLog log,
+                                                      final Cuts cuts, final ShadowRestoreRunner.Probe<? super E> probe,
+                                                      final int appVersion,
+                                                      final io.aeron.cluster.VersionValidator validator) {
+        Objects.requireNonNull(validator, "validator");
         Objects.requireNonNull(fresh, "fresh");
         Objects.requireNonNull(log, "log");
         Objects.requireNonNull(cuts, "cuts");
@@ -104,8 +118,7 @@ public final class LogSpliceRunner {
         // the genesis replay: image, cursor and event count at every point
         final ExpandableArrayBuffer scratch = new ExpandableArrayBuffer(256);
         final E baselineEngine = fresh.get();
-        final ReplayContainer baseline = new ReplayContainer(baselineEngine, ShadowRestoreRunner.DEFAULT_APP_VERSION,
-                ShadowRestoreRunner.DEFAULT_VALIDATOR, (p, t, ts, fl) -> false);
+        final ReplayContainer baseline = new ReplayContainer(baselineEngine, appVersion, validator, (p, t, ts, fl) -> false);
         baseline.genesis();
         final long[] at = points.stream().mapToLong(Long::longValue).toArray();
         final byte[][] image = new byte[at.length][];
@@ -140,8 +153,7 @@ public final class LogSpliceRunner {
             cutCount++;
             final long cut = at[k];
             final E engine = fresh.get();
-            final ReplayContainer leg = new ReplayContainer(engine, ShadowRestoreRunner.DEFAULT_APP_VERSION,
-                    ShadowRestoreRunner.DEFAULT_VALIDATOR, (p, t, ts, fl) -> false);
+            final ReplayContainer leg = new ReplayContainer(engine, appVersion, validator, (p, t, ts, fl) -> false);
             final int eventsMark;
             try {
                 leg.restore(new UnsafeBuffer(image[k]), image[k].length, cut, cursor[k]);

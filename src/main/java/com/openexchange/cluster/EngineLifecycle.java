@@ -154,6 +154,13 @@ public final class EngineLifecycle {
      * ({@code RestartForceExitStatus=3}).
      */
     public static final int EXIT_RESTART = 3;
+    /**
+     * Status of a node-local refusal a restart cannot fix: this build cannot run what the cluster recorded (a member
+     * version outside the window, a behaviour the jar lacks, a jar below the recorded wire ceiling) or a removed
+     * setting is present. The units never restart it ({@code RestartPreventExitStatus=78}); the recovery is a
+     * compatible build or the setting removed.
+     */
+    public static final int EXIT_CONFIG = 78;
 
     /** Why the node is stopping. */
     public enum Cause { NONE, SIGNAL, CLUSTER_TERMINATED, FATAL, RESTART }

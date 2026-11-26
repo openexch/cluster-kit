@@ -27,6 +27,7 @@ auth policy, its image format), the engine passes it in.
 |---|---|
 | `com.openexchange.cluster` | Snapshots and retention: `SnapshotCadence` (leader-side snapshot trigger, by log bytes with a timer floor), `SnapshotEnvelope` (magic, version, length, CRC32C around a snapshot payload), `SnapshotLayouts` (the snapshot layouts one build reads, the current and the previous one, and the layout it writes, picked by the recorded behaviour version), `WireCeiling` (the ingress wire gate: a frame above the recorded ceiling is dropped from its header before the jar range is consulted; the ceiling only rises; a jar below it stops), `SnapshotImageReader`, `SnapshotLogPruner`, `ArchiveHousekeeping`, `RetentionWatermark`, `ReaderRegistry`, `ClusterMemberPositions`, `StagingArchive`, `BundleCapture`. Node process: `EngineLifecycle`, `QuorumWatchdog`, `NodeEndpoint` (`/health`, `/ready`, `/metrics`), `NodeReadiness`, `ConsensusReadiness`, `ConsensusCommitObserver`. Wiring: `ClusterPorts` (UDP offsets 1..5 and the HTTP endpoint at offset 6), `ConsensusChannel` (the consensus term), `TimerPort`, `TermTimerId`. Driver and transport checks: `EmbeddedDriverDir` (refuses a live driver's directory, replaces a stale one), `SocketBufferProbe` (the kernel's grant of a socket buffer against the configured size). |
 | `com.openexchange.cluster.auth` | Session authentication and authorisation shared by both engines: credentials, principals, key table, `ClusterAuthenticator`, `ClassAuthorisationService`. See [docs/auth.md](docs/auth.md). |
+| `com.openexchange.cluster.journal` | Journal retention: `JournalRetention` (the one purge owner for a member's journal recordings: a record goes only when every registered reader has applied it), `JournalRetentionAgent` (its thread inside a member), `JournalReaders` and `JournalReaderTool` (the reader cursor files and the command that writes them), `JournalProfile` (what an engine tells the kit about one journal). See "Journal retention" below. |
 | `com.openexchange.cluster.log` | `ClusterLogReader` (reads a committed cluster log without a cluster), `ReplayContainer`, `ShadowEngine` (the apply interface an engine implements), `SkipWindow`. |
 | `com.openexchange.cluster.replica` | The replica process: a non-member that follows the cluster through `ClusterBackup`, applies the log into its own engine instance and writes shadow images, with a trust check after every restore. See [docs/replica.md](docs/replica.md). |
 | `com.openexchange.cluster.shadow` | Shadow images: a verified engine image at a log position written by a non-leader producer, plus the catalog, loader, floor and retention that use it. The follower producer's kit side: `ShadowProducerSettings`, `ProducerDesignation`, `ProducerWindowGuard`, `CrashedWriteSweep`, `WitnessAlarm`. See [docs/shadow.md](docs/shadow.md). |
@@ -103,9 +104,17 @@ system property:
 | `RETENTION_OFFBOX` / `-Dretention.offbox` | `SnapshotLogPruner`, `OffBoxWatermark`, `ArchiveHousekeeping` | `off`. `required`: the purge never passes the member's off-box watermark, and a watermark that is missing, invalid, foreign or above the commit position holds the whole log. `report`: the same evaluation, logged and exported, not applied. `off` with a watermark file present refuses the start. |
 | `RETENTION_OFFBOX_ALARM_BYTES` / `-Dretention.offbox.alarm.bytes` | `OffBoxWatermark` | `2147483648` (1048576..1099511627776). Log bytes held for the off-box copy above which every purge pass prints a CRITICAL line. An alarm, not a limit. |
 | `RETENTION_OFFBOX_STALE_MS` / `-Dretention.offbox.stale.ms` | `OffBoxWatermark` | `3600000` (1000..604800000). Age of the watermark file above which every purge pass prints a CRITICAL line. It does not change the floor. |
+| `JOURNAL_RETENTION_<JOURNAL>` / `-Djournal.retention.<journal>` | `JournalRetention`, `JournalRetentionAgent` | `off`. One setting per journal of the engine (the core's are `JOURNAL_RETENTION_MONEY` and `JOURNAL_RETENTION_ORDER`). `off`: nothing of the journal is ever purged. `report`: evaluated, logged and exported, nothing purged. `readers`: the member purges its journal recordings behind the registered readers. |
+| `JOURNAL_RETENTION_REQUIRED_READERS_<JOURNAL>` / `-Djournal.retention.required.readers.<journal>` | `JournalRetention` | empty. Reader names, separated by commas, that must have a valid file; one that has none holds the journal. |
+| `JOURNAL_RETENTION_POLL_MS` / `-Djournal.retention.poll.ms` | `JournalRetentionAgent` | `60000` (1000..3600000). The interval between two passes. |
+| `JOURNAL_RETENTION_PASS_TIMEOUT_MS` / `-Djournal.retention.pass.timeout.ms` | `JournalRetentionAgent` | `10000` (1000..600000). The budget of one pass over one journal (listing, one-record reads, purges). |
+| `JOURNAL_RETENTION_ALARM_BYTES` / `-Djournal.retention.alarm.bytes` | `JournalRetention` | `2147483648` (1048576..1099511627776). Bytes of one journal a member holds above which every pass prints a CRITICAL line. An alarm, not a limit. |
+| `JOURNAL_RETENTION_STALE_MS` / `-Djournal.retention.stale.ms` | `JournalRetention` | `3600000` (1000..604800000). Age of the oldest reader file above which every pass prints a CRITICAL line. It does not change the bound. |
 
 A value outside its range refuses the start: `EngineLifecycle.install` parses
-every row above before any thread starts.
+every row above before any thread starts. The `JOURNAL_RETENTION_*` rows are the
+exception: the engine parses them at boot with the names of its journals
+(`JournalRetention.Settings.fromEnv`), and a bad value refuses the start there.
 
 One more setting is named by the kit and passed in by the host, because the kit
 reads no environment for the replica: `TRANSPORT_DRIVER_CLIENT_LIVENESS_MS`
@@ -261,6 +270,107 @@ Both the pruner and the watchdogs open their own Aeron clients on the member's
 driver directory, so they behave the same with an embedded driver and an
 external one. The pruner takes that directory from the live Aeron client of
 the archive context it is given, not from the context's directory name.
+
+### Journal retention
+
+An engine's journals (the core's money journal and order journal) are
+recordings in each member's own archive. `journal.JournalRetention` is the only
+class that purges one, and `journal.JournalRetentionAgent` runs it inside the
+member on its own thread (`journal-retention`) with its own archive session.
+A record is deleted from a member only when every registered reader has
+durably applied it. Outside processes only deliver the readers' cursors.
+
+A reader is registered by a file on the member,
+`<clusterDir>/retention/journal-readers/<journal>/<reader>`, written by a
+command run on that member's host (the engine jars carry it):
+
+```
+java -cp <engine jar> com.openexchange.cluster.journal.JournalReaderTool
+  set     --cluster-dir <dir> --engine core|match --cluster-id <n> --genesis-id <g> --journal <j>
+          --reader <r> --applied-journal-seq <s> --source <name> [--allow-lower]
+  release --cluster-dir <dir> --genesis-id <g> --journal <j> --reader <r> --up-to-journal-seq <s> --reason <text>
+  remove  --cluster-dir <dir> --genesis-id <g> --journal <j> --reader <r> --reason <text>
+  show    --cluster-dir <dir>
+```
+
+Exit codes: 0 done, 64 usage (a positional value, an unknown, missing or
+repeated flag), 65 refused input, 1 I/O failure. Registering a reader is its
+first `set` (0 is legal) and is done before the reader first starts; a reader
+with no file is not protected. `--applied-journal-seq` says "this reader has
+durably applied every record of this genesis up to and including this
+`journalSeq`". A lower value needs `--allow-lower` and prints a CRITICAL line.
+Journal and reader names are 1 to 64 of `A-Z a-z 0-9 . _ -`.
+
+The file is text, one `key=value` per line with LF line ends, in this order:
+`format=journal-reader/1`, `engine`, `cluster_id`, `genesis_id`, `journal`,
+`reader`, `applied_journal_seq`, `released_up_to_journal_seq`,
+`release_reason`, `seq`, `written_at_epoch_ms`, `source`, `sha256` (over every
+byte above its own line). It is replaced through a temp file, an fsync and an
+atomic rename.
+
+Every pass works from the files, the archive and the member's identity as they
+are at that moment; nothing is remembered between passes. The states
+(`JournalRetention.State`, the value of the state gauge):
+
+| state | when | effect |
+|---|---|---|
+| `VALID` (0) | otherwise | purge up to `safeSeq`, the lowest `max(applied, released)` over the readers |
+| `OFF` (1) | the journal's mode is `off` | nothing purged; reader files are ignored |
+| `NO_JOURNAL` (2) | no recording of this genesis with bytes | nothing to do, no alarm |
+| `UNBOUND` (3) | the member has no recorded genesis id yet | hold |
+| `NO_READERS` (4) | no reader file | hold, CRITICAL on every pass |
+| `INVALID` (5) | a reader file is invalid | hold, CRITICAL |
+| `FOREIGN` (6) | a reader file names another engine, cluster, genesis, journal or reader | hold, CRITICAL |
+| `TAIL_UNKNOWN` (7) | the member's own journal tail cannot be read | hold |
+| `AHEAD` (8) | a reader's bound is above the member's own journal tail | hold; it clears when the member catches up |
+| `MISSING` (9) | a required reader has no file | hold, CRITICAL |
+| `OFFBOX_HOLD` (10) | `RETENTION_OFFBOX=required` and the off-box watermark is not VALID | hold |
+
+A reader that stops moving holds the journal; nothing gives up for it. The
+disk grows and two alarms are printed (`JOURNAL_RETENTION_ALARM_BYTES`,
+`JOURNAL_RETENTION_STALE_MS`). The way past it is an operator's `release`
+(said on every pass until a `set` reaches it) or `remove`, per member.
+
+A purge removes whole segments. The first record at a segment base is read
+through a bounded replay, and the base qualifies when that record is a whole
+record of the journal's schema, its sequence is at most `safeSeq + 1`, its
+epoch is the member's genesis (where the journal's records carry one), and,
+under `RETENTION_OFFBOX=required`, its log position is at or below the
+off-box floor. An active recording keeps two whole segments below its head. A
+stopped recording whose last sequence is at or below `safeSeq` is deleted
+whole, unless it is the recording that carries the member's journal tail; any
+other stopped recording keeps its last segment. A recording whose records
+carry another epoch is never touched. A recording whose sequence does not
+rise with its positions is not purged and is reported as an ANOMALY. A purge
+the archive refuses (a reader's replay is below the target) is counted and
+tried again on the next pass.
+
+An engine hands the agent one `JournalProfile` per journal (stream, schema
+id, the offsets of `journalSeq`, epoch and log position). The gauges
+(`JournalRetentionAgent.renderMetrics(prefix)`, each labelled `journal`):
+`<prefix>_journal_retention_mode`, `_state`, `_safe_seq`, `_tail_seq`,
+`_retained_bytes`, `_recordings`, `_recordings_foreign`,
+`_recordings_anomaly`, `_oldest_reader_age_ms`, `_purged_bytes_total`,
+`_purge_failures_total`, `_last_pass_age_ms`, and per reader
+`_reader_applied_seq{journal,reader}` and `_reader_released_seq{journal,reader}`.
+`_retained_bytes` is exported under `off` too. `_recordings_anomaly` counts
+the recordings that cannot be cut as far as their readers allow: a sequence
+that does not rise, or an unreadable record at the start or at a segment base.
+`lastError()` is the text for `/health` when a journal in mode `readers` is
+held, when a pass fails or when the thread died; a hold never fails `/ready`.
+
+The thread never throws into the member and never ends silently. Each
+journal's pass is on its own: an exception or an error out of one is counted
+(`_pass_failures_total{journal}`), said on a CRITICAL line, and the other
+journal is still passed. `<prefix>_journal_retention_agent_state` is the
+thread: 0 not running, 1 running, 2 the last pass failed, 3 dead until the
+member restarts, 4 the engine could not start it
+(`JournalRetentionAgent.renderNotStarted`). Alert rules have to fire on an
+absent series as well as on a bad value.
+
+The negative-control seams (`JournalRetention.Seams`) are public statics for
+the engines' tests; `JournalRetentionSeamsTest` holds them off by default and
+unwritten by any main class.
 
 ### Rejoin and peer reachability
 

@@ -292,6 +292,24 @@ public class JournalRetentionEvaluateTest {
         write(JournalRig.ORDER, "reader", new JournalReaders.Record("core", 0, GENESIS + 1, "order", "reader", 100, -1,
             "", 1, now, "t"));
         assertHolds("foreign", pass(JournalRig.ORDER, Mode.READERS, GENESIS), State.FOREIGN);
+        // the control of the identity check: with it off the foreign file's cursor purges this member's journal
+        JournalRetention.Seams.foreignCheckOff = true;
+        try {
+            JournalAudit.nc("foreign reader file", "purged on a reader file of another genesis", () -> {
+                final Report x;
+                try {
+                    x = pass(JournalRig.ORDER, Mode.READERS, GENESIS);
+                } catch (final Exception e) {
+                    throw new IllegalStateException(e);
+                }
+                if (x.purges > 0) {
+                    throw new AssertionError("purged on a reader file of another genesis: " + x);
+                }
+            });
+        } finally {
+            JournalRetention.Seams.reset();
+            archive = new FakeJournalArchive().add(1, true, GENESIS, 1, 160);
+        }
         tool("remove", "--cluster-dir", clusterDir.getAbsolutePath(), "--genesis-id", String.valueOf(GENESIS + 1),
             "--journal", "order", "--reader", "reader", "--reason", "old genesis");
         assertHolds("removed: the last reader is gone", pass(JournalRig.ORDER, Mode.READERS, GENESIS),
@@ -526,5 +544,100 @@ public class JournalRetentionEvaluateTest {
         assertFalse(r.budgetExceeded);
         assertEquals(List.of("recording 1", "recording 2", "segments 3 " + 6L * SEG), archive.purges);
         assertEquals(1, r.recordings);
+    }
+    /**
+     * A stopped recording that would go whole has its start read first. A read that ran into the pass deadline says
+     * nothing about the start: the recording is not deleted, the pass ends as over budget and nothing is called an
+     * ANOMALY; the next pass reads again and deletes. An unreadable start inside the budget is an ANOMALY.
+     */
+    @Test
+    public void aStartReadThatRunsIntoThePassDeadlineIsNotAnAnomaly() throws Exception {
+        archive = new FakeJournalArchive().add(1, false, GENESIS, 1, 64).add(3, true, GENESIS, 1, 160);
+        set(JournalRig.ORDER, "reader", 100);
+        final long[] clock = {1_000};
+        final long deadline = 2_000;
+        final boolean[] timeOut = {true};
+        final JournalRetention.Archive slow = new JournalRetention.Archive() {
+            @Override
+            public List<JournalRetention.Recording> list() {
+                return archive.list();
+            }
+
+            @Override
+            public JournalRetention.Peek first(final JournalRetention.Recording r, final long position, final long d) {
+                if (r.id() == 1 && timeOut[0]) {
+                    clock[0] = d; // the replay waited until the deadline it was given
+                    return JournalRetention.Peek.unreadable("ReplayTimeoutException: recording 1");
+                }
+                return archive.first(r, position, d);
+            }
+
+            @Override
+            public JournalRetention.Peek last(final JournalRetention.Recording r, final long d) {
+                return archive.last(r, d);
+            }
+
+            @Override
+            public void purgeSegments(final long recordingId, final long newStartPosition) {
+                archive.purgeSegments(recordingId, newStartPosition);
+            }
+
+            @Override
+            public void purgeRecording(final long recordingId) {
+                archive.purgeRecording(recordingId);
+            }
+        };
+        final JournalRetention retention = new JournalRetention(JournalRig.ORDER, clusterDir, "core", 0, Mode.READERS,
+            Set.of(), 1L << 30, 3_600_000, () -> clock[0], out::add, err::add);
+        out.clear();
+        err.clear();
+        Report r = retention.pass(slow, GENESIS, JournalRetention.OffBox.NONE, now, deadline);
+        assertTrue("the pass ended at its budget", r.budgetExceeded);
+        assertTrue("nothing deleted: " + archive.purges, archive.purges.isEmpty());
+        assertTrue("a timed out read is not an anomaly: " + r.anomalies, r.anomalies.isEmpty());
+        assertNull(r.problem);
+        assertFalse(err.toString(), err.stream().anyMatch(l -> l.contains("ANOMALY")));
+        assertTrue(out.toString(), out.stream().anyMatch(l -> l.contains("the pass budget ended while its start was"
+            + " read") && l.contains("Not purged this pass")));
+        // the same unreadable start inside the budget is what it was: an anomaly, still nothing deleted
+        final JournalRetention.Archive unreadable = new JournalRetention.Archive() {
+            @Override
+            public List<JournalRetention.Recording> list() {
+                return archive.list();
+            }
+
+            @Override
+            public JournalRetention.Peek first(final JournalRetention.Recording rec, final long position, final long d) {
+                return rec.id() == 1 ? JournalRetention.Peek.unreadable("schema id 9") : archive.first(rec, position, d);
+            }
+
+            @Override
+            public JournalRetention.Peek last(final JournalRetention.Recording rec, final long d) {
+                return archive.last(rec, d);
+            }
+
+            @Override
+            public void purgeSegments(final long recordingId, final long newStartPosition) {
+                archive.purgeSegments(recordingId, newStartPosition);
+            }
+
+            @Override
+            public void purgeRecording(final long recordingId) {
+                archive.purgeRecording(recordingId);
+            }
+        };
+        clock[0] = 1_000;
+        r = retention.pass(unreadable, GENESIS, JournalRetention.OffBox.NONE, now, deadline);
+        assertFalse("recording 1 is not deleted: " + archive.purges, archive.purges.contains("recording 1"));
+        assertEquals(List.of(1L), r.anomalies);
+        assertFalse(r.budgetExceeded);
+        assertTrue(err.toString(), err.stream().anyMatch(l -> l.contains("recording 1 ANOMALY: the record at its"
+            + " start 0 is unreadable")));
+        // the next pass reads the start and deletes
+        timeOut[0] = false;
+        clock[0] = 1_000;
+        r = retention.pass(slow, GENESIS, JournalRetention.OffBox.NONE, now, deadline);
+        assertFalse(r.budgetExceeded);
+        assertTrue(archive.purges.toString(), archive.purges.contains("recording 1"));
     }
 }

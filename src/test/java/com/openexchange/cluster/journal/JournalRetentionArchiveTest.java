@@ -167,6 +167,124 @@ public class JournalRetentionArchiveTest {
         }
     }
 
+    /**
+     * One recording that holds records of two epochs (a process run that wrote before its engine was bound to this
+     * genesis, or anything else that went wrong): its last record is this genesis', so it is counted as own, and its
+     * first record is not. The retention reads the start before it cuts or deletes: such a recording is an ANOMALY,
+     * active or stopped, and nothing of it goes.
+     */
+    @Test
+    public void aRecordingThatStartsInAnotherEpochIsNeitherCutNorDeleted() {
+        final JournalProfile p = JournalRig.ORDER;
+        // stopped: 300 records of epoch 99, then 1..1500 of this genesis; the live recording covers its tail
+        final JournalRig.Writer mixed = rig.writer(p).append(1, 300, 99).append(1, 1_500).stop();
+        final JournalRig.Writer live = rig.writer(p).append(1_200, 3_000);
+        rig.set(p, "reader", 2_500);
+        final Runnable audited = () -> {
+            final JournalAudit.Snapshot before = rig.snapshot(p);
+            final Report report = rig.pass(p);
+            JournalAudit.check(before, rig.snapshot(p), truth(p).cursor("reader", 2_500));
+            assertEquals("counted as own by its last record", 0, report.recordingsForeign);
+            assertEquals(java.util.List.of(mixed.recordingId), report.anomalies);
+            assertTrue(String.valueOf(report.problem), report.problem.contains("ANOMALY"));
+        };
+        audited.run();
+        assertEquals("the stopped recording of two epochs keeps its start", 0, rig.start(mixed.recordingId));
+        assertTrue(rig.err(), rig.err().contains("journal recording " + mixed.recordingId + " ANOMALY: the record at"
+            + " its start 0 carries epoch 99 (journalSeq 1), this member's genesis is " + JournalRig.GENESIS
+            + ": a recording of two epochs"));
+        assertTrue("the recording of this genesis alone is cut as before", rig.start(live.recordingId) > 0);
+        // the control: with the epoch check off the start is not read and the records of epoch 99 are deleted
+        JournalRetention.Seams.epochCheckOff = true;
+        try {
+            JournalAudit.nc("MJR-K2 stopped", "purged a recording of genesis 99", audited);
+        } finally {
+            JournalRetention.Seams.reset();
+        }
+        live.stop();
+    }
+
+    /** The same for the active recording: a boundary of this genesis does not excuse a start of another epoch. */
+    @Test
+    public void anActiveRecordingThatStartsInAnotherEpochIsNotCut() {
+        final JournalProfile p = JournalRig.ORDER;
+        final JournalRig.Writer mixed = rig.writer(p).append(1, 300, 99).append(1, 1_500);
+        rig.set(p, "reader", 1_500);
+        final Runnable audited = () -> {
+            final JournalAudit.Snapshot before = rig.snapshot(p);
+            final Report report = rig.pass(p);
+            JournalAudit.check(before, rig.snapshot(p), truth(p).cursor("reader", 1_500));
+            assertEquals(java.util.List.of(mixed.recordingId), report.anomalies);
+        };
+        audited.run();
+        assertEquals(0, rig.start(mixed.recordingId));
+        assertTrue(rig.err(), rig.err().contains("a recording of two epochs"));
+        JournalRetention.Seams.epochCheckOff = true;
+        try {
+            JournalAudit.nc("MJR-K2 active", "purged a recording of genesis 99", audited);
+        } finally {
+            JournalRetention.Seams.reset();
+        }
+        mixed.stop();
+    }
+
+    /**
+     * Epoch 0 at a recording's start is "written before the member had a genesis" (the core's order journal stamps 0
+     * until a CoreConfig is recorded), not another genesis: the recording is cut at a boundary of this genesis that
+     * every reader has applied, and it goes whole when it is covered. For a profile of an engine that never writes
+     * before its genesis ({@code strictStartEpoch}, the matching engine) the same recording is an ANOMALY.
+     */
+    @Test
+    public void epochZeroAtTheStartIsNoGenesisYetUnlessTheProfileIsStrict() {
+        final JournalProfile p = JournalRig.ORDER;
+        final JournalProfile strict = p.strictStartEpoch();
+        assertTrue(strict.startEpochStrict());
+        assertFalse(p.startEpochStrict());
+        // one run: 300 records before the genesis was recorded, then this genesis' (the sequence goes on)
+        final JournalRig.Writer stopped = rig.writer(p).append(1, 300, 0).append(301, 1_500).stop();
+        final JournalRig.Writer live = rig.writer(p).append(1, 300, 0).append(301, 3_000);
+        rig.set(p, "reader", 2_500);
+
+        // strict: neither the stopped recording (it would go whole) nor the active one is touched
+        JournalAudit.Snapshot before = rig.snapshot(p);
+        Report report = rig.pass(rig.retention(strict, JournalRetention.Mode.READERS), JournalRetention.OffBox.NONE);
+        JournalAudit.check(before, rig.snapshot(p), truth(p).cursor("reader", 2_500));
+        assertEquals(java.util.List.of(stopped.recordingId, live.recordingId), report.anomalies);
+        assertEquals(0, rig.start(stopped.recordingId));
+        assertEquals(0, rig.start(live.recordingId));
+        assertTrue(rig.err(), rig.err().contains("journal recording " + live.recordingId + " ANOMALY: the record at"
+            + " its start 0 carries epoch 0 (journalSeq 1), this member's genesis is " + JournalRig.GENESIS));
+        // and the strict audit sees the lenient rule: the default profile's pass deletes epoch 0 records
+        JournalAudit.nc("MJR-K2 strict", "purged a recording of genesis 0", () -> {
+            final JournalAudit.Snapshot b = rig.snapshot(p);
+            rig.pass(p);
+            JournalAudit.check(b, rig.snapshot(p), truth(p).cursor("reader", 2_500));
+        });
+
+        // the default profile (what the pass above did): cut and deleted by sequence, nothing above the cursor
+        assertFalse("the covered recording went whole", rig.port(p).list().stream()
+            .anyMatch(r -> r.id() == stopped.recordingId));
+        assertTrue("the active recording is cut", rig.start(live.recordingId) > 0);
+        before = rig.snapshot(p);
+        live.append(3_001, 4_000);
+        rig.set(p, "reader", 3_600);
+        report = rig.pass(p);
+        final JournalAudit.Truth lenient = truth(p).cursor("reader", 3_600).epochZeroIsNoGenesis();
+        JournalAudit.check(before, rig.snapshot(p), lenient);
+        JournalAudit.checkKept(before, rig.snapshot(p), lenient, 3_600);
+        assertTrue(report.anomalies.isEmpty());
+        // a boundary must still be this genesis': a base whose first record is of epoch 0 never qualifies, so an
+        // active recording whose every candidate base lies in its epoch 0 prefix is not cut
+        final JournalRig.Writer prefix = rig.writer(p).append(1, 1_500, 0).append(1_501, 1_600);
+        before = rig.snapshot(p);
+        report = rig.pass(p);
+        assertEquals("no base of epoch 0 qualifies", 0, rig.start(prefix.recordingId));
+        assertTrue(report.anomalies.isEmpty());
+        JournalAudit.check(before, rig.snapshot(p), lenient);
+        prefix.stop();
+        live.stop();
+    }
+
     @Test
     public void aWrongSchemaFrameAtABoundaryDoesNotQualify() {
         final JournalProfile p = JournalRig.ORDER;

@@ -54,6 +54,13 @@ final class JournalAudit {
         final Map<String, Long> cursors = new LinkedHashMap<>();
         /** The off-box floor in log position; {@code Long.MAX_VALUE} for none. */
         long logFloor = Long.MAX_VALUE;
+        /** Epoch 0 records (written before the member had a genesis) are no other genesis'. */
+        boolean epochZeroIsNoGenesis;
+
+        Truth epochZeroIsNoGenesis() {
+            epochZeroIsNoGenesis = true;
+            return this;
+        }
 
         Truth cursor(final String reader, final long applied) {
             cursors.put(reader, applied);
@@ -86,7 +93,8 @@ final class JournalAudit {
                     break;
                 }
                 purged++;
-                if (truth.hasEpoch && rec.epoch() != truth.genesis) {
+                if (truth.hasEpoch && rec.epoch() != truth.genesis
+                    && !(truth.epochZeroIsNoGenesis && rec.epoch() == 0)) {
                     throw new AssertionError("purged a recording of genesis " + rec.epoch() + " (recording " + b.id()
                         + ", this member's genesis is " + truth.genesis + ")");
                 }

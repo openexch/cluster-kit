@@ -58,6 +58,8 @@ public final class JournalReaders {
     public static final String FORMAT = "journal-reader/1";
     public static final String ENGINE_CORE = "core";
     public static final String ENGINE_MATCH = "match";
+    /** The matching engine's one journal (its settlement journal): the name in settings, reader files and metrics. */
+    public static final String MATCH_SETTLEMENT = "settlement";
     /** {@code released_up_to_journal_seq} when no release is in force. */
     public static final long NO_RELEASE = -1;
     static final int MAX_NAME_LENGTH = 64;
@@ -102,7 +104,10 @@ public final class JournalReaders {
      * cannot register a reader in a directory no member reads.
      */
     public static java.util.Set<String> journalsOf(final String engine) {
-        return ENGINE_CORE.equals(engine) ? java.util.Set.of("money", "order") : java.util.Set.of();
+        if (ENGINE_CORE.equals(engine)) {
+            return java.util.Set.of("money", "order");
+        }
+        return ENGINE_MATCH.equals(engine) ? java.util.Set.of(MATCH_SETTLEMENT) : java.util.Set.of();
     }
 
     /** The content of a valid file. */

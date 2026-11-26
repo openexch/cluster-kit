@@ -101,6 +101,22 @@ public class JournalReaderToolTest {
             new File(clusterDir, "retention").exists() ? 1 : 0);
     }
 
+    /** The matching engine's one journal: its settlement journal, registered and read back like the core's. */
+    @Test
+    public void matchRegistersAReaderOfItsSettlementJournal() {
+        assertEquals(java.util.Set.of("settlement"), JournalReaders.journalsOf(JournalReaders.ENGINE_MATCH));
+        assertEquals(java.util.Set.of("money", "order"), JournalReaders.journalsOf(JournalReaders.ENGINE_CORE));
+        assertEquals(java.util.Set.of(), JournalReaders.journalsOf("oms"));
+        assertEquals(0, run("set", "--cluster-dir", dir, "--engine", "match", "--cluster-id", "0",
+            "--genesis-id", "17", "--journal", "settlement", "--reader", "ct-bridge", "--applied-journal-seq",
+            "12", "--source", "c"));
+        final JournalReaders.Read read = JournalReaders.read(new java.io.File(dir), "settlement", "ct-bridge");
+        assertTrue(String.valueOf(read.invalid), read.valid());
+        assertEquals("match", read.record.engine);
+        assertEquals("settlement", read.record.journal);
+        assertEquals(12, read.record.appliedJournalSeq);
+    }
+
     @Test
     public void refusedInputExits65() {
         assertEquals(65, set("order", "oe-projector", -1));
@@ -115,8 +131,13 @@ public class JournalReaderToolTest {
             "--source", "c"));
         assertEquals("a journal the engine does not have", 65, set("orders", "oe-projector", 1));
         assertTrue(err.toString(), err.toString().contains("is not a journal of engine core"));
-        assertEquals("match has no journal with registered readers yet", 65, run("set", "--cluster-dir", dir,
+        assertEquals("the core's journal names are not match's", 65, run("set", "--cluster-dir", dir,
             "--engine", "match", "--cluster-id", "0", "--genesis-id", "17", "--journal", "order", "--reader", "r",
+            "--applied-journal-seq", "1", "--source", "c"));
+        assertTrue(err.toString(), err.toString().contains("'order' is not a journal of engine match (its journals:"
+            + " [settlement])"));
+        assertEquals("match's journal name is not the core's", 65, run("set", "--cluster-dir", dir, "--engine",
+            "core", "--cluster-id", "0", "--genesis-id", "17", "--journal", "settlement", "--reader", "r",
             "--applied-journal-seq", "1", "--source", "c"));
         assertEquals("a reader name that is a path", 65, set("order", "../../x", 1));
         assertEquals("a reader name with a space", 65, set("order", "oe projector", 1));

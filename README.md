@@ -104,7 +104,7 @@ system property:
 | `RETENTION_OFFBOX` / `-Dretention.offbox` | `SnapshotLogPruner`, `OffBoxWatermark`, `ArchiveHousekeeping` | `off`. `required`: the purge never passes the member's off-box watermark, and a watermark that is missing, invalid, foreign or above the commit position holds the whole log. `report`: the same evaluation, logged and exported, not applied. `off` with a watermark file present refuses the start. |
 | `RETENTION_OFFBOX_ALARM_BYTES` / `-Dretention.offbox.alarm.bytes` | `OffBoxWatermark` | `2147483648` (1048576..1099511627776). Log bytes held for the off-box copy above which every purge pass prints a CRITICAL line. An alarm, not a limit. |
 | `RETENTION_OFFBOX_STALE_MS` / `-Dretention.offbox.stale.ms` | `OffBoxWatermark` | `3600000` (1000..604800000). Age of the watermark file above which every purge pass prints a CRITICAL line. It does not change the floor. |
-| `JOURNAL_RETENTION_<JOURNAL>` / `-Djournal.retention.<journal>` | `JournalRetention`, `JournalRetentionAgent` | `off`. One setting per journal of the engine (the core's are `JOURNAL_RETENTION_MONEY` and `JOURNAL_RETENTION_ORDER`). `off`: nothing of the journal is ever purged. `report`: evaluated, logged and exported, nothing purged. `readers`: the member purges its journal recordings behind the registered readers. |
+| `JOURNAL_RETENTION_<JOURNAL>` / `-Djournal.retention.<journal>` | `JournalRetention`, `JournalRetentionAgent` | `off`. One setting per journal of the engine (the core's are `JOURNAL_RETENTION_MONEY` and `JOURNAL_RETENTION_ORDER`, the matching engine's is `JOURNAL_RETENTION_SETTLEMENT`). `off`: nothing of the journal is ever purged. `report`: evaluated, logged and exported, nothing purged. `readers`: the member purges its journal recordings behind the registered readers. |
 | `JOURNAL_RETENTION_REQUIRED_READERS_<JOURNAL>` / `-Djournal.retention.required.readers.<journal>` | `JournalRetention` | empty. Reader names, separated by commas, that must have a valid file; one that has none holds the journal. |
 | `JOURNAL_RETENTION_POLL_MS` / `-Djournal.retention.poll.ms` | `JournalRetentionAgent` | `60000` (1000..3600000). The interval between two passes. |
 | `JOURNAL_RETENTION_PASS_TIMEOUT_MS` / `-Djournal.retention.pass.timeout.ms` | `JournalRetentionAgent` | `10000` (1000..600000). The budget of one pass over one journal (listing, one-record reads, purges). |
@@ -273,8 +273,9 @@ the archive context it is given, not from the context's directory name.
 
 ### Journal retention
 
-An engine's journals (the core's money journal and order journal) are
-recordings in each member's own archive. `journal.JournalRetention` is the only
+An engine's journals (the core's money journal and order journal, the matching
+engine's settlement journal) are recordings in an archive of the member (the
+agent is given that archive's client context). `journal.JournalRetention` is the only
 class that purges one, and `journal.JournalRetentionAgent` runs it inside the
 member on its own thread (`journal-retention`) with its own archive session.
 A record is deleted from a member only when every registered reader has
@@ -341,7 +342,13 @@ stopped recording whose last sequence is at or below `safeSeq` is deleted
 whole, unless it is the recording that carries the member's journal tail; any
 other stopped recording keeps its last segment. A recording whose records
 carry another epoch is never touched. A recording whose sequence does not
-rise with its positions is not purged and is reported as an ANOMALY. A purge
+rise with its positions is not purged and is reported as an ANOMALY. So is a
+recording whose last record is this genesis' and whose first record carries
+another genesis' epoch (one process run that wrote two epochs): it is neither
+cut nor deleted. Epoch 0 at a recording's start reads as "written before the
+member had a genesis" and is no other genesis'; an engine that never writes
+before its genesis hands a strict profile (`JournalProfile.strictStartEpoch()`),
+for which epoch 0 at the start is an ANOMALY too. A purge
 the archive refuses (a reader's replay is below the target) is counted and
 tried again on the next pass.
 

@@ -21,9 +21,6 @@ import org.agrona.concurrent.UnsafeBuffer;
 import org.agrona.concurrent.status.AtomicCounter;
 
 import java.io.File;
-import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.net.DatagramSocket;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -163,23 +160,7 @@ final class OneMemberCluster implements AutoCloseable {
     }
 
     private static int[] freePorts(final int n) {
-        final DatagramSocket[] sockets = new DatagramSocket[n];
-        final int[] ports = new int[n];
-        try {
-            for (int i = 0; i < n; i++) {
-                sockets[i] = new DatagramSocket(0);
-                ports[i] = sockets[i].getLocalPort();
-            }
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        } finally {
-            for (final DatagramSocket s : sockets) {
-                if (s != null) {
-                    s.close();
-                }
-            }
-        }
-        return ports;
+        return com.openexchange.cluster.TestPorts.freeUdpPorts(n);
     }
 
     /** Authenticates every session, with its credentials as the encoded principal. */

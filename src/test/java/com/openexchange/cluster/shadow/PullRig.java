@@ -8,6 +8,9 @@ import io.aeron.archive.ArchivingMediaDriver;
 import io.aeron.archive.client.AeronArchive;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
+import io.aeron.driver.ext.DebugReceiveChannelEndpoint;
+import io.aeron.driver.ext.DebugSendChannelEndpoint;
+import io.aeron.driver.ext.LossGenerator;
 import org.agrona.CloseHelper;
 import org.agrona.IoUtil;
 import org.agrona.concurrent.BackoffIdleStrategy;
@@ -15,7 +18,6 @@ import org.agrona.concurrent.BackoffIdleStrategy;
 import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.net.DatagramSocket;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
@@ -29,6 +31,11 @@ import java.util.List;
  * <p>The archive runs in {@link ArchiveThreadingMode#DEDICATED}, the member's mode (its recorder, replayer and
  * conductor race as they do on a member; SHARED hides the window between REPLICATE_END and the destination's stop).
  * The test setting {@code -Dkit.pullrig.archive.threading=SHARED} runs every node in SHARED instead.</p>
+ *
+ * <p>{@link Node#partition} cuts a node off from every UDP peer (each frame its driver receives is dropped), so the
+ * loss of a peer is silent there, as a crash or a cable pull is: a peer stopped during a partition never reaches this
+ * node with an end of stream, an error or a closed session. An in-process {@link Node#stop} alone is a graceful close
+ * whose last frames may or may not get out before the driver ends, depending on scheduling.</p>
  */
 final class PullRig {
 
@@ -39,17 +46,9 @@ final class PullRig {
     private PullRig() {
     }
 
-    /** A UDP port that is free right now. */
+    /** A UDP port that is free right now, below the ephemeral range ({@link com.openexchange.cluster.TestPorts}). */
     static int freeUdpPort() {
-        for (int attempt = 0; attempt < 100; attempt++) {
-            final int p = 21_000 + (int)(Math.random() * 18_000);
-            try (DatagramSocket ignored = new DatagramSocket(p)) {
-                return p;
-            } catch (final IOException taken) {
-                // next
-            }
-        }
-        throw new IllegalStateException("no free UDP port");
+        return com.openexchange.cluster.TestPorts.freeUdpPort();
     }
 
     static File tempDir(final String prefix) {
@@ -71,6 +70,9 @@ final class PullRig {
         private Aeron aeron;
         private AeronArchive archive;
         private final List<AutoCloseable> extra = new ArrayList<>();
+        private volatile boolean partitioned;
+        /** Every inbound UDP frame (data, setup, status, NAK, RTT) while {@link #partition} is on. */
+        private final LossGenerator cut = (address, buffer, length) -> partitioned;
 
         Node(final String name, final int maxReplays) {
             this(name, maxReplays, ARCHIVE_THREADING);
@@ -92,6 +94,12 @@ final class PullRig {
                             .aeronDirectoryName(aeronDir)
                             .threadingMode(ThreadingMode.SHARED)
                             .sharedIdleStrategy(new BackoffIdleStrategy())
+                            .receiveChannelEndpointSupplier((udpChannel, dispatcher, statusIndicator, context) ->
+                                    new DebugReceiveChannelEndpoint(udpChannel, dispatcher, statusIndicator, context,
+                                            cut, cut))
+                            .sendChannelEndpointSupplier((udpChannel, statusIndicator, context) ->
+                                    new DebugSendChannelEndpoint(udpChannel, statusIndicator, context,
+                                            (address, buffer, length) -> false, cut))
                             .dirDeleteOnStart(true)
                             .dirDeleteOnShutdown(true),
                     new Archive.Context()
@@ -117,6 +125,11 @@ final class PullRig {
                     .ownsAeronClient(false)
                     .controlRequestChannel("aeron:ipc")
                     .controlResponseChannel("aeron:ipc");
+        }
+
+        /** On: this node's driver drops every UDP frame it receives (see the class comment); off: heals. */
+        void partition(final boolean on) {
+            partitioned = on;
         }
 
         String endpoint() {

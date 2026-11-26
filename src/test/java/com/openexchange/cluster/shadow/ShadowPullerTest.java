@@ -264,24 +264,16 @@ public class ShadowPullerTest {
     // ------------------------------------------------------------------------------------------------ INCOMPLETE
 
     /**
-     * The source archive stopped mid-copy. Aeron ends such a replication one of two ways, by timing: the replay image
-     * closes and the session ends with no error and no SYNC (INCOMPLETE), or the destination's control session to the
-     * source reports an error ({@code not connected}, an archive refusal). Both are retried, neither is content; the
-     * scenario is repeated (up to three times) until the INCOMPLETE shape was seen, so the control below always meets
-     * the rule it switches off.
+     * The source lost mid-copy, in two shapes. (1) The source stops: Aeron ends such a replication one of several ways,
+     * by scheduling alone (which of the stopping source's last frames get out): the replay image ends and the session
+     * ends with no error and no SYNC (INCOMPLETE), the destination's control session to the source reports
+     * {@code not connected} (GENERIC); when nothing gets out, one of the two after the image liveness timeout (10 s).
+     * Every one is retried, none is content, and which one comes is not asserted. (2) The source's replay stops
+     * mid-copy while the source stays up (an operator's stopAllReplays, a segment read error): the replay image ends
+     * with no error and no SYNC, the INCOMPLETE shape every time, so the control below always meets the rule it
+     * switches off.
      */
     static void killMidCopy(final Set<NegativeControl> off) {
-        for (int attempt = 1; ; attempt++) {
-            if (killMidCopyOnce(off, attempt)) {
-                return;
-            }
-            if (attempt == 3) {
-                throw new AssertionError("the source loss never ended as INCOMPLETE in 3 attempts");
-            }
-        }
-    }
-
-    private static boolean killMidCopyOnce(final Set<NegativeControl> off, final int attempt) {
         try (Pair p = new Pair(10)) {
             final long big = p.src.write(R3, 1, ShadowKind.ALIGNED, 1_000, BIG, 1, "4m");
             final ShadowAlias alias = aliasOf(p.src, big);
@@ -289,23 +281,42 @@ public class ShadowPullerTest {
             p.awaitDestinationProgress(16L * 1024 * 1024);
             p.src.stop();
             await("the copy ended short of the source", () -> p.refused("INCOMPLETE") >= 1
-                    || p.refused("GENERIC") >= 1 || !p.puller.contentRefused().isEmpty(), 60_000);
+                    || p.refused("GENERIC") >= 1 || p.refused("TIMEOUT") >= 1
+                    || !p.puller.contentRefused().isEmpty() || p.refused("CORRUPT") != 0, 60_000);
             if (!p.puller.contentRefused().isEmpty() || p.refused("CORRUPT") != 0) {
                 throw new AssertionError("a crashed source copy was refused for content: " + p.puller.lastRefusal());
             }
-            if (p.refused("INCOMPLETE") == 0) {
-                System.out.println("[puller test] attempt " + attempt + ": the source loss was answered as an archive"
-                        + " refusal (" + p.puller.lastRefusal() + "), not content; repeating for the INCOMPLETE shape");
-                return false;
-            }
+            final String shape = "INCOMPLETE " + p.refused("INCOMPLETE") + ", GENERIC " + p.refused("GENERIC")
+                    + ", TIMEOUT " + p.refused("TIMEOUT");
             await("the partial copy purged", () -> p.copies(alias).isEmpty(), 20_000);
             p.src.start(false);
             await("the same source re-pulled after it returned", () -> p.get(Counter.PULL_TOTAL) == 1, 60_000);
             assertEquals(ShadowEntry.State.VERIFIED, p.copies(alias).get(0).state());
             assertEquals(0, p.refused("CORRUPT"));
-            ShadowRig.green("puller kill mid-copy: INCOMPLETE '" + p.puller.lastRefusal() + "', partial purged,"
-                    + " re-pulled after the source returned");
-            return true;
+            System.out.println("[puller test] source stopped mid-copy: answered as " + shape + ", re-pulled");
+        }
+        try (Pair p = new Pair(10)) {
+            final long big = p.src.write(R3, 1, ShadowKind.ALIGNED, 1_000, BIG, 1, "4m");
+            final ShadowAlias alias = aliasOf(p.src, big);
+            p.start(p.settings(120_000, 1, false), () -> false, off);
+            p.awaitDestinationProgress(16L * 1024 * 1024);
+            p.src.archive().stopAllReplays(big);
+            await("the copy ended short of the source", () -> p.refused("INCOMPLETE") >= 1
+                    || p.refused("GENERIC") >= 1 || p.refused("TIMEOUT") >= 1
+                    || !p.puller.contentRefused().isEmpty() || p.refused("CORRUPT") != 0, 60_000);
+            if (!p.puller.contentRefused().isEmpty() || p.refused("CORRUPT") != 0) {
+                throw new AssertionError("a crashed source copy was refused for content (its replay stopped"
+                        + " mid-copy): " + p.puller.lastRefusal());
+            }
+            assertEquals("a replay stopped at the source ends the copy without an error: " + p.puller.lastRefusal(),
+                    1, p.refused("INCOMPLETE"));
+            final String incomplete = p.puller.lastRefusal();
+            await("re-pulled from the source", () -> p.get(Counter.PULL_TOTAL) == 1, 60_000);
+            final List<ShadowEntry> local = p.copies(alias);
+            assertEquals("the partial copy purged: " + local, 1, local.size());
+            assertEquals(ShadowEntry.State.VERIFIED, local.get(0).state());
+            assertEquals(0, p.refused("CORRUPT"));
+            ShadowRig.green("puller kill mid-copy: INCOMPLETE '" + incomplete + "', partial purged, re-pulled");
         }
     }
 
@@ -350,14 +361,25 @@ public class ShadowPullerTest {
     @Test(timeout = 180_000)
     public void aReplicationThatOutlivesItsBoundIsStoppedPurgedAndRetried() {
         try (Pair p = new Pair(10)) {
-            final long big = p.src.write(R3, 1, ShadowKind.ALIGNED, 1_000, 100_000_000, 1, "4m");
+            // the bound must fire during the silent loss (before the destination's 10 s image liveness, or its 5 s
+            // publication connection timeout, could end the copy) AND admit the whole copy on the retry: 4 s for 60 MB
+            // (15 MB/s). The old 1 s for 100 MB needed 100 MB/s on the retry, which a loaded 4-core runner misses on
+            // every attempt; 60 MB is still in flight at the 16 MB the partition waits for
+            final long big = p.src.write(R3, 1, ShadowKind.ALIGNED, 1_000, 60_000_000, 1, "4m");
             final ShadowAlias alias = aliasOf(p.src, big);
-            p.start(p.settings(1_000, 1, false), () -> false, Set.of());
+            p.start(p.settings(4_000, 1, false), () -> false, Set.of());
             p.awaitDestinationProgress(16L * 1024 * 1024);
-            p.src.stop(); // the destination image stays alive for its liveness timeout: the bound fires first
-            await("REFUSED(TIMEOUT)", () -> p.refused("TIMEOUT") >= 1, 20_000);
+            // the source dies silently (partitioned first, so no last frame of its stop reaches the destination): the
+            // destination's images stay alive for their liveness timeout (10 s), the 4 s bound fires first. A bare
+            // stop is a graceful close whose end of stream reaches the destination or not by scheduling
+            p.dst.partition(true);
+            p.src.stop();
+            await("REFUSED(TIMEOUT)", () -> p.refused("TIMEOUT") >= 1 || p.refused("INCOMPLETE") >= 1
+                    || p.refused("GENERIC") >= 1, 20_000);
+            assertEquals("the bound fired first: " + p.puller.lastRefusal(), 1, p.refused("TIMEOUT"));
             assertEquals("no INCOMPLETE: the bound fired first", 0, p.refused("INCOMPLETE"));
             await("the partial copy purged", () -> p.copies(alias).isEmpty(), 30_000);
+            p.dst.partition(false);
             p.src.start(false);
             await("retried and pulled", () -> p.get(Counter.PULL_TOTAL) == 1, 60_000);
             assertTrue(p.puller.contentRefused().isEmpty());
@@ -580,9 +602,13 @@ public class ShadowPullerTest {
                     System.nanoTime() + TimeUnit.SECONDS.toNanos(4))));
             t.start();
             p.awaitDestinationProgress(16L * 1024 * 1024);
+            // a silent loss (see aReplicationThatOutlivesItsBoundIsStoppedPurgedAndRetried): nothing of the source's
+            // stop reaches the destination before its liveness timeout (10 s), so the 4 s deadline is what ends it
+            p.dst.partition(true);
             p.src.stop();
             t.join(30_000);
             once.close();
+            p.dst.partition(false);
             assertNotNull(result.get());
             assertEquals("tried 1 sources, 1 candidates, refused 0, last: TIMEOUT", result.get().text());
             await("the stopped copy purged", () -> p.copies(bigAlias).isEmpty(), 20_000);

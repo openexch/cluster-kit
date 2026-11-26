@@ -16,7 +16,6 @@ import org.junit.Test;
 
 import java.io.File;
 import java.io.IOException;
-import java.net.DatagramSocket;
 import java.nio.file.Files;
 
 import static org.junit.Assert.assertEquals;
@@ -38,11 +37,7 @@ public class BundleCaptureStubRefusalTest {
     static final BundleCapture.EngineSchema SCHEMA = new BundleCapture.EngineSchema(901, 5);
 
     static int freeUdpPort() {
-        try (DatagramSocket s = new DatagramSocket(0)) {
-            return s.getLocalPort();
-        } catch (final IOException e) {
-            throw new IllegalStateException(e);
-        }
+        return TestPorts.freeUdpPort();
     }
 
     /** A source node: a log recording, and a cluster dir per service payload. */

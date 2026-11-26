@@ -188,10 +188,12 @@ public class ShadowReplayReadTest {
         });
         drain.start();
         final AtomicReference<Throwable> failure = new AtomicReference<>();
+        final AtomicInteger n = new AtomicInteger();
+        // one deadline, taken before the reader starts: the wait below outlasts it, so A's own deadline decides
+        final long aDeadlineNs = ShadowRig.CLOCK.nanoTime() + ShadowRig.TIMEOUT_NS;
         final Thread reader = new Thread(() -> {
             try {
                 final ByteArrayOutputStream out = new ByteArrayOutputStream();
-                final AtomicInteger n = new AtomicInteger();
                 new ShadowReplay(rig.fixture.aeron(), rig.archive(), ShadowRig.CLOCK).readAll(a.recordingId(), 0,
                         a.bytes(), (buf, o, l, h) -> {
                             final int i = n.getAndIncrement();
@@ -204,7 +206,7 @@ public class ShadowReplayReadTest {
                                 aStreaming.countDown();
                             }
                             java.util.concurrent.locks.LockSupport.parkNanos(5_000_000L); // a slow loader
-                        }, ShadowRig.CLOCK.nanoTime() + ShadowRig.TIMEOUT_NS);
+                        }, aDeadlineNs);
                 payloadOut[0] = out.toByteArray();
             } catch (final Throwable t) {
                 failure.set(t);
@@ -212,9 +214,10 @@ public class ShadowReplayReadTest {
         });
         reader.start();
         try {
-            // A streams, or (char run) A was refused at its join; either way B's window runs while A is live or done
-            final long until = System.nanoTime() + 10_000_000_000L;
-            while (aStreaming.getCount() > 0 && failure.get() == null && System.nanoTime() < until) {
+            // A streams, or (char run) A was refused at its join or timed out; either way B's window runs while A
+            // is live or done. The wait outlasts A's deadline by a margin: a wait equal to that deadline raced it
+            final long until = aDeadlineNs + 5_000_000_000L;
+            while (aStreaming.getCount() > 0 && failure.get() == null && ShadowRig.CLOCK.nanoTime() - until < 0) {
                 Thread.sleep(1);
             }
             assertTrue("A neither streamed nor failed", aStreaming.getCount() == 0 || failure.get() != null);
@@ -233,6 +236,13 @@ public class ShadowReplayReadTest {
         if (failure.get() != null) {
             if (bareSessions != null && failure.get() instanceof ShadowReplay.ReplayJoinedLateException) {
                 payloadOut[0] = null; // (char) the bare subscriber connected A's replay early: refused, not misread
+                return;
+            }
+            if (bareSessions != null && failure.get() instanceof ShadowReplay.ReplayTimeoutException && n.get() == 0) {
+                // (char) the bare subscriber drained A's whole replay before the scoped subscription was added; the
+                // linger=0 publication closed with it, so A's image never appeared and A timed out with nothing read:
+                // refused, not misread. A timeout after A delivered a message is not this shape and fails below
+                payloadOut[0] = null;
                 return;
             }
             throw new AssertionError(failure.get());
@@ -257,7 +267,8 @@ public class ShadowReplayReadTest {
             String outcome;
             try {
                 concurrent(rig, true, trailer, got, bare);
-                outcome = got[0] == null ? "A refused (joined late)" : "A read";
+                outcome = got[0] == null ? "A refused (joined late, or its replay drained before it subscribed)"
+                        : "A read";
             } catch (final ShadowReplay.ReplayJoinedLateException late) {
                 outcome = "B refused (joined late)";
             }

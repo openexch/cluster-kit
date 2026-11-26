@@ -91,7 +91,9 @@ public class ReplicaProcessSmokeTest {
     /** A port base whose member-0 and slot-3 ports (stride 100) are free right now. */
     static int freeBase() {
         for (int attempt = 0; attempt < 50; attempt++) {
-            final int b = 20_000 + (int)(Math.random() * 20_000) / 10 * 10;
+            // below the ephemeral range, as com.openexchange.cluster.TestPorts explains
+            final int top = com.openexchange.cluster.TestPorts.ephemeralLow() - 400;
+            final int b = 20_000 + (int)(Math.random() * (top - 20_000)) / 10 * 10;
             if (udpFree(b + 1, 6) && udpFree(b + 301, 5)) {
                 return b;
             }

@@ -11,14 +11,12 @@ import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
 import org.agrona.concurrent.UnsafeBuffer;
 import org.junit.Test;
-import java.net.DatagramSocket;
 import java.nio.file.Files;
 import static org.junit.Assert.*;
 
 public class ConsensusCommitObserverTest {
     @Test public void passiveWireObserverFencesTermsLeadersAndBufferedBacklog() throws Exception {
-        final int port;
-        try (var socket = new DatagramSocket(0)) { port = socket.getLocalPort(); }
+        final int port = TestPorts.freeUdpPort();
         final var directory = Files.createTempDirectory("consensus-observer-");
         final String channel = "aeron:udp?endpoint=127.0.0.1:" + port;
         try (var driver = MediaDriver.launch(new MediaDriver.Context().aeronDirectoryName(directory.toString())

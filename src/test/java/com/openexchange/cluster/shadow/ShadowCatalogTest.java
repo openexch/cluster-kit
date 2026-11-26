@@ -18,7 +18,6 @@ import org.agrona.concurrent.UnsafeBuffer;
 import org.junit.Test;
 
 import java.io.File;
-import java.net.DatagramSocket;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.util.ArrayList;
@@ -58,11 +57,7 @@ public class ShadowCatalogTest {
     static final int LEN = CHUNK * 2 + 777;
 
     static int freeUdpPort() {
-        try (DatagramSocket s = new DatagramSocket(0)) {
-            return s.getLocalPort();
-        } catch (final java.io.IOException e) {
-            throw new IllegalStateException(e);
-        }
+        return com.openexchange.cluster.TestPorts.freeUdpPort();
     }
 
     /** A destination archive for replication, deleted on close. */

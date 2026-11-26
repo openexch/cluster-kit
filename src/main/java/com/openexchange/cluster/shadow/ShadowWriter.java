@@ -152,7 +152,7 @@ public final class ShadowWriter {
     private final java.util.concurrent.atomic.AtomicLong inFlight = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong abortedWrite = new java.util.concurrent.atomic.AtomicLong();
     private long writeIds;
-    private final IdleStrategy idle = new BackoffIdleStrategy(10, 20, 1_000, 1_000_000);
+    private final IdleStrategy idle;
     private final UnsafeBuffer trailerBuffer = new UnsafeBuffer(new byte[ShadowTrailer.LENGTH]);
     private long producerSeq;
     private long lastWrittenPosition;
@@ -170,7 +170,18 @@ public final class ShadowWriter {
                         final ShadowCounters counters) {
         this(aeron, archive, producer, selfCheck, ipcTermLength, clock, connectTimeoutNs, offerTimeoutNs,
                 recordTimeoutNs, initialProducerSeq, initialLastWrittenPosition, counters, Faults.NONE,
-                EnumSet.noneOf(NegativeControl.class));
+                EnumSet.noneOf(NegativeControl.class), new BackoffIdleStrategy(10, 20, 1_000, 1_000_000));
+    }
+
+    /** As above, with the host's idle strategy for the waits inside a write (the replica passes its idle mode). */
+    public ShadowWriter(final Aeron aeron, final AeronArchive archive, final ShadowProducer producer,
+                        final ShadowSelfCheck selfCheck, final String ipcTermLength, final NanoClock clock,
+                        final long connectTimeoutNs, final long offerTimeoutNs, final long recordTimeoutNs,
+                        final long initialProducerSeq, final long initialLastWrittenPosition,
+                        final ShadowCounters counters, final IdleStrategy idle) {
+        this(aeron, archive, producer, selfCheck, ipcTermLength, clock, connectTimeoutNs, offerTimeoutNs,
+                recordTimeoutNs, initialProducerSeq, initialLastWrittenPosition, counters, Faults.NONE,
+                EnumSet.noneOf(NegativeControl.class), idle);
     }
 
     ShadowWriter(final Aeron aeron, final AeronArchive archive, final ShadowProducer producer,
@@ -178,6 +189,17 @@ public final class ShadowWriter {
                  final long connectTimeoutNs, final long offerTimeoutNs, final long recordTimeoutNs,
                  final long initialProducerSeq, final long initialLastWrittenPosition, final ShadowCounters counters,
                  final Faults faults, final Set<NegativeControl> off) {
+        this(aeron, archive, producer, selfCheck, ipcTermLength, clock, connectTimeoutNs, offerTimeoutNs,
+                recordTimeoutNs, initialProducerSeq, initialLastWrittenPosition, counters, faults, off,
+                new BackoffIdleStrategy(10, 20, 1_000, 1_000_000));
+    }
+
+    ShadowWriter(final Aeron aeron, final AeronArchive archive, final ShadowProducer producer,
+                 final ShadowSelfCheck selfCheck, final String ipcTermLength, final NanoClock clock,
+                 final long connectTimeoutNs, final long offerTimeoutNs, final long recordTimeoutNs,
+                 final long initialProducerSeq, final long initialLastWrittenPosition, final ShadowCounters counters,
+                 final Faults faults, final Set<NegativeControl> off, final IdleStrategy idle) {
+        this.idle = Objects.requireNonNull(idle, "idle");
         this.aeron = Objects.requireNonNull(aeron, "aeron");
         this.archive = Objects.requireNonNull(archive, "archive");
         this.producer = Objects.requireNonNull(producer, "producer");

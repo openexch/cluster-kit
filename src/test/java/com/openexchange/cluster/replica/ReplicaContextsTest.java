@@ -327,4 +327,45 @@ public class ReplicaContextsTest {
         assertEquals(132_000, base().verifyWaitMs(132_000).build().verifyWaitMs());
         assertEquals(180_000, base().build().verifyWaitMs());
     }
+
+    private static void assertIdleClasses(final ReplicaConfig.IdleMode mode, final Class<?> shared,
+                                          final Class<?> follower) {
+        final ReplicaConfig c = base().idleMode(mode).build();
+        assertEquals(follower, ReplicaContexts.idle(c).getClass());
+        final io.aeron.driver.MediaDriver.Context d = ReplicaContexts.driver(c);
+        assertEquals(shared, d.sharedIdleStrategy().getClass());
+        final io.aeron.archive.Archive.Context a = ReplicaContexts.archive(c, t -> { });
+        assertEquals(shared, a.idleStrategy().getClass());
+        final ClusterBackup.Context b = ReplicaContexts.backup(c, new BackupEvents(() -> 0, null), t -> { }, () -> { });
+        if (mode == ReplicaConfig.IdleMode.SLEEP) {
+            assertEquals(shared, d.conductorIdleStrategy().getClass());
+            assertEquals(shared, d.senderIdleStrategy().getClass());
+            assertEquals(shared, d.receiverIdleStrategy().getClass());
+            assertEquals(shared, d.sharedNetworkIdleStrategy().getClass());
+            assertEquals(shared, d.nativeResourceAgentIdleStrategy().getClass());
+            assertEquals(shared, a.recorderIdleStrategy().getClass());
+            assertEquals(shared, a.replayerIdleStrategy().getClass());
+            assertEquals(shared, b.idleStrategy().getClass());
+            assertEquals(shared, ReplicaContexts.writerIdle(c).getClass());
+        } else {
+            assertEquals(org.agrona.concurrent.BackoffIdleStrategy.class, ReplicaContexts.writerIdle(c).getClass());
+        }
+    }
+
+    @Test
+    public void everyContextGetsTheStrategyOfTheIdleMode() {
+        assertIdleClasses(ReplicaConfig.IdleMode.SLEEP, org.agrona.concurrent.SleepingMillisIdleStrategy.class,
+                org.agrona.concurrent.SleepingMillisIdleStrategy.class);
+        assertIdleClasses(ReplicaConfig.IdleMode.BACKOFF, org.agrona.concurrent.BackoffIdleStrategy.class,
+                org.agrona.concurrent.BackoffIdleStrategy.class);
+        assertIdleClasses(ReplicaConfig.IdleMode.BUSY_SPIN, org.agrona.concurrent.BusySpinIdleStrategy.class,
+                org.agrona.concurrent.BusySpinIdleStrategy.class);
+    }
+
+    @Test
+    public void busySpinSetterMapsToTheModes() {
+        assertEquals(ReplicaConfig.IdleMode.BACKOFF, base().build().idleMode);
+        assertEquals(ReplicaConfig.IdleMode.BUSY_SPIN, base().busySpin(true).build().idleMode);
+        assertEquals(ReplicaConfig.IdleMode.BACKOFF, base().busySpin(true).busySpin(false).build().idleMode);
+    }
 }

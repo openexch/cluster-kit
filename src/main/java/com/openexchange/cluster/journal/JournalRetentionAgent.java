@@ -52,10 +52,27 @@ public final class JournalRetentionAgent {
         public final long passFailuresTotal;
         /** Why this journal's last pass failed; null when it completed. The report is then the last completed one. */
         public final String failure;
+        /** How long the last completed pass over this journal took, in ms; -1 before the first. */
+        public final long lastPassDurationMs;
+        /** Bytes the last completed pass asked the archive to replay to read the recordings' last records. */
+        public final long tailReadBytes;
+        /** The same over every completed pass of this process. */
+        public final long tailReadBytesTotal;
 
         Status(final String journal, final JournalRetention.Mode mode, final JournalRetention.Report report,
                final long purgedBytesTotal, final long purgeFailuresTotal, final long lastPassMs,
                final long passFailuresTotal, final String failure) {
+            this(journal, mode, report, purgedBytesTotal, purgeFailuresTotal, lastPassMs, passFailuresTotal, failure,
+                -1, 0, 0);
+        }
+
+        Status(final String journal, final JournalRetention.Mode mode, final JournalRetention.Report report,
+               final long purgedBytesTotal, final long purgeFailuresTotal, final long lastPassMs,
+               final long passFailuresTotal, final String failure, final long lastPassDurationMs,
+               final long tailReadBytes, final long tailReadBytesTotal) {
+            this.lastPassDurationMs = lastPassDurationMs;
+            this.tailReadBytes = tailReadBytes;
+            this.tailReadBytesTotal = tailReadBytesTotal;
             this.journal = journal;
             this.mode = mode;
             this.report = report;
@@ -112,7 +129,8 @@ public final class JournalRetentionAgent {
     /** Test seam: runs at the start of each journal's pass (a pass that throws). */
     volatile java.util.function.Consumer<String> beforePass = journal -> { };
     private volatile boolean running;
-    private Thread thread;
+    /** The thread that may pass; a thread that is not this one any more ends without touching anything. */
+    private volatile Thread thread;
 
     /**
      * @param clusterDir     the member's cluster directory
@@ -192,18 +210,30 @@ public final class JournalRetentionAgent {
         thread = null;
     }
 
+    /** Whether the calling thread is the agent's thread still: not stopped, and not replaced by a later start. */
+    private boolean mine() {
+        return running && thread == Thread.currentThread();
+    }
+
     private void run() {
         AeronArchive archive = null;
+        // The archive port of each journal, kept while this thread's archive session lives, so a pass replays only
+        // what was recorded since the pass before (RecordingTail). A local: no other thread, and no later thread of
+        // this agent, can reach a port; a thread started after a stop begins with none.
+        final Map<String, JournalRetention.AeronPort> ports = new LinkedHashMap<>();
         try {
             out.accept(JournalRetention.LOG + "started: " + settings + " (clusterDir=" + clusterDir + ")");
-            while (running) {
+            while (mine()) {
                 Thread.sleep(settings.pollMs());
+                if (!mine()) {
+                    return;
+                }
                 Throwable failed = null;
                 try {
                     if (archive == null) {
                         archive = AeronArchive.connect(archiveContext.clone());
                     }
-                    failed = passAll(archive);
+                    failed = passAll(archive, ports);
                     passFailure = null; // the session connected; a journal's own failure is in its status
                     if (failed == null) {
                         agentState = AgentState.RUNNING;
@@ -224,16 +254,17 @@ public final class JournalRetentionAgent {
                     }
                     agentState = AgentState.PASS_FAILING;
                     reportDriverLoss(failed);
-                    // the session may be the broken part: the next pass connects a new one
+                    // the session may be the broken part: the next pass connects a new one, with new ports
                     CloseHelper.quietClose(archive);
                     archive = null;
+                    ports.clear();
                 }
             }
         } catch (final InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (final Throwable t) {
             // nothing may leave this thread into the member; what the loop could not handle ends the thread, loudly
-            if (running) {
+            if (mine()) {
                 death = "journal retention thread stopped: " + t;
                 agentState = AgentState.DEAD;
                 try {
@@ -244,16 +275,19 @@ public final class JournalRetentionAgent {
                 }
             }
         } finally {
-            if (agentState != AgentState.DEAD) {
+            // a thread that a later start replaced leaves the state to its successor
+            final Thread current = thread;
+            if (agentState != AgentState.DEAD && (current == null || current == Thread.currentThread())) {
                 agentState = AgentState.NOT_RUNNING;
             }
+            ports.clear();
             CloseHelper.quietClose(archive);
         }
     }
 
     /** Whether a failure is {@link #stop} interrupting a call in flight: a stop, not a failure. */
     private boolean stopping(final Throwable t) {
-        return !running || t instanceof InterruptedException || Thread.currentThread().isInterrupted();
+        return !mine() || t instanceof InterruptedException || Thread.currentThread().isInterrupted();
     }
 
     /**
@@ -262,12 +296,15 @@ public final class JournalRetentionAgent {
      *
      * @return the first failure, or null when every journal's pass completed
      */
-    private Throwable passAll(final AeronArchive archive) {
+    private Throwable passAll(final AeronArchive archive, final Map<String, JournalRetention.AeronPort> ports) {
         Throwable first = null;
         for (final JournalRetention retention : retentions) {
             final String journal = retention.profile().journal();
             try {
-                passOne(archive, retention);
+                if (!mine()) {
+                    return new InterruptedException("the journal retention thread was stopped");
+                }
+                passOne(archive, retention, ports);
             } catch (final Throwable t) {
                 if (stopping(t)) {
                     return t;
@@ -279,7 +316,8 @@ public final class JournalRetentionAgent {
                 synchronized (status) {
                     final Status before = status.get(journal);
                     status.put(journal, new Status(journal, retention.mode(), before.report, before.purgedBytesTotal,
-                        before.purgeFailuresTotal, before.lastPassMs, before.passFailuresTotal + 1, failure));
+                        before.purgeFailuresTotal, before.lastPassMs, before.passFailuresTotal + 1, failure,
+                        before.lastPassDurationMs, before.tailReadBytes, before.tailReadBytesTotal));
                 }
                 err.accept(JournalRetention.LOG + "CRITICAL: the pass over the " + journal + " journal failed, nothing"
                     + " more of it is purged until a pass succeeds: " + t);
@@ -288,7 +326,8 @@ public final class JournalRetentionAgent {
         return first;
     }
 
-    private void passOne(final AeronArchive archive, final JournalRetention retention) {
+    private void passOne(final AeronArchive archive, final JournalRetention retention,
+                         final Map<String, JournalRetention.AeronPort> ports) {
         final String journal = retention.profile().journal();
         beforePass.accept(journal);
         final long genesis = genesisId.getAsLong();
@@ -303,14 +342,23 @@ public final class JournalRetentionAgent {
                     + ") is not applied to the " + journal + " journal");
             }
         }
-        final JournalRetention.Report report = retention.pass(
-            new JournalRetention.AeronPort(archive.context().aeron(), archive, clock, retention.profile()), genesis,
-            offBox, nowMs, clock.nanoTime() + settings.passTimeoutMs() * 1_000_000L);
+        final JournalRetention.AeronPort port = ports.computeIfAbsent(journal, j -> new JournalRetention.AeronPort(
+            archive.context().aeron(), archive, clock, retention.profile()));
+        final long startNs = clock.nanoTime();
+        final long replayedBefore = port.tail().replayBytes();
+        final JournalRetention.Report report = retention.pass(port, genesis, offBox, nowMs,
+            startNs + settings.passTimeoutMs() * 1_000_000L);
+        final long durationMs = (clock.nanoTime() - startNs) / 1_000_000L;
+        final long tailReadBytes = port.tail().replayBytes() - replayedBefore;
+        if (!mine()) {
+            return; // stopped or replaced while the pass ran: its successor reports
+        }
         synchronized (status) {
             final Status before = status.get(journal);
             status.put(journal, new Status(journal, retention.mode(), report,
                 before.purgedBytesTotal + report.purgedBytes, before.purgeFailuresTotal + report.purgeFailures,
-                System.currentTimeMillis(), before.passFailuresTotal, null));
+                System.currentTimeMillis(), before.passFailuresTotal, null, durationMs, tailReadBytes,
+                before.tailReadBytesTotal + tailReadBytes));
         }
     }
 
@@ -414,6 +462,13 @@ public final class JournalRetentionAgent {
             + " error out of the pass)", all, s -> s.passFailuresTotal);
         family(sb, base + "last_pass_age_ms", "gauge", "Time since the last completed pass (since the start before"
             + " the first)", all, s -> Math.max(0, nowMs - s.lastPassMs));
+        family(sb, base + "last_pass_duration_ms", "gauge", "Time the last completed pass over the journal took"
+            + " (-1 before the first)", all, s -> s.lastPassDurationMs);
+        family(sb, base + "tail_read_bytes", "gauge", "Bytes the last completed pass asked the archive to replay to"
+            + " read the last record of each recording (0 when no recording grew; up to one term per recording on a"
+            + " first look)", all, s -> s.tailReadBytes);
+        family(sb, base + "tail_read_bytes_total", "counter", "Bytes this process asked the archive to replay to read"
+            + " the last records, over every completed pass", all, s -> s.tailReadBytesTotal);
         readers(sb, base + "reader_applied_seq", "journalSeq a registered reader has applied", all, true);
         readers(sb, base + "reader_released_seq", "journalSeq an operator released a reader's hold up to (-1: none)",
             all, false);

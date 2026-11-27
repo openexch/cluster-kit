@@ -25,9 +25,9 @@ auth policy, its image format), the engine passes it in.
 
 | Package | What it holds |
 |---|---|
-| `com.openexchange.cluster` | Snapshots and retention: `SnapshotCadence` (leader-side snapshot trigger, by log bytes with a timer floor), `SnapshotEnvelope` (magic, version, length, CRC32C around a snapshot payload), `SnapshotLayouts` (the snapshot layouts one build reads, the current and the previous one, and the layout it writes, picked by the recorded behaviour version), `WireCeiling` (the ingress wire gate: a frame above the recorded ceiling is dropped from its header before the jar range is consulted; the ceiling only rises; a jar below it stops), `SnapshotImageReader`, `SnapshotLogPruner`, `ArchiveHousekeeping`, `RetentionWatermark`, `ReaderRegistry`, `ClusterMemberPositions`, `StagingArchive`, `BundleCapture`. Node process: `EngineLifecycle`, `QuorumWatchdog`, `NodeEndpoint` (`/health`, `/ready`, `/metrics`), `NodeReadiness`, `ConsensusReadiness`, `ConsensusCommitObserver`. Wiring: `ClusterPorts` (UDP offsets 1..5 and the HTTP endpoint at offset 6), `ConsensusChannel` (the consensus term), `TimerPort`, `TermTimerId`. Driver and transport checks: `EmbeddedDriverDir` (refuses a live driver's directory, replaces a stale one), `SocketBufferProbe` (the kernel's grant of a socket buffer against the configured size). |
+| `com.openexchange.cluster` | Snapshots and retention: `SnapshotCadence` (leader-side snapshot trigger, by log bytes with a timer floor), `SnapshotEnvelope` (magic, version, length, CRC32C around a snapshot payload), `SnapshotLayouts` (the snapshot layouts one build reads, the current and the previous one, and the layout it writes, picked by the recorded behaviour version), `WireCeiling` (the ingress wire gate: a frame above the recorded ceiling is dropped from its header before the jar range is consulted; the ceiling only rises; a jar below it stops), `SnapshotImageReader`, `SnapshotLogPruner`, `ArchiveHousekeeping`, `RetentionWatermark`, `ReaderRegistry`, `ClusterMemberPositions`, `StagingArchive`, `BundleCapture`. Node process: `EngineLifecycle`, `QuorumWatchdog`, `NodeEndpoint` (`/health`, `/ready`, `/metrics`), `NodeReadiness`, `ConsensusReadiness`, `ConsensusCommitObserver`, `StallMetrics` (Aeron's duty-cycle and snapshot-duration counters as `/metrics` series), `LogTimestamps` (one time format at the start of every log line). Wiring: `ClusterPorts` (UDP offsets 1..5 and the HTTP endpoint at offset 6), `ConsensusChannel` (the consensus term), `TimerPort`, `TermTimerId`. Driver and transport checks: `EmbeddedDriverDir` (refuses a live driver's directory, replaces a stale one), `SocketBufferProbe` (the kernel's grant of a socket buffer against the configured size). |
 | `com.openexchange.cluster.auth` | Session authentication and authorisation shared by both engines: credentials, principals, key table, `ClusterAuthenticator`, `ClassAuthorisationService`. See [docs/auth.md](docs/auth.md). |
-| `com.openexchange.cluster.journal` | Journal retention: `JournalRetention` (the one purge owner for a member's journal recordings: a record goes only when every registered reader has applied it), `JournalRetentionAgent` (its thread inside a member), `JournalReaders` and `JournalReaderTool` (the reader cursor files and the command that writes them), `JournalProfile` (what an engine tells the kit about one journal). See "Journal retention" below. |
+| `com.openexchange.cluster.journal` | Journal retention: `JournalRetention` (the one purge owner for a member's journal recordings: a record goes only when every registered reader has applied it), `JournalRetentionAgent` (its thread inside a member), `JournalReaders` and `JournalReaderTool` (the reader cursor files and the command that writes them), `JournalProfile` (what an engine tells the kit about one journal), `RecordingTail` (the last message of a recording, read without a replay that starts inside a frame). See "Journal retention" below. |
 | `com.openexchange.cluster.log` | `ClusterLogReader` (reads a committed cluster log without a cluster), `ReplayContainer`, `ShadowEngine` (the apply interface an engine implements), `SkipWindow`. |
 | `com.openexchange.cluster.replica` | The replica process: a non-member that follows the cluster through `ClusterBackup`, applies the log into its own engine instance and writes shadow images, with a trust check after every restore. See [docs/replica.md](docs/replica.md). |
 | `com.openexchange.cluster.shadow` | Shadow images: a verified engine image at a log position written by a non-leader producer, plus the catalog, loader, floor and retention that use it. The follower producer's kit side: `ShadowProducerSettings`, `ProducerDesignation`, `ProducerWindowGuard`, `CrashedWriteSweep`, `WitnessAlarm`. See [docs/shadow.md](docs/shadow.md). |
@@ -375,9 +375,96 @@ member restarts, 4 the engine could not start it
 (`JournalRetentionAgent.renderNotStarted`). Alert rules have to fire on an
 absent series as well as on a bad value.
 
+The last record of each recording (the member's journal tail) is read by
+`journal.RecordingTail`. Every replay it asks for starts where a frame starts:
+the recording's start, a term base, or the end of the last message it read
+from the same recording on an earlier pass. An archive raises a refused replay
+start into the node's error handler, so a reader that probes for the last
+frame fills the error log of a healthy member; this one asks for none. The
+first look at a recording replays at most its last term, a later look only
+what was recorded since, and nothing when the end has not moved. The record it
+answers is the last whole message of the recording's last term, whatever it
+remembers. A caller that reads a tail once (a restore) makes a `RecordingTail`
+for the read; one that reads it again and again keeps it.
+
+What a tail read costs: a first look replays from the base of the recording's
+last term (or its start) to its end, so up to one journal term per recording,
+read from disk and copied through an IPC replay publication the archive creates
+with the recording's term length (three terms mapped sparse; pages are touched
+as they are written, about the replayed bytes). The agent pays that on its
+first pass after the member started, on the first pass after a failed pass
+(the agent then opens a new archive session with new ports), after a stop and
+a start of the agent, and for a recording whose end moved into a later term
+since the pass before (more than the rest of a term was recorded between two
+passes; at the default 60 s poll that is a journal writing more than a term a
+minute). Every other pass replays the bytes recorded since, and nothing for a
+recording that did not grow. Two series show it per journal:
+`<prefix>_journal_retention_tail_read_bytes{journal}` (bytes the last
+completed pass asked the archive to replay for tail reads) with
+`_tail_read_bytes_total{journal}`, and
+`<prefix>_journal_retention_last_pass_duration_ms{journal}`. The agent's ports
+belong to its thread: no other thread reaches one, and a thread started after
+a stop begins without any.
+
 The negative-control seams (`JournalRetention.Seams`) are public statics for
 the engines' tests; `JournalRetentionSeamsTest` holds them off by default and
 unwritten by any main class.
+
+### Duty-cycle and snapshot-duration series
+
+`StallMetrics` exports the counters Aeron keeps per member for its slowest
+work cycle and its slowest snapshot, so "does a snapshot stall this member,
+and for how long" is read from `/metrics`. An engine opens one with its metric
+prefix, its media driver's directory, its cluster id and service id
+(`StallMetrics.open`), starts it and appends `render` to its metrics body. It
+reads the driver's counters file through a read-only mapping of its own, so it
+opens no Aeron client and is not hurt by one that closes; both driver modes.
+
+| Source (Aeron counter type id) | Maximum `M` | Over-threshold count `C` |
+|---|---|---|
+| consensus module cycle (216, 217) | `<prefix>_consensus_module_max_cycle_time` | `<prefix>_consensus_module_cycle_time_exceeded` |
+| clustered service cycle (218, 219) | `<prefix>_service_max_cycle_time` | `<prefix>_service_cycle_time_exceeded` |
+| snapshot of every service, timed by the consensus module (234, 235) | `<prefix>_snapshot_total_max_duration` | `<prefix>_snapshot_total_duration_exceeded` |
+| snapshot of this service, timed by its container (236, 237) | `<prefix>_snapshot_service_max_duration` | `<prefix>_snapshot_service_duration_exceeded` |
+| driver conductor, sender, receiver cycle (system counters 26..31) | `<prefix>_driver_{conductor,sender,receiver}_max_cycle_time` | `<prefix>_driver_{conductor,sender,receiver}_cycle_time_exceeded` |
+| archive agent cycle (103, 104), labels `archive_id` and `agent` (`conductor`; with dedicated archive threads also `recorder` and `replayer`) | `<prefix>_archive_max_cycle_time` | `<prefix>_archive_cycle_time_exceeded` |
+
+Each maximum is three gauges: `M_seconds` (Aeron's counter: the maximum since
+the component started), `M_last_rise_age_seconds` (seconds since it last rose,
+-1 when it has not risen since the member began to sample it) and
+`M_recent_seconds` (`M_seconds` when it rose within the last 300 s, else 0).
+Each count is `C_total` (Aeron's counter), `C_last_age_seconds` and `C_recent`
+(its rise between the newest sample and the one 300 samples before it: the
+last 300 one-second intervals). Aeron keeps one maximum: a slow cycle below the
+standing maximum does not move `M`, and shows in `C` when it was over the
+component's threshold. A source with no Aeron counter on the member has no
+series. `<prefix>_stall_sampler_age_seconds` is the time since the counters
+were last read (-1 before the first read).
+
+The counters are read once a second on the object's own daemon thread
+(`stall-metrics-sampler`), never on a cluster service, consensus or driver
+thread: one volatile read per source (14, and two per archive agent) and no
+allocation.
+
+### Log line times
+
+`LogTimestamps.install()`, called first in a process's `main`, wraps
+`System.out` and `System.err` so every line starts with its time in ISO-8601
+UTC with milliseconds: `2026-11-27T11:44:31.654Z [SNAPSHOT] ...`. A line that
+already starts with a time in that format (a logger that stamps its own lines
+with `LogTimestamps.now()`), a continuation line (it starts with a tab, a
+space, `Caused by: ` or `Suppressed: `) and an empty line are left as they
+are. The head line of a printed stack trace is a line like any other and gets
+its time. The text after the time is not changed. A line is collected and
+handed to the stream below in one write (time, text, newline) when its newline
+arrives, so two threads, or out and err over one file, never interleave inside
+a line; a line without a newline is written on `flush()`; a line longer than
+8192 bytes is written in pieces of that size, the time once before the first.
+
+`EngineLifecycle.install(name, log, info)` takes a second sink for the lines
+that are information (a watchdog was armed, and with which bounds), so an
+engine whose `log` writes at its error level prints no error line on a healthy
+start.
 
 ### Rejoin and peer reachability
 

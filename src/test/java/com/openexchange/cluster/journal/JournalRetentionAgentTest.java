@@ -84,6 +84,109 @@ public class JournalRetentionAgentTest {
         return s.report == null ? null : s.report.evaluation.state;
     }
 
+    /**
+     * The agent's passes over journals that grow between them ask the archive for no replay that starts inside a
+     * frame: the archive raises nothing into its error handler (a member's error log stays empty).
+     */
+    @Test
+    public void theAgentsPassesRaiseNoArchiveError() {
+        final JournalRig.Writer order = rig.writer(JournalRig.ORDER).append(1, 300);
+        final JournalRig.Writer money = rig.writer(JournalRig.MONEY).append(1, 500);
+        rig.set(JournalRig.ORDER, "reader", 0);
+        rig.set(JournalRig.MONEY, "reader", 0);
+        agent(Map.of("JOURNAL_RETENTION_ORDER", "readers", "JOURNAL_RETENTION_MONEY", "readers",
+            "JOURNAL_RETENTION_POLL_MS", "1000")).start();
+        long orderSeq = 300;
+        long moneySeq = 500;
+        for (int round = 0; round < 4; round++) {
+            final long o = orderSeq;
+            final long m = moneySeq;
+            await(() -> agent.status("order").report != null && agent.status("order").report.tailSeq == o
+                && agent.status("money").report != null && agent.status("money").report.tailSeq == m,
+                "a pass that reads the tails " + o + " and " + m);
+            order.append(orderSeq + 1, orderSeq + (round == 2 ? 600 : 7));
+            orderSeq += round == 2 ? 600 : 7;
+            money.append(moneySeq + 1, moneySeq + (round == 1 ? 1_500 : 11));
+            moneySeq += round == 1 ? 1_500 : 11;
+        }
+        final long o = orderSeq;
+        final long m = moneySeq;
+        await(() -> agent.status("order").report.tailSeq == o && agent.status("money").report.tailSeq == m,
+            "the last pass");
+        assertEquals(State.VALID, state("order"));
+        assertEquals(State.VALID, state("money"));
+        assertTrue("the archive raised " + rig.archiveErrors, rig.archiveErrors.isEmpty());
+    }
+
+    private long completedPass(final String journal, final long after) {
+        await(() -> agent.status(journal).report != null && agent.status(journal).lastPassMs > after,
+            "a pass over " + journal + " after " + after);
+        return agent.status(journal).lastPassMs;
+    }
+
+    /**
+     * The agent keeps one archive port per journal from pass to pass: a pass over a journal that did not grow
+     * replays nothing, and a pass over one that grew replays what was recorded since. An agent that made a new
+     * port for every pass would replay the last term every time. After a stop and a start the new thread has no
+     * port of the old one: its first pass reads the last term again.
+     */
+    @Test
+    public void thePortIsKeptAcrossPassesAndNotAcrossAStopAndAStart() throws Exception {
+        final JournalRig.Writer money = rig.writer(JournalRig.MONEY).append(1, 400);
+        final long bytes = money.position();
+        rig.set(JournalRig.MONEY, "reader", 0);
+        agent(Map.of("JOURNAL_RETENTION_MONEY", "readers", "JOURNAL_RETENTION_POLL_MS", "1000")).start();
+        long pass = completedPass("money", 0);
+        JournalRetentionAgent.Status s = agent.status("money");
+        assertEquals("the first pass reads the recording's last term from its base", bytes, s.tailReadBytes);
+        assertEquals(400, s.report.tailSeq);
+        assertTrue(s.lastPassDurationMs >= 0);
+        for (int i = 0; i < 2; i++) {
+            pass = completedPass("money", pass);
+            Thread.sleep(2);
+            s = agent.status("money");
+            assertEquals("a pass over a journal that did not grow replays nothing", 0, s.tailReadBytes);
+            assertEquals(400, s.report.tailSeq);
+        }
+        money.append(401, 410);
+        final long grown = money.position() - bytes;
+        await(() -> agent.status("money").report.tailSeq == 410, "the pass that reads the tail 410");
+        s = agent.status("money");
+        assertEquals("only what was recorded since", grown, s.tailReadBytes);
+        assertEquals(bytes + grown, s.tailReadBytesTotal);
+        final String metrics = agent.renderMetrics("core");
+        assertTrue(metrics, metrics.contains("core_journal_retention_tail_read_bytes{journal=\"money\"} " + grown
+            + "\n"));
+        assertTrue(metrics, metrics.contains("core_journal_retention_tail_read_bytes_total{journal=\"money\"} "
+            + (bytes + grown) + "\n"));
+        assertTrue(metrics, metrics.contains("# TYPE core_journal_retention_tail_read_bytes_total counter\n"));
+        assertTrue(metrics, metrics.contains("core_journal_retention_last_pass_duration_ms{journal=\"money\"} "
+            + s.lastPassDurationMs + "\n"));
+        assertTrue(metrics, metrics.contains("core_journal_retention_last_pass_duration_ms{journal=\"order\"} "));
+
+        // a stop and a start: one thread, a clean first pass, and passes afterwards that replay nothing
+        agent.stop();
+        assertEquals(JournalRetentionAgent.AgentState.NOT_RUNNING, agent.agentState());
+        agent.start();
+        final long restartedAt = System.currentTimeMillis();
+        pass = completedPass("money", Math.max(pass, restartedAt - 1));
+        s = agent.status("money");
+        assertEquals("the new thread reads the last term again", bytes + grown, s.tailReadBytes);
+        assertEquals(410, s.report.tailSeq);
+        pass = completedPass("money", pass);
+        Thread.sleep(2);
+        assertEquals(0, agent.status("money").tailReadBytes);
+        assertEquals(JournalRetentionAgent.AgentState.RUNNING, agent.agentState());
+        int threads = 0;
+        for (final Thread t : Thread.getAllStackTraces().keySet()) {
+            if (t.getName().equals("journal-retention") && t.isAlive()) {
+                threads++;
+            }
+        }
+        assertEquals("the stopped thread ended", 1, threads);
+        assertTrue("the archive raised " + rig.archiveErrors, rig.archiveErrors.isEmpty());
+    }
+
     @Test
     public void theAgentPurgesByItselfFromTheReaderFiles() {
         final JournalRig.Writer order = rig.writer(JournalRig.ORDER).append(1, 2_600);

@@ -354,6 +354,38 @@ public class EngineLifecycleTest {
         }
     }
 
+    /**
+     * That a watchdog was armed is information: with a second sink it goes there and the node's log (which an
+     * engine writes at its error level) stays empty on a healthy start. Without one it goes to the node's log, as
+     * before. A fault still goes to the node's log.
+     */
+    @Test
+    public void armingAWatchdogIsInformationAndAFaultIsNot() {
+        final List<String> info = new CopyOnWriteArrayList<>();
+        final EngineLifecycle lf = lifecycle(1_000, 60_000).infoLog(info::add);
+        final QuorumWatchdog quorum = lf.watchQuorum(() -> 0, () -> 0);
+        try {
+            assertEquals(info.toString(), 1, info.size());
+            assertTrue(info.get(0), info.get(0).startsWith("test-node rejoin watchdog armed: exit 1 if"));
+            assertTrue("nothing in the node's log: " + logs, logs.isEmpty());
+            lf.fatal(1, "a fault");
+            assertTrue(logs.toString(), logs.stream().anyMatch(l -> l.contains("FATAL (exit 1): a fault")));
+            assertEquals("the fault is not in the information sink", 1, info.size());
+        } finally {
+            quorum.stop(0);
+            lf.rejoinWatchdog().stop(0);
+        }
+        final List<String> single = new CopyOnWriteArrayList<>();
+        final EngineLifecycle one = new EngineLifecycle("test-node", single::add, status -> { }, 1_000, 60_000);
+        final QuorumWatchdog q = one.watchQuorum(() -> 0, () -> 0);
+        try {
+            assertTrue(single.toString(), single.stream().anyMatch(l -> l.contains("rejoin watchdog armed")));
+        } finally {
+            q.stop(0);
+            one.rejoinWatchdog().stop(0);
+        }
+    }
+
     /** On the consensus stream the probe would read a restoring peer reachable: refused before anything is armed. */
     @Test
     public void aProbeStreamEqualToTheConsensusStreamRefusesToArm() {

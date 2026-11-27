@@ -55,6 +55,8 @@ final class JournalRig implements AutoCloseable {
     final ByteArrayOutputStream outBytes = new ByteArrayOutputStream();
     final ByteArrayOutputStream errBytes = new ByteArrayOutputStream();
     private final List<AutoCloseable> resources = new ArrayList<>();
+    /** Every error the archive raised into its error handler (a member's error log), in order. */
+    final List<String> archiveErrors = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     JournalRig() {
         try {
@@ -72,7 +74,8 @@ final class JournalRig implements AutoCloseable {
                 .controlChannelEnabled(false)
                 .archiveClientContext(new AeronArchive.Context().controlResponseChannel("aeron:ipc"))
                 .replicationChannel("aeron:udp?endpoint=localhost:0").recordingEventsEnabled(false)
-                .segmentFileLength(SEG).threadingMode(ArchiveThreadingMode.SHARED).deleteArchiveOnStart(true));
+                .segmentFileLength(SEG).threadingMode(ArchiveThreadingMode.SHARED).deleteArchiveOnStart(true)
+                .errorHandler(t -> archiveErrors.add(String.valueOf(t))));
         aeron = Aeron.connect(new Aeron.Context().aeronDirectoryName(aeronDir));
         archive = AeronArchive.connect(new AeronArchive.Context().aeron(aeron).controlRequestChannel("aeron:ipc")
             .controlResponseChannel("aeron:ipc"));
@@ -134,9 +137,62 @@ final class JournalRig implements AutoCloseable {
     final class Writer {
         final JournalProfile profile;
         final long recordingId;
-        private final ExclusivePublication publication;
+        private ExclusivePublication publication;
         private final UnsafeBuffer buffer = new UnsafeBuffer(new byte[512]);
         private boolean stopped;
+
+        /**
+         * A recording that starts in the middle of a term: its publication begins at {@code startPosition} (frame
+         * aligned, no term base), so that is the recording's start position.
+         */
+        Writer(final JournalProfile profile, final long startPosition) {
+            this.profile = profile;
+            final String channel = new io.aeron.ChannelUriStringBuilder().media("ipc").termLength(SEG)
+                .initialPosition(startPosition, 1_000, SEG).build();
+            publication = archive.addRecordedExclusivePublication(channel, profile.streamId());
+            final CountersReader counters = aeron.countersReader();
+            final long deadline = System.nanoTime() + TIMEOUT_NS;
+            int counterId;
+            while ((counterId = RecordingPos.findCounterIdBySession(counters, publication.sessionId(),
+                archive.archiveId())) == CountersReader.NULL_COUNTER_ID) {
+                await(deadline, "the recording counter");
+            }
+            while (!publication.isConnected()) {
+                await(deadline, "the recorded publication to connect");
+            }
+            recordingId = RecordingPos.getRecordingId(counters, counterId);
+            resources.add(() -> {
+                if (!stopped) {
+                    CloseHelper.quietClose(publication);
+                }
+            });
+        }
+
+        /**
+         * Stops the recording, cuts it back to {@code position} (a frame start) and records on from there with a
+         * new publication: the bytes above {@code position} are then other bytes than they were.
+         */
+        Writer truncateAndExtend(final long position) {
+            final int initialTermId = publication.initialTermId();
+            if (!stopped) {
+                stop();
+            }
+            archive.truncateRecording(recordingId, position);
+            final String channel = new io.aeron.ChannelUriStringBuilder().media("ipc").termLength(SEG)
+                .initialPosition(position, initialTermId, SEG).build();
+            publication = aeron.addExclusivePublication(channel, profile.streamId());
+            archive.extendRecording(recordingId, io.aeron.ChannelUri.addSessionId(channel, publication.sessionId()),
+                profile.streamId(), io.aeron.archive.codecs.SourceLocation.LOCAL);
+            final long deadline = System.nanoTime() + TIMEOUT_NS;
+            while (!publication.isConnected()
+                || archive.getRecordingPosition(recordingId) == AeronArchive.NULL_POSITION) {
+                await(deadline, "the extended recording of " + recordingId);
+            }
+            stopped = false;
+            final ExclusivePublication extended = publication;
+            resources.add(() -> CloseHelper.quietClose(extended));
+            return this;
+        }
 
         Writer(final JournalProfile profile) {
             this.profile = profile;
@@ -211,6 +267,11 @@ final class JournalRig implements AutoCloseable {
 
     Writer writer(final JournalProfile profile) {
         return new Writer(profile);
+    }
+
+    /** A writer whose recording starts at {@code startPosition}, in the middle of a term. */
+    Writer lateWriter(final JournalProfile profile, final long startPosition) {
+        return new Writer(profile, startPosition);
     }
 
     static void green(final String what) {

@@ -29,8 +29,10 @@ import java.util.function.Consumer;
  * Disk reclamation for a member's journal recordings, and the only class that purges one. A journal record is
  * deleted from a member only when every registered reader ({@link JournalReaders}) has durably applied it, and the
  * member's own journal tail reads the same afterwards. A purge cannot be undone, so every unknown answers "hold", and
- * nothing is remembered between two passes: each pass works from the reader files, the archive and the member's
- * identity as they are now.
+ * no decision is remembered between two passes: each pass works from the reader files, the archive and the member's
+ * identity as they are now. The one thing an {@link AeronPort} keeps is where the last record of each recording was
+ * read, so the next pass replays only what was recorded since; the record it answers is the one a full read of the
+ * recording's last term gives ({@link RecordingTail}).
  *
  * <h2>The bound</h2>
  *
@@ -382,6 +384,11 @@ public final class JournalRetention {
      * The member's own archive: listings, one-record replays ({@link ShadowReplay}, bounded and session scoped, one at
      * a time) and the two purge calls. A refused or failed replay is an unreadable record; any other failure (a lost
      * driver, a closed client) propagates to the caller.
+     *
+     * <p>Every replay starts where a frame starts: a segment base, the recording's start, a term base, or the end
+     * of a message read before ({@link RecordingTail}). The archive raises a refused start into the node's error
+     * handler, so a pass over a healthy journal asks for none. A port kept from one pass to the next reads only the
+     * bytes recorded since; a new port reads the last term of each recording once. One owner thread.</p>
      */
     public static final class AeronPort implements Archive {
         private static final int LIST_BATCH = 100;
@@ -389,6 +396,7 @@ public final class JournalRetention {
         private final AeronArchive archive;
         private final ShadowReplay replay;
         private final JournalProfile profile;
+        private final RecordingTail<Peek> tail;
 
         public AeronPort(final Aeron aeron, final AeronArchive archive, final NanoClock clock,
                          final JournalProfile profile) {
@@ -396,6 +404,13 @@ public final class JournalRetention {
             this.replay = new ShadowReplay(Objects.requireNonNull(aeron, "aeron"), archive,
                 Objects.requireNonNull(clock, "clock"));
             this.profile = Objects.requireNonNull(profile, "profile");
+            this.tail = new RecordingTail<>((buffer, offset, length, header) -> {
+                try {
+                    return Peek.of(profile.key(buffer, offset, length, header.frameLength()));
+                } catch (final JournalProfile.NotARecord notARecord) {
+                    return Peek.unreadable(notARecord.getMessage());
+                }
+            });
         }
 
         @Override
@@ -414,6 +429,11 @@ public final class JournalRetention {
                 }
                 from = rows.get(rows.size() - 1)[0] + 1;
             }
+            final Set<Long> ids = new HashSet<>();
+            for (final long[] r : rows) {
+                ids.add(r[0]);
+            }
+            tail.retain(ids::contains);
             final List<Recording> out = new ArrayList<>(rows.size());
             for (final long[] r : rows) {
                 long end = r[2];
@@ -467,61 +487,28 @@ public final class JournalRetention {
             return found[0] != null ? found[0] : Peek.unreadable("no message at " + position);
         }
 
+        /**
+         * The last record of the recording: the last whole message of the term that holds its end (from the
+         * recording's start when that is higher), as {@link RecordingTail} reads it. No replay starts inside a frame.
+         * The answer is the one a replay of that whole range gives; what the port remembers of an earlier pass only
+         * shortens the replay.
+         */
         @Override
         public Peek last(final Recording r, final long deadlineNs) {
-            final long stop = r.end();
             try {
-                // the largest record first (a journal of one record size answers with one replay), then every
-                // shorter aligned length: the archive refuses a start that is not a frame header
-                final int max = profile.maxFrameLength();
-                final int steps = max / FrameDescriptor.FRAME_ALIGNMENT;
-                for (int i = 0; i < steps; i++) {
-                    final int w = i == 0 ? max : i * FrameDescriptor.FRAME_ALIGNMENT;
-                    final long from = stop - w;
-                    if (from < r.start()) {
-                        continue;
-                    }
-                    final Peek[] found = {null};
-                    final int[] messages = {0};
-                    final int[] frameLength = {0};
-                    try {
-                        replay.readRange(r.id(), from, w, (buffer, offset, length, header) -> {
-                            messages[0]++;
-                            frameLength[0] = header.frameLength();
-                            try {
-                                found[0] = Peek.of(profile.key(buffer, offset, length, header.frameLength()));
-                            } catch (final JournalProfile.NotARecord notARecord) {
-                                found[0] = Peek.unreadable(notARecord.getMessage());
-                            }
-                        }, deadlineNs);
-                    } catch (final ArchiveException notAFrame) {
-                        if (notAFrame.errorCode() == ArchiveException.INVALID_POSITION) {
-                            continue; // not a frame header: another window
-                        }
-                        throw notAFrame;
-                    }
-                    if (messages[0] == 1 && found[0] != null
-                        && BitUtil.align(frameLength[0], FrameDescriptor.FRAME_ALIGNMENT) == w) {
-                        return found[0];
-                    }
-                }
-                // the end is not one record frame (padding at a term end): the term holding the end, frame aligned
-                final long termStart = Math.max(r.start(), (stop - 1) & -(long) r.termLength());
-                final Peek[] found = {null};
-                replay.readRange(r.id(), termStart, stop - termStart, (buffer, offset, length, header) -> {
-                    try {
-                        found[0] = Peek.of(profile.key(buffer, offset, length, header.frameLength()));
-                    } catch (final JournalProfile.NotARecord notARecord) {
-                        found[0] = Peek.unreadable(notARecord.getMessage());
-                    }
-                }, deadlineNs);
-                return found[0] != null ? found[0]
+                final Peek last = tail.last(replay, r.id(), r.start(), r.end(), r.termLength(), deadlineNs);
+                return last != null ? last
                     : Peek.unreadable("no journal message in the last term of recording " + r.id());
             } catch (final ArchiveException | ShadowReplay.ReplayTimeoutException
                            | ShadowReplay.ReplayJoinedLateException | ShadowReplay.ReplayEndedEarlyException
                            | IllegalStateException failed) {
                 return Peek.unreadable(String.valueOf(failed));
             }
+        }
+
+        /** The tail reads of this port (tests, and a host that wants to show them). */
+        public RecordingTail<Peek> tail() {
+            return tail;
         }
 
         @Override

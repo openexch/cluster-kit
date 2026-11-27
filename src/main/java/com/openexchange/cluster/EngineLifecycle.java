@@ -171,6 +171,8 @@ public final class EngineLifecycle {
 
     private final String name;
     private final Consumer<String> log;
+    /** Where a line that is information goes (a watchdog was armed); the node's log unless the host gave another. */
+    private volatile Consumer<String> info;
     private final IntConsumer halter;
     private final long shutdownTimeoutMs;
     private final long fatalExitGraceMs;
@@ -235,6 +237,7 @@ public final class EngineLifecycle {
         this.catchupRefusalWaitMs = catchupRefusalWaitMs;
         this.name = name;
         this.log = log;
+        this.info = log;
         this.halter = halter;
         this.shutdownTimeoutMs = shutdownTimeoutMs;
         this.fatalExitGraceMs = fatalExitGraceMs;
@@ -247,6 +250,17 @@ public final class EngineLifecycle {
      * hook registered for the signal stop. Call first in the node's bootstrap, before any thread starts.
      */
     public static EngineLifecycle install(final String name, final Consumer<String> log) {
+        return install(name, log, log);
+    }
+
+    /**
+     * {@link #install(String, Consumer)} with a second sink for the lines that are information and not a fault:
+     * that a watchdog was armed, and with which bounds. A host whose {@code log} writes at its error level passes
+     * its informational level here, so a healthy start prints no error line.
+     */
+    public static EngineLifecycle install(final String name, final Consumer<String> log,
+                                          final Consumer<String> info) {
+        java.util.Objects.requireNonNull(info, "info");
         // Every setting is parsed here, in every driver mode: a malformed or out-of-range one refuses the start.
         final long shutdownMs = shutdownTimeoutMs();
         final long graceMs = fatalExitGraceMs();
@@ -273,8 +287,15 @@ public final class EngineLifecycle {
         final EngineLifecycle lifecycle = new EngineLifecycle(name, log, status -> Runtime.getRuntime().halt(status),
                 shutdownMs, graceMs, quorumMs, rejoinMs, rejoinWindowMs, leaderElectMs, catchupRefusals(),
                 catchupRefusalWaitMs());
+        lifecycle.infoLog(info);
         Runtime.getRuntime().addShutdownHook(new Thread(lifecycle::onJvmShutdown, name + "-shutdown"));
         return lifecycle;
+    }
+
+    /** Where the informational lines go from now on (see {@link #install(String, Consumer, Consumer)}). */
+    EngineLifecycle infoLog(final Consumer<String> info) {
+        this.info = java.util.Objects.requireNonNull(info, "info");
+        return this;
     }
 
     public static long shutdownTimeoutMs() {
@@ -368,7 +389,7 @@ public final class EngineLifecycle {
         if (probeRefusal != null) {
             throw new IllegalArgumentException(probeRefusal);
         }
-        log.accept(name + " quorum watchdog armed: exit 1 if no leader is known within " + quorumWaitMs + " ms ("
+        info.accept(name + " quorum watchdog armed: exit 1 if no leader is known within " + quorumWaitMs + " ms ("
                 + QUORUM_WAIT_ENV + ")");
         final QuorumWatchdog quorum = QuorumWatchdog.of(this, context, quorumWaitMs);
         watchdogs.add(quorum::stop);
@@ -410,7 +431,7 @@ public final class EngineLifecycle {
     }
 
     private void watchRejoin(final RejoinWatchdog w, final String evidence) {
-        log.accept(name + " rejoin watchdog armed: exit 1 if, after a leader was known, one election stays open "
+        info.accept(name + " rejoin watchdog armed: exit 1 if, after a leader was known, one election stays open "
                 + "without a leader for " + rejoinWaitMs + " ms (" + REJOIN_WAIT_ENV + ") while a quorum of members"
                 + " is reachable (evidence window " + rejoinPeerWindowMs + " ms, " + REJOIN_PEER_WINDOW_ENV + "), or a"
                 + " leader elect stays in LEADER_LOG_REPLICATION or LEADER_READY for " + leaderElectWaitMs + " ms ("
@@ -428,7 +449,7 @@ public final class EngineLifecycle {
     }
 
     private void watchCatchup(final CatchupWatchdog w) {
-        log.accept(name + " catch-up watchdog armed: exit 1 when " + catchupRefusals + " catch-up attempts in a row"
+        info.accept(name + " catch-up watchdog armed: exit 1 when " + catchupRefusals + " catch-up attempts in a row"
                 + " fail (" + CATCHUP_REFUSALS_ENV + ") or the catch-up has failed for " + catchupRefusalWaitMs
                 + " ms (" + CATCHUP_REFUSAL_WAIT_ENV + ") and this member's log position is below the leader's log"
                 + " start");
